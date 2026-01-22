@@ -1,0 +1,14 @@
+[package]
+name = "mdax"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+bio = "3.0.0"
+calm_io = "0.1.1"
+clap = { version = "4.5.54", features = ["cargo"] }
+flate2 = "1.1.8"
+gxhash = "3.5.0"
+packed-seq = "4.4.1"
+simd-minimizers = "2.2.0"

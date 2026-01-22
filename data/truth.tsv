@@ -1,0 +1,5 @@
+read_id	type	n_breakpoints	approx_positions
+forward_concatemer	forward	2	1000,2000
+inverted_concatemer	inverted	1	800
+template_switch	switch	1	1200
+multi_switch	multi	2	1200,2400
