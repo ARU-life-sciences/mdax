@@ -1,8 +1,3 @@
-// a simple cli for fos
-
-// use the Builder API from clap
-// let's add one free positional argument
-
 use crate::utils::RefineMode;
 use clap::{Arg, ArgMatches, Command, ValueEnum, builder::PossibleValue, value_parser};
 use std::path::PathBuf;
@@ -150,7 +145,7 @@ pub fn build_cli() -> ArgMatches {
     c.get_matches()
 }
 
-// Can also be derived with feature flag `derive`
+// Change RefineMode to a clap ValueEnum
 impl ValueEnum for RefineMode {
     fn value_variants<'a>() -> &'a [Self] {
         &[RefineMode::HiFi, RefineMode::ONT]

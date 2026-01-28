@@ -1,17 +1,4 @@
 #[derive(Debug, Clone)]
-pub struct Breakpoint {
-    pub split_pos: usize, // coarse junction estimate
-    pub delta: usize,     // repeat offset (median p2 - p1)
-    pub score: i64,
-    pub matches: usize,
-    pub span: usize,
-
-    // diagnostics
-    pub cross_frac: f32,
-    pub p2_span: usize,
-}
-
-#[derive(Debug, Clone)]
 pub struct Refined {
     pub split_pos: usize,
     pub score: i64,
@@ -24,20 +11,6 @@ pub enum RefineMode {
     ONT,
 }
 
-/// Hash a k-mer slice (ASCII A/C/G/T/N).
-///
-/// This is used only on minimizer positions, so it is not performance-critical.
-/// A robust hash reduces accidental collisions that could create false diagonals.
-pub fn hash_kmer(kmer: &[u8]) -> u64 {
-    // Simple FNV-1a 64-bit
-    let mut h: u64 = 14695981039346656037;
-    for &b in kmer {
-        h ^= b as u64;
-        h = h.wrapping_mul(1099511628211);
-    }
-    h
-}
-
 pub fn div_floor(x: i32, d: i32) -> i32 {
     let q = x / d;
     let r = x % d;
@@ -48,13 +21,13 @@ pub fn div_floor(x: i32, d: i32) -> i32 {
     }
 }
 
-/// Compute banded Levenshtein edit distance between `a` and `b`.
-///
-/// Returns a distance in [0..=band+1]. If the true distance is > band, returns band+1.
-/// This makes refinement robust: we can still choose the best candidate split even if
-/// all candidates are "bad" under the current band.
-///
-/// Complexity: O(len(a) * band)
+// Compute banded Levenshtein edit distance between `a` and `b`.
+//
+// Returns a distance in [0..=band+1]. If the true distance is > band, returns band+1.
+// This makes refinement robust: we can still choose the best candidate split even if
+// all candidates are "bad" under the current band.
+//
+// Complexity: O(len(a) * band)
 pub fn banded_edit_distance(a: &[u8], b: &[u8], band: usize) -> usize {
     let n = a.len();
     let m = b.len();
@@ -113,4 +86,47 @@ pub fn banded_edit_distance(a: &[u8], b: &[u8], band: usize) -> usize {
     }
 
     prev[m].min(maxd + 1)
+}
+
+// Write reverse-complement of `src` into `dst`.
+#[inline]
+pub fn revcomp_into(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    let mut i = 0usize;
+    let mut j = src.len();
+    while i < src.len() {
+        j -= 1;
+        dst[i] = comp(src[j]);
+        i += 1;
+    }
+}
+
+// Return the DNA complement of a base.
+// Non-ACGT bases are mapped to 'N'.
+#[inline]
+pub fn comp(b: u8) -> u8 {
+    match b {
+        b'A' | b'a' => b'T',
+        b'C' | b'c' => b'G',
+        b'G' | b'g' => b'C',
+        b'T' | b't' => b'A',
+        _ => b'N',
+    }
+}
+
+// Reverse-complement in place (ACGTN; other -> N)
+pub fn revcomp_in_place(seq: &mut [u8]) {
+    let mut i = 0usize;
+    let mut j = seq.len().saturating_sub(1);
+    while i < j {
+        let a = comp(seq[i]);
+        let b = comp(seq[j]);
+        seq[i] = b;
+        seq[j] = a;
+        i += 1;
+        j = j.saturating_sub(1);
+    }
+    if i == j && i < seq.len() {
+        seq[i] = comp(seq[i]);
+    }
 }

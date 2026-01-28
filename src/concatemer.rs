@@ -1,8 +1,11 @@
 use gxhash::{HashMap, HashMapExt};
 
 use crate::cfg::{ConcatOnlyCfg, SharedCfg};
-use crate::minimizer::sampled_minimizers;
+use crate::minimizer::sampled_minimizers_into;
 use crate::utils::{RefineMode, Refined, banded_edit_distance, div_floor};
+
+// NOTE: this code is very similar to `foldback.rs`
+// but kept distinct in case we want to delete later
 
 #[derive(Debug, Clone)]
 pub struct ConcatBreakpoint {
@@ -178,7 +181,7 @@ pub fn detect_concatemer(
         return None;
     }
 
-    let (pos_f, val_f) = sampled_minimizers(seq, &shared.minimizer);
+    let (pos_f, val_f) = sampled_minimizers_into(seq, &shared.minimizer, &mut vec![], &mut vec![]);
 
     if pos_f.len() < shared.min_matches {
         return None;
@@ -308,7 +311,7 @@ fn best_bin_to_concat_breakpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cfg::{ConcatOnlyCfg, FoldOnlyCfg, MinimizerCfg, RefineCfg, SharedCfg};
+    use crate::cfg::{ConcatOnlyCfg, MinimizerCfg, RefineCfg, SharedCfg};
 
     fn test_concat_cfg(
         k: usize,
@@ -507,8 +510,6 @@ mod tests {
             RefineMode::HiFi,
             0.25,
         );
-
-        let coarse = detect_concatemer(&s, &shared, &con).unwrap();
 
         let coarse = detect_concatemer(&s, &shared, &con).unwrap();
         let refined =

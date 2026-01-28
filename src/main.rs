@@ -1,9 +1,11 @@
 mod cfg;
 mod cli;
 mod concatemer;
+mod fingerprint;
 mod foldback;
 mod io;
 mod minimizer;
+mod scratch;
 mod utils;
 
 use anyhow::Result;
@@ -12,7 +14,12 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::{
-    cfg::{ConcatOnlyCfg, FoldOnlyCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg},
+    cfg::{
+        ConcatOnlyCfg, FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg,
+    },
+    fingerprint::{foldback_pass1_support, is_real_foldback},
+    foldback::recursive_foldback_cut,
+    scratch::SigScratch,
     utils::RefineMode,
 };
 
@@ -43,13 +50,8 @@ fn main() -> Result<()> {
     let refine_window = *args.get_one::<usize>("refine_window").unwrap();
     let refine_arm = *args.get_one::<usize>("refine_arm").unwrap();
     let max_ed_rate = *args.get_one::<f32>("max_ed_rate").unwrap();
-
-    let fasta_reader = io::open_fasta_reader(fasta)?;
-    let mut fasta_writer = io::open_fasta_writer(output)?;
-
     let fold_diag_tol = *args.get_one::<i32>("fold_diag_tol").unwrap();
     let concat_diag_tol = *args.get_one::<i32>("concat_diag_tol").unwrap();
-
     // forward-only minimizers toggle
     let forward_only = *args.get_one::<bool>("forward_only").unwrap();
 
@@ -78,118 +80,140 @@ fn main() -> Result<()> {
             min_delta,
             cross_frac: 0.80, // optionally CLI-control this later
         },
+        fold2: FoldSecondPassCfg {
+            // TODO: sensible defaults + add to cli
+            min_support: 3,
+            split_tol_bp: 50,
+            min_identity: 0.6,
+        },
     };
+    let mut fold_scratch = scratch::FoldScratch::new();
+
+    // first pass
+    let support = foldback_pass1_support(&fasta, &cfg, &mut fold_scratch)?;
+    stderrln!("Foldback support map entries: {}", support.len())?;
+
+    let mut fasta_reader = io::open_fasta_reader(fasta)?;
+    let mut fasta_writer = io::open_fasta_writer(output)?;
 
     // output tsv
     let mut tsv = io::open_tsv_writer(report)?;
     writeln!(
         tsv,
-        "read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est"
+        "read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tsupport_n\tsupport_span\tdecision"
     )?;
 
-    let mut num_foldbacks = 0;
-    let mut num_concatemers = 0;
+    // tweakables (eventually CLI or cfg.fold2)
+    let max_depth = 5usize;
 
-    for record in fasta_reader.records() {
+    let mut num_foldbacks = 0;
+    let mut num_foldbacks_cut = 0usize;
+    let mut num_foldbacks_kept_real = 0usize;
+
+    let mut sig_scratch = SigScratch::default();
+
+    while let Some(record) = fasta_reader.next() {
         let r = record?;
         let seq = r.seq();
-        let id = r.id();
+        let id = std::str::from_utf8(r.id())?;
         let len = seq.len();
 
-        let fold = foldback::detect_foldback(seq, &cfg.shared, &cfg.fold);
-        let concat = concatemer::detect_concatemer(seq, &cfg.shared, &cfg.concat);
+        let fold = foldback::detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut fold_scratch);
 
         // ---- FASTA output (foldback correction) ----
-        if let Some(fb) = fold.as_ref() {
-            // refine split if possible; otherwise fall back to coarse
-            let split = match foldback::refine_breakpoint(seq, fb.split_pos, &cfg.shared) {
-                Some(rf) => rf.split_pos,
-                None => fb.split_pos,
-            };
+        if let Some(_) = fold.as_ref() {
+            // Decide whether to cut recursively
+            let kept = recursive_foldback_cut(
+                &seq,
+                &cfg,
+                &support,
+                max_depth,
+                &mut fold_scratch,
+                &mut sig_scratch,
+            )?;
 
-            // guard against pathological split values
-            let split = split.min(seq.len());
-
-            // suffix the ID
-            let out_id = io::split_id(id, 1);
-            io::write_fasta_record(&mut fasta_writer, &out_id, &seq[..split])?;
+            // i.e. if we got a recursive cut
+            if kept.len() < seq.len() {
+                // we actually cut at least once
+                num_foldbacks_cut += 1;
+                let out_id = io::split_id(id, 1);
+                io::write_fasta_record(&mut fasta_writer, &out_id, kept)?;
+            } else {
+                io::write_fasta_record(&mut fasta_writer, id, &seq)?;
+            }
         } else {
             // no foldback => passthrough
-            io::write_fasta_record(&mut fasta_writer, id, seq)?;
+            io::write_fasta_record(&mut fasta_writer, id, &seq)?;
         }
 
-        // ---- Foldback row ----
+        // ---- Foldback TSV row ----
         if let Some(fb) = fold {
-            let foldback::FoldBreakpoint {
-                split_pos,
-                score,
-                matches,
-                span,
-            } = fb;
-
-            let refined = foldback::refine_breakpoint(seq, split_pos, &cfg.shared);
-
             num_foldbacks += 1;
 
-            if let Some(rf) = refined {
-                writeln!(
-                    tsv,
-                    "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}",
-                    split_pos, rf.split_pos, matches, span, score, rf.score, rf.identity_est
-                )?;
-            } else {
-                writeln!(
-                    tsv,
-                    "{id}\t{len}\tfoldback\t1\t{}\t\t\t{}\t{}\t\t\t{}\t\t",
-                    split_pos, matches, span, score
-                )?;
-            }
-        }
-
-        // ---- Concatemer row ----
-        if let Some(cb) = concat {
-            let concatemer::ConcatBreakpoint {
-                split_pos,
-                score,
-                delta,
-                matches,
-                span,
-                cross_frac,
-                p2_span,
-            } = cb;
-
-            let refined =
-                concatemer::refine_concatemer_breakpoint(seq, split_pos, delta, &cfg.shared);
-
-            num_concatemers += 1;
+            let refined = foldback::refine_breakpoint(&seq, fb.split_pos, &cfg.shared);
 
             if let Some(rf) = refined {
+                // signature + decision if possible
+                let (decision, support_n, support_span) =
+                    if rf.identity_est >= cfg.fold2.min_identity {
+                        if let Some(sig) = fingerprint::foldback_signature(
+                            &seq,
+                            rf.split_pos,
+                            &cfg.shared,
+                            1000,
+                            12,
+                            &mut sig_scratch,
+                        ) {
+                            if let Some(st) = support.get(&sig) {
+                                let real = is_real_foldback(sig, &support, &cfg);
+                                if real {
+                                    num_foldbacks_kept_real += 1;
+                                }
+                                (
+                                    if real { "real" } else { "artefact" },
+                                    st.n,
+                                    st.split_span(),
+                                )
+                            } else {
+                                ("unknown", 0, 0)
+                            }
+                        } else {
+                            ("unknown", 0, 0)
+                        }
+                    } else {
+                        ("low_ident", 0, 0)
+                    };
+
                 writeln!(
                     tsv,
-                    "{id}\t{len}\tconcatemer\t1\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{:.3}",
-                    split_pos,
+                    "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}\t{}\t{}\t{}",
+                    fb.split_pos,
                     rf.split_pos,
-                    delta,
-                    matches,
-                    span,
-                    p2_span,
-                    cross_frac,
-                    score,
+                    fb.matches,
+                    fb.span,
+                    fb.score,
                     rf.score,
-                    rf.identity_est
+                    rf.identity_est,
+                    support_n,
+                    support_span,
+                    decision
                 )?;
             } else {
                 writeln!(
                     tsv,
-                    "{id}\t{len}\tconcatemer\t1\t{}\t\t{}\t{}\t{}\t{}\t{:.3}\t{}\t\t",
-                    split_pos, delta, matches, span, p2_span, cross_frac, score
+                    "{id}\t{len}\tfoldback\t1\t{}\t\t\t{}\t{}\t\t\t{}\t\t\t0\t0\tunknown",
+                    fb.split_pos, fb.matches, fb.span, fb.score
                 )?;
             }
         }
     }
 
     stderrln!("Total foldbacks detected: {}", num_foldbacks)?;
-    stderrln!("Total concatemers detected: {}", num_concatemers)?;
+    stderrln!("Total foldbacks cut (>=1 recursion): {}", num_foldbacks_cut)?;
+    stderrln!(
+        "Total foldbacks classified real (if enabled): {}",
+        num_foldbacks_kept_real
+    )?;
 
     Ok(())
 }

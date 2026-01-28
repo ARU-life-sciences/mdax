@@ -1,7 +1,38 @@
-use crate::cfg::{FoldOnlyCfg, SharedCfg};
-use crate::minimizer::sampled_minimizers;
-use crate::utils::{RefineMode, Refined, banded_edit_distance, div_floor};
-use gxhash::{HashMap, HashMapExt};
+use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
+use crate::fingerprint::{SupportStats, foldback_signature, is_real_foldback};
+use crate::minimizer::sampled_minimizers_into;
+use crate::scratch::{FoldScratch, SigScratch};
+use crate::utils::{
+    RefineMode, Refined, banded_edit_distance, comp, div_floor, revcomp_in_place, revcomp_into,
+};
+use gxhash::HashMap;
+
+#[derive(Copy, Clone, Debug)]
+pub struct BinStat {
+    count: usize,
+    min_p1: i32,
+    max_p1: i32,
+}
+impl BinStat {
+    fn new(p1: i32) -> Self {
+        Self {
+            count: 1,
+            min_p1: p1,
+            max_p1: p1,
+        }
+    }
+    fn update(&mut self, p1: i32) {
+        self.count += 1;
+        self.min_p1 = self.min_p1.min(p1);
+        self.max_p1 = self.max_p1.max(p1);
+    }
+    fn span(&self) -> usize {
+        (self.max_p1 as i64 - self.min_p1 as i64).max(0) as usize
+    }
+    fn score_proxy(&self) -> i64 {
+        self.span() as i64 + (self.count as i64 * 10)
+    }
+}
 
 /// IMPORTANT:
 /// This implementation uses *strand-specific* minimizers (forward-only) via:
@@ -14,50 +45,6 @@ use gxhash::{HashMap, HashMapExt};
 /// This makes the foldback detector more “Pacasus-like” in the sense that it is
 /// explicitly looking for strong reverse-complement self-similarity (anti-diagonal)
 /// without canonical-strand tie-breaking artifacts.
-
-/// Configuration for foldback detection.
-#[derive(Debug, Clone)]
-pub struct FoldCfg {
-    /// Sampling minimizer k value
-    pub k: usize,
-    /// Sampling minimizer window size
-    pub w: usize,
-    /// Diagonal bucketing tolerance when clustering matchpoints
-    pub diag_tol: i32,
-    /// Minimum palindrome arm length to actually call a palindrome (coarse span)
-    pub min_arm: usize,
-    /// Minimum number of minimizer matchpoints required to support a foldback candidate.
-    pub min_matches: usize,
-    /// Don't call breakpoints too close to read endpoints
-    pub end_guard: usize,
-    /// Half-width (bp) of the local search window used to refine a coarse breakpoint estimate.
-    pub refine_window: usize,
-    /// Arm length (bp) used during breakpoint refinement.
-    pub refine_arm: usize,
-    /// Refinement mode.
-    pub refine_mode: RefineMode,
-    /// Max edit-distance rate used to define band in ONT refinement.
-    pub max_ed_rate: f32,
-}
-
-impl Default for FoldCfg {
-    fn default() -> Self {
-        Self {
-            k: 17,
-            w: 21,
-            diag_tol: 120,
-            // NOTE: if you want “Pacasus-like” behavior on real ONT reads,
-            // you usually want this larger (hundreds–thousands), and CLI-controlled.
-            min_arm: 200,
-            min_matches: 10,
-            end_guard: 1000,
-            refine_window: 200,
-            refine_arm: 500,
-            refine_mode: RefineMode::HiFi,
-            max_ed_rate: 0.05,
-        }
-    }
-}
 
 /// Result of foldback detection (coarse).
 #[derive(Debug, Clone)]
@@ -125,6 +112,7 @@ pub fn refine_breakpoint_hamming(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Opti
     })
 }
 
+// for ONT data
 pub fn refine_breakpoint_banded_ed(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Option<Refined> {
     let n = seq.len();
     if s0 < cfg.refine.arm + cfg.refine.window || s0 + cfg.refine.arm + cfg.refine.window > n {
@@ -165,7 +153,7 @@ pub fn refine_breakpoint_banded_ed(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Op
 ///
 /// Method:
 /// 1) Compute *forward-only* minimizers on `seq` and on `revcomp(seq)` using NtHasher<false>
-/// 2) Index forward minimizers by their minimizer *value* (as returned by simd_minimizers)
+/// 2) Index forward minimizers by their minimizer *value*
 /// 3) For each minimizer on rc, match by value and convert rc pos -> forward coordinate
 /// 4) Cluster matchpoints by anti-diagonal d = p1 + p2 (within diag_tol)
 /// 5) Choose best cluster; return split ≈ median(d/2)
@@ -173,6 +161,7 @@ pub fn detect_foldback(
     seq: &[u8],
     shared: &SharedCfg,
     fold: &FoldOnlyCfg,
+    scratch: &mut FoldScratch,
 ) -> Option<FoldBreakpoint> {
     let k = shared.minimizer.k;
     let w = shared.minimizer.w;
@@ -182,150 +171,233 @@ pub fn detect_foldback(
     }
 
     // forward-only minimizers (or canonical if configured), returning (pos, value)
-    let (pos_f, val_f) = sampled_minimizers(seq, &shared.minimizer);
+    sampled_minimizers_into(
+        seq,
+        &shared.minimizer,
+        &mut scratch.pos_f,
+        &mut scratch.val_f,
+    );
 
-    let mut rc = seq.to_vec();
-    revcomp_in_place(&mut rc);
-    let (pos_rc, val_rc) = sampled_minimizers(&rc, &shared.minimizer);
+    scratch.rc.clear();
+    scratch.rc.extend_from_slice(seq);
+    revcomp_in_place(&mut scratch.rc);
+
+    sampled_minimizers_into(
+        &scratch.rc,
+        &shared.minimizer,
+        &mut scratch.pos_rc,
+        &mut scratch.val_rc,
+    );
+
+    let pos_f = &scratch.pos_f;
+    let val_f = &scratch.val_f;
+    let pos_rc = &scratch.pos_rc;
+    let val_rc = &scratch.val_rc;
 
     if pos_f.len() < shared.min_matches || pos_rc.len() < shared.min_matches {
         return None;
     }
 
-    // index forward minimizers by value -> positions
-    let mut idx_f: HashMap<u64, Vec<i32>> = HashMap::new();
+    // ---- 1) index forward minimizers by value -> positions (with cap) ----
+    // Avoid pathological buckets from low-complexity sequence.
+    const MAX_BUCKET: usize = 64;
+
+    scratch.idx_f.clear();
+    scratch.repetitive.clear();
+
     for (&p, &v) in pos_f.iter().zip(val_f.iter()) {
-        idx_f.entry(v).or_default().push(p as i32);
+        if scratch.repetitive.contains_key(&v) {
+            continue;
+        }
+        let e = scratch.idx_f.entry(v).or_default();
+        if e.len() < MAX_BUCKET {
+            e.push(p as i32);
+        } else {
+            // mark as repetitive; drop positions to stop quadratic blowups
+            scratch.idx_f.remove(&v);
+            scratch.repetitive.insert(v, ());
+        }
     }
 
-    // match rc minimizers by value, convert rc pos -> forward coordinate
+    // ---- 2) first phase: lightweight per-bin stats, choose best bin ----
     let n = seq.len() as i32;
     let k_i32 = k as i32;
 
-    let mut d_bins: HashMap<i32, Vec<(i32, i32)>> = HashMap::new();
+    scratch.stats.clear();
+
     for (&prc, &vrc) in pos_rc.iter().zip(val_rc.iter()) {
-        if let Some(p1s) = idx_f.get(&vrc) {
-            let p2 = n - k_i32 - (prc as i32); // rc start -> forward start
-            for &p1 in p1s {
-                let d = p1 + p2;
-                let bin = div_floor(d, shared.fold_diag_tol.max(1));
-                d_bins.entry(bin).or_default().push((p1, p2));
+        if scratch.repetitive.contains_key(&vrc) {
+            continue;
+        }
+        let Some(p1s) = scratch.idx_f.get(&vrc) else {
+            continue;
+        };
+
+        let p2 = n - k_i32 - (prc as i32);
+
+        for &p1 in p1s {
+            let d = p1 + p2;
+            let bin = div_floor(d, shared.fold_diag_tol.max(1));
+            scratch
+                .stats
+                .entry(bin)
+                .and_modify(|st| st.update(p1))
+                .or_insert_with(|| BinStat::new(p1));
+        }
+    }
+
+    // Choose best bin using gates + proxy score
+    let mut best_bin: Option<i32> = None;
+    let mut best_score: i64 = i64::MIN;
+    let mut best_count: usize = 0;
+
+    for (&bin, st) in scratch.stats.iter() {
+        if st.count < shared.min_matches {
+            continue;
+        }
+        if st.span() < fold.min_arm {
+            continue;
+        }
+        let sc = st.score_proxy();
+        if sc > best_score {
+            best_score = sc;
+            best_bin = Some(bin);
+            best_count = st.count;
+        }
+    }
+
+    let best_bin = best_bin?;
+
+    if best_count < shared.min_matches {
+        return None;
+    }
+
+    // ---- 3) second phase: collect points only for best bin ----
+    let cap = scratch.stats.get(&best_bin).map(|s| s.count).unwrap_or(0);
+    scratch.best_pts.clear();
+    scratch.best_pts.reserve(cap); // keeps capacity across reads
+
+    for (&prc, &vrc) in pos_rc.iter().zip(val_rc.iter()) {
+        if scratch.repetitive.contains_key(&vrc) {
+            continue;
+        }
+        let Some(p1s) = scratch.idx_f.get(&vrc) else {
+            continue;
+        };
+
+        let p2 = n - k_i32 - (prc as i32);
+
+        for &p1 in p1s {
+            let d = p1 + p2;
+            let bin = div_floor(d, shared.fold_diag_tol.max(1));
+            if bin == best_bin {
+                scratch.best_pts.push((p1, p2));
             }
         }
     }
 
-    best_bin_to_fold_breakpoint(&d_bins, shared, fold, seq.len())
+    if scratch.best_pts.len() < shared.min_matches {
+        return None;
+    }
+
+    // reuse existing scoring logic
+    fold_breakpoint_from_pts(&mut scratch.best_pts, shared, fold, seq.len())
 }
 
-fn best_bin_to_fold_breakpoint(
-    d_bins: &HashMap<i32, Vec<(i32, i32)>>,
+fn fold_breakpoint_from_pts(
+    pts: &mut Vec<(i32, i32)>,
     shared: &SharedCfg,
     fold: &FoldOnlyCfg,
     len: usize,
 ) -> Option<FoldBreakpoint> {
-    let mut best: Option<FoldBreakpoint> = None;
+    if pts.len() < shared.min_matches {
+        return None;
+    }
 
-    for (_bin, pts) in d_bins {
-        if pts.len() < shared.min_matches {
-            continue;
+    pts.sort_by_key(|(p1, _)| *p1);
+
+    // monotone anti-diagonal chain: p2 decreasing as p1 increases
+    let mut chain: Vec<(i32, i32)> = Vec::with_capacity(pts.len());
+    let mut last_p2 = i32::MAX;
+    for &(p1, p2) in pts.iter() {
+        if p2 < last_p2 {
+            chain.push((p1, p2));
+            last_p2 = p2;
         }
+    }
+    if chain.len() < shared.min_matches {
+        return None;
+    }
 
-        let mut v = pts.clone();
-        v.sort_by_key(|(p1, _)| *p1);
+    let p1_min = chain.first().unwrap().0 as i64;
+    let p1_max = chain.last().unwrap().0 as i64;
+    let span = (p1_max - p1_min).max(0) as usize;
+    if span < fold.min_arm {
+        return None;
+    }
 
-        // monotone anti-diagonal chain: p2 decreasing as p1 increases
-        let mut chain = Vec::new();
-        let mut last_p2 = i32::MAX;
-        for (p1, p2) in v {
-            if p2 < last_p2 {
-                chain.push((p1, p2));
-                last_p2 = p2;
-            }
-        }
-        if chain.len() < shared.min_matches {
-            continue;
-        }
+    // median d = p1 + p2 => split ≈ d/2
+    let mut ds: Vec<i32> = chain.iter().map(|(p1, p2)| p1 + p2).collect();
+    ds.sort_unstable();
+    let d_med = ds[ds.len() / 2];
+    let split_u = ((d_med as f64) / 2.0).round().max(0.0) as usize;
 
-        let p1_min = chain.first().unwrap().0 as i64;
-        let p1_max = chain.last().unwrap().0 as i64;
-        let span = (p1_max - p1_min).max(0) as usize;
-        if span < fold.min_arm {
-            continue;
-        }
+    if split_u < shared.end_guard || split_u + shared.end_guard > len {
+        return None;
+    }
 
-        // median d = p1 + p2 => split ≈ d/2
-        let mut ds: Vec<i32> = chain.iter().map(|(p1, p2)| p1 + p2).collect();
-        ds.sort_unstable();
-        let d_med = ds[ds.len() / 2];
-        let split_u = ((d_med as f64) / 2.0).round().max(0.0) as usize;
+    let score = span as i64 + (chain.len() as i64 * 10);
+    Some(FoldBreakpoint {
+        split_pos: split_u,
+        score,
+        matches: chain.len(),
+        span,
+    })
+}
 
-        if split_u < shared.end_guard || split_u + shared.end_guard > len {
-            continue;
-        }
-
-        let score = span as i64 + (chain.len() as i64 * 10);
-        let bp = FoldBreakpoint {
-            split_pos: split_u,
-            score,
-            matches: chain.len(),
-            span,
+pub fn recursive_foldback_cut<'a>(
+    mut seq: &'a [u8],
+    cfg: &MdaxCfg,
+    support: &HashMap<u64, SupportStats>,
+    max_depth: usize,
+    scratch: &mut FoldScratch,
+    sig_scratch: &mut SigScratch,
+) -> anyhow::Result<&'a [u8]> {
+    for _ in 0..max_depth {
+        let Some(fb) = detect_foldback(seq, &cfg.shared, &cfg.fold, scratch) else {
+            break;
         };
-
-        if best.as_ref().map(|b| bp.score > b.score).unwrap_or(true) {
-            best = Some(bp);
+        let Some(rf) = refine_breakpoint(seq, fb.split_pos, &cfg.shared) else {
+            break;
+        };
+        if rf.identity_est < cfg.fold2.min_identity {
+            break;
         }
-    }
 
-    best
-}
+        let Some(sig) = foldback_signature(seq, rf.split_pos, &cfg.shared, 1000, 12, sig_scratch)
+        else {
+            break;
+        };
+        if is_real_foldback(sig, support, cfg) {
+            // don't cut
+            break;
+        }
 
-/// Write reverse-complement of `src` into `dst`.
-#[inline]
-fn revcomp_into(src: &[u8], dst: &mut [u8]) {
-    debug_assert_eq!(src.len(), dst.len());
-    let mut i = 0usize;
-    let mut j = src.len();
-    while i < src.len() {
-        j -= 1;
-        dst[i] = comp(src[j]);
-        i += 1;
-    }
-}
+        // artefact -> cut left
 
-/// Return the DNA complement of a base.
-/// Non-ACGT bases are mapped to 'N'.
-#[inline]
-fn comp(b: u8) -> u8 {
-    match b {
-        b'A' | b'a' => b'T',
-        b'C' | b'c' => b'G',
-        b'G' | b'g' => b'C',
-        b'T' | b't' => b'A',
-        _ => b'N',
+        let split = rf.split_pos.min(seq.len());
+        seq = &seq[..split];
     }
-}
-
-/// Reverse-complement in place (ACGTN; other -> N)
-fn revcomp_in_place(seq: &mut [u8]) {
-    let mut i = 0usize;
-    let mut j = seq.len().saturating_sub(1);
-    while i < j {
-        let a = comp(seq[i]);
-        let b = comp(seq[j]);
-        seq[i] = b;
-        seq[j] = a;
-        i += 1;
-        j = j.saturating_sub(1);
-    }
-    if i == j && i < seq.len() {
-        seq[i] = comp(seq[i]);
-    }
+    Ok(seq)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cfg::{ConcatOnlyCfg, FoldOnlyCfg, MinimizerCfg, RefineCfg, SharedCfg};
+    use crate::{
+        cfg::{FoldOnlyCfg, MinimizerCfg, RefineCfg, SharedCfg},
+        scratch,
+    };
 
     fn test_fold_cfg(
         k: usize,
@@ -442,8 +514,9 @@ mod tests {
         let (s, true_bp) = make_noisy_foldback_from_left(left, join, 0, 0, 0);
 
         let (shared, fold) = test_fold_cfg(9, 11, 50, 20, 5, 0, 0, RefineMode::HiFi, 0.0);
+        let mut scratch = scratch::FoldScratch::new();
 
-        let bp = detect_foldback(&s, &shared, &fold).unwrap();
+        let bp = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
 
         assert!((bp.split_pos as i32 - true_bp as i32).abs() <= 20);
     }
@@ -455,8 +528,9 @@ mod tests {
         let (s, true_bp) = make_noisy_foldback_from_left(left, join, 12, 0, 0);
 
         let (shared, fold) = test_fold_cfg(9, 11, 50, 20, 5, 10, 30, RefineMode::HiFi, 0.0);
+        let mut scratch = scratch::FoldScratch::new();
 
-        let coarse = detect_foldback(&s, &shared, &fold).unwrap();
+        let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
 
         let refined = refine_breakpoint(&s, coarse.split_pos, &shared).unwrap();
 
@@ -472,7 +546,8 @@ mod tests {
 
         let (shared, fold) = test_fold_cfg(7, 9, 120, 30, 3, 40, 60, RefineMode::ONT, 0.35);
 
-        let coarse = detect_foldback(&s, &shared, &fold).unwrap();
+        let mut scratch = scratch::FoldScratch::new();
+        let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
 
         let refined = refine_breakpoint(&s, coarse.split_pos, &shared).expect("should refine");
 
@@ -499,8 +574,9 @@ mod tests {
             RefineMode::HiFi,
             0.35, // max_ed_rate (used when mode=ONT)
         );
+        let mut scratch = scratch::FoldScratch::new();
 
-        let coarse = detect_foldback(&s, &shared, &fold).unwrap();
+        let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
 
         shared.refine.mode = RefineMode::HiFi;
         let hifi = refine_breakpoint(&s, coarse.split_pos, &shared);

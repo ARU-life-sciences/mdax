@@ -1,11 +1,12 @@
 use crate::utils::RefineMode;
 
-/// Global configuration for mdax: shared knobs + per-detector knobs.
+/// Global configuration for mdax: shared + per-detector.
 #[derive(Debug, Clone)]
 pub struct MdaxCfg {
     pub shared: SharedCfg,
     pub fold: FoldOnlyCfg,
     pub concat: ConcatOnlyCfg,
+    pub fold2: FoldSecondPassCfg,
 }
 
 impl Default for MdaxCfg {
@@ -14,6 +15,7 @@ impl Default for MdaxCfg {
             shared: SharedCfg::default(),
             fold: FoldOnlyCfg::default(),
             concat: ConcatOnlyCfg::default(),
+            fold2: FoldSecondPassCfg::default(),
         }
     }
 }
@@ -26,10 +28,7 @@ pub struct MinimizerCfg {
 
     /// If true, use strand-specific forward-only minimizers (NtHasher<false>).
     /// If false, use canonical minimizers (strand-agnostic).
-    ///
-    /// Recommendation:
-    /// - foldback: true
-    /// - concatemer: true (for consistency with foldback)
+    /// Should generally use forward_only=true for mdax.
     pub forward_only: bool,
 }
 
@@ -63,7 +62,7 @@ impl Default for RefineCfg {
     }
 }
 
-/// Shared knobs across foldback + concatemer detection.
+/// Shared across foldback + concatemer detection.
 #[derive(Debug, Clone)]
 pub struct SharedCfg {
     pub minimizer: MinimizerCfg,
@@ -96,7 +95,7 @@ impl Default for SharedCfg {
     }
 }
 
-/// Foldback-only gates (everything else is in SharedCfg).
+/// Foldback-only gates.
 #[derive(Debug, Clone)]
 pub struct FoldOnlyCfg {
     /// Minimum “arm evidence span” (bp) on p1 for anti-diagonal chain.
@@ -128,6 +127,29 @@ impl Default for ConcatOnlyCfg {
             min_span: 2000,
             min_delta: 2000,
             cross_frac: 0.80,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FoldSecondPassCfg {
+    // Minimum number of reads supporting the same junction fingerprint
+    // to call it "real" and therefore DO NOT correct by default.
+    pub min_support: usize,
+
+    // If supported, splits must cluster within this tolerance (bp) to be “real”.
+    pub split_tol_bp: usize,
+
+    // Minimum arm identity (refinement identity_est) to accept as a foldback candidate.
+    pub min_identity: f32,
+}
+
+impl Default for FoldSecondPassCfg {
+    fn default() -> Self {
+        Self {
+            min_support: 3,
+            split_tol_bp: 100,
+            min_identity: 0.60,
         }
     }
 }
