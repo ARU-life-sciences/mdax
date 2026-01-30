@@ -1,9 +1,10 @@
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
 use crate::fingerprint::{SupportStats, foldback_signature, is_real_foldback};
 use crate::minimizer::sampled_minimizers_into;
-use crate::scratch::{FoldScratch, SigScratch};
+use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
 use crate::utils::{
-    RefineMode, Refined, banded_edit_distance, comp, div_floor, revcomp_in_place, revcomp_into,
+    RefineMode, Refined, banded_edit_distance_scratch, comp, div_floor, revcomp_in_place,
+    revcomp_into,
 };
 use gxhash::HashMap;
 
@@ -56,7 +57,12 @@ pub struct FoldBreakpoint {
 }
 
 /// Refine an inexact breakpoint estimate `s0` into a more exact split position.
-pub fn refine_breakpoint(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Option<Refined> {
+pub fn refine_breakpoint(
+    seq: &[u8],
+    s0: usize,
+    cfg: &SharedCfg,
+    refine_scratch: &mut RefineScratch,
+) -> Option<Refined> {
     let n = seq.len();
     if s0 < cfg.refine.arm + cfg.refine.window || s0 + cfg.refine.arm + cfg.refine.window > n {
         eprintln!(
@@ -67,7 +73,7 @@ pub fn refine_breakpoint(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Option<Refin
     }
     match cfg.refine.mode {
         RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, cfg),
-        RefineMode::ONT => refine_breakpoint_banded_ed(seq, s0, cfg),
+        RefineMode::ONT => refine_breakpoint_banded_ed(seq, s0, cfg, refine_scratch),
     }
 }
 
@@ -113,11 +119,13 @@ pub fn refine_breakpoint_hamming(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Opti
 }
 
 // for ONT data
-pub fn refine_breakpoint_banded_ed(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Option<Refined> {
-    let n = seq.len();
-    if s0 < cfg.refine.arm + cfg.refine.window || s0 + cfg.refine.arm + cfg.refine.window > n {
-        return None;
-    }
+pub fn refine_breakpoint_banded_ed(
+    seq: &[u8],
+    s0: usize,
+    cfg: &SharedCfg,
+    scratch: &mut crate::scratch::RefineScratch,
+) -> Option<Refined> {
+    // ... bounds checks ...
 
     let mut band = (cfg.refine.max_ed_rate.max(0.0) * cfg.refine.arm as f32).ceil() as usize;
     band = band.max(1).min(cfg.refine.arm);
@@ -125,21 +133,38 @@ pub fn refine_breakpoint_banded_ed(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Op
     let mut best_s = s0;
     let mut best_ed: usize = usize::MAX;
 
-    let mut right_rc = vec![b'N'; cfg.refine.arm];
+    scratch.right_rc.resize(cfg.refine.arm, b'N');
+    let mut found = false;
 
     for s in (s0 - cfg.refine.window)..=(s0 + cfg.refine.window) {
         let left = &seq[s - cfg.refine.arm..s];
         let right = &seq[s..s + cfg.refine.arm];
 
-        revcomp_into(right, &mut right_rc);
+        revcomp_into(right, &mut scratch.right_rc);
 
-        let ed = banded_edit_distance(left, &right_rc, band);
+        let ed = banded_edit_distance_scratch(
+            left,
+            &scratch.right_rc,
+            band,
+            &mut scratch.prev,
+            &mut scratch.curr,
+        );
+
+        // If ed == band+1, true distance is > band => treat as failure
+        if ed > band {
+            continue;
+        }
+        found = true;
+
         if ed < best_ed {
             best_ed = ed;
             best_s = s;
         }
     }
 
+    if !found {
+        return None; // or identity_est=0.0
+    }
     let identity = (1.0 - (best_ed as f32 / cfg.refine.arm as f32)).clamp(0.0, 1.0);
 
     Some(Refined {
@@ -367,15 +392,22 @@ pub fn recursive_foldback_cut<'a>(
         let Some(fb) = detect_foldback(seq, &cfg.shared, &cfg.fold, scratch) else {
             break;
         };
-        let Some(rf) = refine_breakpoint(seq, fb.split_pos, &cfg.shared) else {
+        let Some(rf) = refine_breakpoint(seq, fb.split_pos, &cfg.shared, &mut scratch.refine)
+        else {
             break;
         };
         if rf.identity_est < cfg.fold2.min_identity {
             break;
         }
 
-        let Some(sig) = foldback_signature(seq, rf.split_pos, &cfg.shared, 1000, 12, sig_scratch)
-        else {
+        let Some(sig) = foldback_signature(
+            seq,
+            rf.split_pos,
+            &cfg.shared,
+            cfg.sig.flank_bp,
+            cfg.sig.take,
+            sig_scratch,
+        ) else {
             break;
         };
         if is_real_foldback(sig, support, cfg) {
@@ -426,7 +458,6 @@ mod tests {
                     max_ed_rate,
                 },
                 fold_diag_tol: diag_tol,
-                concat_diag_tol: diag_tol, // irrelevant for foldback tests
             },
             FoldOnlyCfg { min_arm },
         )
@@ -531,8 +562,9 @@ mod tests {
         let mut scratch = scratch::FoldScratch::new();
 
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
+        let refine_scratch = &mut RefineScratch::default();
 
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared).unwrap();
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch).unwrap();
 
         assert!((refined.split_pos as i32 - true_bp as i32).abs() <= 2);
 
@@ -548,8 +580,10 @@ mod tests {
 
         let mut scratch = scratch::FoldScratch::new();
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
+        let refine_scratch = &mut RefineScratch::default();
 
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared).expect("should refine");
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch)
+            .expect("should refine");
 
         assert!(refined.identity_est > 0.6);
         assert!(
@@ -577,12 +611,13 @@ mod tests {
         let mut scratch = scratch::FoldScratch::new();
 
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
+        let refine_scratch = &mut RefineScratch::default();
 
         shared.refine.mode = RefineMode::HiFi;
-        let hifi = refine_breakpoint(&s, coarse.split_pos, &shared);
+        let hifi = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch);
 
         shared.refine.mode = RefineMode::ONT;
-        let ont = refine_breakpoint(&s, coarse.split_pos, &shared).unwrap();
+        let ont = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch).unwrap();
 
         assert!(ont.identity_est > 0.4);
         assert!(

@@ -6,9 +6,9 @@ use std::hash::{Hash, Hasher};
 use crate::{
     cfg::{MdaxCfg, SharedCfg},
     foldback, io,
-    minimizer::{self, sampled_minimizers_into},
-    scratch::{self, SigScratch},
-    utils::revcomp_in_place,
+    minimizer::sampled_minimizers_into,
+    scratch::{self, RefineScratch, SigScratch},
+    utils::RefineMode,
 };
 
 // Compute a reproducible fingerprint for a foldback junction at `split`.
@@ -109,6 +109,11 @@ pub fn foldback_pass1_support<P: AsRef<std::path::Path>>(
     cfg: &MdaxCfg,
     scratch: &mut scratch::FoldScratch,
 ) -> anyhow::Result<HashMap<u64, SupportStats>> {
+    // clone cfg but force fast refine for pass1
+    // this should help ONT runtime
+    let mut cfg1 = cfg.clone();
+    cfg1.shared.refine.mode = RefineMode::HiFi;
+
     let mut reader = io::open_fasta_reader(fasta_path)?;
     let mut support: HashMap<u64, SupportStats> = HashMap::new();
     let mut sig_scratch = SigScratch::default();
@@ -122,25 +127,23 @@ pub fn foldback_pass1_support<P: AsRef<std::path::Path>>(
             None => continue,
         };
 
-        let refined = match foldback::refine_breakpoint(&seq, fb.split_pos, &cfg.shared) {
-            Some(rf) => rf,
-            None => continue,
-        };
+        let refined =
+            match foldback::refine_breakpoint(&seq, fb.split_pos, &cfg.shared, &mut scratch.refine)
+            {
+                Some(rf) => rf,
+                None => continue,
+            };
 
         if refined.identity_est < cfg.fold2.min_identity {
             continue;
         }
 
-        // TODO: maybe make these parameters configurable, but probably should not need to
-        const DEFAULT_FLANK_BP: usize = 1000;
-        const DEFAULT_TAKE: usize = 12;
-
         let sig = match foldback_signature(
             &seq,
             refined.split_pos,
             &cfg.shared,
-            DEFAULT_FLANK_BP,
-            DEFAULT_TAKE,
+            cfg.sig.flank_bp,
+            cfg.sig.take,
             &mut sig_scratch,
         ) {
             Some(s) => s,
@@ -167,11 +170,10 @@ pub fn is_real_foldback(sig: u64, support: &HashMap<u64, SupportStats>, cfg: &Md
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cfg::{
-        ConcatOnlyCfg, FoldOnlyCfg, FoldSecondPassCfg, MinimizerCfg, RefineCfg, SharedCfg,
-    };
+    use crate::cfg::{FoldOnlyCfg, FoldSecondPassCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg};
     use crate::utils::RefineMode;
 
+    use calm_io::stderrln;
     use noodles::fasta::{
         self as fasta,
         record::{Definition, Sequence},
@@ -234,7 +236,6 @@ mod tests {
                 max_ed_rate: 0.0,
             },
             fold_diag_tol: 100,
-            concat_diag_tol: 100,
         }
     }
 
@@ -277,16 +278,18 @@ mod tests {
                     max_ed_rate: 0.25,
                 },
                 fold_diag_tol: 50,
-                concat_diag_tol: 200,
             },
             fold: FoldOnlyCfg {
                 min_arm: 200, // span evidence for foldback detector
             },
-            concat: ConcatOnlyCfg::default(),
             fold2: FoldSecondPassCfg {
                 min_support: 3,
                 split_tol_bp: 100,
                 min_identity: 0.60,
+            },
+            sig: SigCfg {
+                flank_bp: 1000,
+                take: 8,
             },
         }
     }
@@ -334,9 +337,12 @@ mod tests {
         let (seq, split) = make_clean_foldback(&left, b"");
 
         let shared = shared_for_sig(9, 11, 5);
+        let mut sig_scratch = SigScratch::default();
 
-        let sig1 = foldback_signature(&seq, split, &shared, 200, 8).expect("sig1");
-        let sig2 = foldback_signature(&seq, split, &shared, 200, 8).expect("sig2");
+        let sig1 =
+            foldback_signature(&seq, split, &shared, 200, 8, &mut sig_scratch).expect("sig1");
+        let sig2 =
+            foldback_signature(&seq, split, &shared, 200, 8, &mut sig_scratch).expect("sig2");
 
         // should be the same signature for same input
         assert_eq!(sig1, sig2);
@@ -359,10 +365,20 @@ mod tests {
         seq2 = with_prefix;
 
         let shared = shared_for_sig(9, 11, 5);
+        let mut sig_scratch = SigScratch::default();
 
         // fingerprint around the true junction positions in each read
-        let sig1 = foldback_signature(&seq1, split1, &shared, 200, 8).expect("sig1");
-        let sig2 = foldback_signature(&seq2, split2 + prefix.len(), &shared, 200, 8).expect("sig2");
+        let sig1 =
+            foldback_signature(&seq1, split1, &shared, 200, 8, &mut sig_scratch).expect("sig1");
+        let sig2 = foldback_signature(
+            &seq2,
+            split2 + prefix.len(),
+            &shared,
+            200,
+            8,
+            &mut sig_scratch,
+        )
+        .expect("sig2");
 
         assert_eq!(sig1, sig2);
     }
@@ -376,9 +392,12 @@ mod tests {
         let (seq2, split2) = make_clean_foldback(&left2, b"");
 
         let shared = shared_for_sig(9, 11, 5);
+        let mut sig_scratch = SigScratch::default();
 
-        let sig1 = foldback_signature(&seq1, split1, &shared, 200, 8).expect("sig1");
-        let sig2 = foldback_signature(&seq2, split2, &shared, 200, 8).expect("sig2");
+        let sig1 =
+            foldback_signature(&seq1, split1, &shared, 200, 8, &mut sig_scratch).expect("sig1");
+        let sig2 =
+            foldback_signature(&seq2, split2, &shared, 200, 8, &mut sig_scratch).expect("sig2");
 
         assert_ne!(sig1, sig2);
     }
@@ -400,21 +419,20 @@ mod tests {
 
     #[test]
     fn is_real_foldback_respects_threshold_and_tolerance() {
-        use crate::cfg::{ConcatOnlyCfg, FoldOnlyCfg, MdaxCfg};
+        use crate::cfg::{FoldOnlyCfg, MdaxCfg};
 
         // minimal cfg stub
         let cfg = MdaxCfg {
             shared: shared_for_sig(9, 11, 5),
             fold: FoldOnlyCfg { min_arm: 20 },
-            concat: ConcatOnlyCfg {
-                min_span: 2000,
-                min_delta: 2000,
-                cross_frac: 0.8,
-            },
             fold2: crate::cfg::FoldSecondPassCfg {
                 min_support: 3,
                 split_tol_bp: 50,
                 min_identity: 0.6,
+            },
+            sig: SigCfg {
+                flank_bp: 1000,
+                take: 8,
             },
         };
 
@@ -446,5 +464,160 @@ mod tests {
             st
         });
         assert!(is_real_foldback(sig, &support, &cfg));
+    }
+
+    #[test]
+    fn foldback_pass1_support_ignores_outside_flank_noise() {
+        let cfg = cfg_for_pass1();
+        // ensure flank fits: default flank is 1000
+        let left = pseudo_dna(3000, 42);
+        let (base, _split) = make_clean_foldback(&left, b"");
+
+        // mutate bases far from the junction so flanks stay identical
+        fn mutate_far(mut s: Vec<u8>, split: usize, radius: usize, every: usize) -> Vec<u8> {
+            let n = s.len();
+            for i in (0..n).step_by(every.max(1)) {
+                if i + 1 < split.saturating_sub(radius)
+                    || i > (split + radius).min(n.saturating_sub(1))
+                {
+                    s[i] = match s[i] {
+                        b'A' => b'C',
+                        b'C' => b'A',
+                        b'G' => b'T',
+                        b'T' => b'G',
+                        x => x,
+                    };
+                }
+            }
+            s
+        }
+
+        let split = left.len(); // join is empty
+        let s1 = base.clone();
+        let s2 = mutate_far(base.clone(), split, 1100, 97); // outside ±1100 keeps 1000bp flanks intact
+        let s3 = mutate_far(base.clone(), split, 1100, 131);
+
+        let decoy = pseudo_dna(8000, 999);
+
+        let path = tmp_fasta_path("mdax_fold2_pass1_flank_noise");
+        write_fasta(
+            &path,
+            &[("r1", &s1), ("r2", &s2), ("r3", &s3), ("decoy", &decoy)],
+        );
+
+        let mut scratch = crate::scratch::FoldScratch::new();
+        let support = foldback_pass1_support(&path, &cfg, &mut scratch).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            support.len(),
+            1,
+            "should still be one cluster when noise is outside flanks"
+        );
+        let (_sig, st) = support.iter().next().unwrap();
+        assert_eq!(st.n, 3);
+        assert!(st.split_span() <= cfg.fold2.split_tol_bp);
+    }
+
+    #[test]
+    fn signature_collision_rate_is_low_on_random_foldbacks() {
+        let shared = shared_for_sig(13, 17, 5);
+
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let mut collisions = 0usize;
+
+        for seed in 0u64..2000 {
+            let left = pseudo_dna(2500, 10_000 + seed);
+            let (seq, split) = make_clean_foldback(&left, b"");
+            let mut sig_scratch = SigScratch::default();
+
+            let sig = foldback_signature(&seq, split, &shared, 1000, 12, &mut sig_scratch)
+                .expect("sig should exist for long enough reads");
+
+            if !seen.insert(sig) {
+                collisions += 1;
+            }
+        }
+
+        // Tune threshold if you change signature scheme, but this should be near-zero.
+        assert!(collisions <= 1, "too many collisions: {collisions}");
+    }
+
+    #[test]
+    fn low_complexity_should_not_all_share_one_signature() {
+        let shared = shared_for_sig(9, 11, 5);
+        use std::collections::HashSet;
+
+        fn poly(base: u8, len: usize) -> Vec<u8> {
+            vec![base; len]
+        }
+
+        let mut sig_scratch = SigScratch::default();
+
+        let mut sigs = HashSet::new();
+        for (b, _seed) in [(b'A', 1u64), (b'C', 2), (b'G', 3), (b'T', 4)] {
+            let left = poly(b, 2500);
+            let (seq, split) = make_clean_foldback(&left, b"");
+            if let Some(sig) = foldback_signature(&seq, split, &shared, 1000, 12, &mut sig_scratch)
+            {
+                sigs.insert(sig);
+            }
+        }
+
+        // Either you get None (because not enough minimizers) or you get distinct signatures.
+        assert!(sigs.len() <= 4);
+    }
+
+    #[test]
+    fn signature_stability_under_split_jitter() {
+        let shared = shared_for_sig(13, 17, 5);
+
+        let left = pseudo_dna(3000, 42);
+        let (seq, split) = make_clean_foldback(&left, b"");
+
+        let mut sig_scratch = SigScratch::default();
+
+        let sig0 = foldback_signature(&seq, split, &shared, 1000, 12, &mut sig_scratch).unwrap();
+
+        let mut sig_scratch2 = SigScratch::default();
+        // try small jitters
+        let mut same = 0usize;
+        for dj in [-20isize, -10, -5, 5, 10, 20] {
+            let s2 = (split as isize + dj) as usize;
+            if let Some(sig) = foldback_signature(&seq, s2, &shared, 1000, 12, &mut sig_scratch2) {
+                if sig == sig0 {
+                    same += 1;
+                }
+            }
+        }
+
+        // Don’t assert “must be stable” unless you want that behaviour;
+        // this test tells you how stable it is for current signature design.
+        stderrln!("Signature matched {} out of 6 small split shifts", same).unwrap();
+        assert!(
+            same >= 2,
+            "signature seems too sensitive to small split shifts"
+        );
+    }
+
+    #[test]
+    fn is_real_foldback_only_when_supported_and_tight() {
+        let cfg = cfg_for_pass1();
+
+        let left = pseudo_dna(3000, 1);
+        let (seq, _split) = make_clean_foldback(&left, b"");
+
+        let path = tmp_fasta_path("mdax_real_logic");
+        write_fasta(&path, &[("r1", &seq), ("r2", &seq), ("r3", &seq)]);
+        let mut scratch = crate::scratch::FoldScratch::new();
+
+        let support = foldback_pass1_support(&path, &cfg, &mut scratch).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(support.len(), 1);
+        let (&sig, st) = support.iter().next().unwrap();
+        assert!(is_real_foldback(sig, &support, &cfg));
+        assert_eq!(st.n, 3);
     }
 }

@@ -1,6 +1,5 @@
 mod cfg;
 mod cli;
-mod concatemer;
 mod fingerprint;
 mod foldback;
 mod io;
@@ -15,17 +14,37 @@ use std::path::PathBuf;
 
 use crate::{
     cfg::{
-        ConcatOnlyCfg, FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg,
+        CallMode, FairnessParams, FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg,
+        SharedCfg, SigCfg,
     },
     fingerprint::{foldback_pass1_support, is_real_foldback},
     foldback::recursive_foldback_cut,
-    scratch::SigScratch,
+    scratch::{RefineScratch, SigScratch},
     utils::RefineMode,
 };
+
+fn fmt_param<T: std::fmt::Display + PartialEq>(
+    name: &str,
+    effective: T,
+    mode_default: T,
+) -> String {
+    if effective == mode_default {
+        format!("{name}={effective}")
+    } else {
+        format!("{name}={effective} (override; mode={mode_default})")
+    }
+}
 
 fn main() -> Result<()> {
     let args = cli::build_cli();
 
+    // for testing
+    let fairness_baseline = args.get_flag("fairness_baseline")
+        || std::env::var("MDAX_FAIRNESS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+    // inputs and outputs
     let fasta = args
         .get_one::<PathBuf>("input")
         .expect("not allowed no input");
@@ -33,27 +52,89 @@ fn main() -> Result<()> {
         .get_one::<PathBuf>("output")
         .expect("not allowed no output");
     let report = args.get_one::<PathBuf>("report").unwrap();
-    let k = *args.get_one::<usize>("k").expect("defaulted k of 17");
-    let w = *args.get_one::<usize>("w").expect("defaulted w of 21");
-    let min_span = *args
-        .get_one::<usize>("min_span")
-        .expect("defaulted min_span of 2000");
-    let min_matches = *args
+
+    // deal with the baseline mode
+    let mode = *args
+        .get_one::<CallMode>("mode")
+        .unwrap_or(&CallMode::Balanced);
+    let t = mode.tuning();
+
+    // params overriding tuning
+    let mut max_depth = *args.get_one::<usize>("max_depth").unwrap_or(&t.max_depth);
+    let mut min_matches = *args
         .get_one::<usize>("min_matches")
-        .expect("defaulted min_matches of 40");
-    let refine_mode = *args
-        .get_one::<RefineMode>("refine_mode")
-        .unwrap_or(&RefineMode::HiFi);
-    // also all defaulted
-    let min_delta = *args.get_one::<usize>("min_delta").unwrap();
-    let end_guard = *args.get_one::<usize>("end_guard").unwrap();
-    let refine_window = *args.get_one::<usize>("refine_window").unwrap();
-    let refine_arm = *args.get_one::<usize>("refine_arm").unwrap();
-    let max_ed_rate = *args.get_one::<f32>("max_ed_rate").unwrap();
-    let fold_diag_tol = *args.get_one::<i32>("fold_diag_tol").unwrap();
-    let concat_diag_tol = *args.get_one::<i32>("concat_diag_tol").unwrap();
-    // forward-only minimizers toggle
-    let forward_only = *args.get_one::<bool>("forward_only").unwrap();
+        .unwrap_or(&t.min_matches);
+    let mut min_span = *args.get_one::<usize>("min_span").unwrap_or(&t.min_span);
+    let mut min_identity = *args
+        .get_one::<f32>("min_identity")
+        .unwrap_or(&t.min_identity);
+    let mut min_support = *args
+        .get_one::<usize>("min_support")
+        .unwrap_or(&t.min_support);
+    let mut split_tol_bp = *args
+        .get_one::<usize>("split_tol_bp")
+        .unwrap_or(&t.split_tol_bp);
+
+    let mut k = *args.get_one::<usize>("k").expect("defaulted k of 17");
+    let mut w = *args.get_one::<usize>("w").expect("defaulted w of 21");
+    // w must be odd, so error out here if it's not
+    if w % 2 == 0 {
+        anyhow::bail!("Window size `w` must be odd, got {}", w);
+    }
+    let mut forward_only = *args.get_one::<bool>("forward_only").unwrap();
+
+    let mut refine_mode = *args.get_one::<RefineMode>("refine_mode").unwrap();
+    let mut refine_window = *args.get_one::<usize>("refine_window").unwrap();
+    let mut refine_arm = *args.get_one::<usize>("refine_arm").unwrap();
+    let mut max_ed_rate = *args.get_one::<f32>("max_ed_rate").unwrap();
+
+    let mut end_guard = *args.get_one::<usize>("end_guard").unwrap();
+    let mut fold_diag_tol = *args.get_one::<i32>("fold_diag_tol").unwrap();
+
+    // TODO: override on cli later?
+    let mut sig_flank_bp = t.sig_flank_bp;
+    let mut sig_take = t.sig_take;
+
+    let msg = [
+        fmt_param("min_matches", min_matches, t.min_matches),
+        fmt_param("min_span", min_span, t.min_span),
+        fmt_param("min_identity", min_identity, t.min_identity),
+        fmt_param("min_support", min_support, t.min_support),
+        fmt_param("split_tol_bp", split_tol_bp, t.split_tol_bp),
+        fmt_param("max_depth", max_depth, t.max_depth),
+    ]
+    .join("\n  ");
+
+    let fairness = if fairness_baseline {
+        Some(FairnessParams::baseline())
+    } else {
+        None
+    };
+
+    if let Some(f) = fairness.as_ref() {
+        // detection thresholds
+        min_matches = f.min_matches;
+        min_span = f.min_span;
+        min_identity = f.min_identity;
+        min_support = f.min_support;
+        split_tol_bp = f.split_tol_bp;
+        max_depth = f.max_depth;
+
+        // minimizers
+        k = f.k;
+        w = f.w;
+        forward_only = f.forward_only;
+
+        // refinement
+        refine_mode = f.refine_mode;
+        refine_window = f.refine_window;
+        refine_arm = f.refine_arm;
+        max_ed_rate = f.max_ed_rate;
+
+        // guards
+        end_guard = f.end_guard;
+        fold_diag_tol = f.fold_diag_tol;
+    }
 
     // cfg here:
     let cfg = MdaxCfg {
@@ -68,30 +149,70 @@ fn main() -> Result<()> {
                 max_ed_rate,
             },
             fold_diag_tol,
-            concat_diag_tol,
         },
         fold: FoldOnlyCfg {
             // This is the foldback “arm evidence span” threshold.
             // If you want a dedicated fold option, add a separate CLI flag.
             min_arm: min_span,
         },
-        concat: ConcatOnlyCfg {
-            min_span,
-            min_delta,
-            cross_frac: 0.80, // optionally CLI-control this later
-        },
         fold2: FoldSecondPassCfg {
             // TODO: sensible defaults + add to cli
-            min_support: 3,
-            split_tol_bp: 50,
-            min_identity: 0.6,
+            min_support,
+            split_tol_bp,
+            min_identity,
+        },
+        sig: SigCfg {
+            flank_bp: sig_flank_bp,
+            take: sig_take,
         },
     };
+
+    if fairness_baseline {
+        stderrln!("FAIRNESS BASELINE ENABLED (developer mode)")?;
+        stderrln!(
+            "Locked parameters: k={} w={} forward_only={} refine={:?}",
+            k,
+            w,
+            forward_only,
+            refine_mode
+        )?;
+    }
+
+    stderrln!("Mode={mode:?} effective parameters:\n  {msg}")?;
+
     let mut fold_scratch = scratch::FoldScratch::new();
 
-    // first pass
+    // first pass to store support for foldbacks
     let support = foldback_pass1_support(&fasta, &cfg, &mut fold_scratch)?;
     stderrln!("Foldback support map entries: {}", support.len())?;
+
+    let mut n1 = 0usize;
+    let mut n2 = 0usize;
+    let mut n3 = 0usize;
+    let mut nge4 = 0usize;
+    let mut spans: Vec<usize> = Vec::new();
+
+    for st in support.values() {
+        match st.n {
+            0 | 1 => n1 += 1,
+            2 => n2 += 1,
+            3 => n3 += 1,
+            _ => nge4 += 1,
+        }
+        spans.push(st.split_span());
+    }
+    spans.sort_unstable();
+
+    stderrln!(
+        "Support clusters: total={}  n=1:{} n=2:{} n=3:{} n>=4:{}  span_median:{} span_p95:{}",
+        support.len(),
+        n1,
+        n2,
+        n3,
+        nge4,
+        spans.get(spans.len() / 2).copied().unwrap_or(0),
+        spans.get((spans.len() * 95) / 100).copied().unwrap_or(0),
+    )?;
 
     let mut fasta_reader = io::open_fasta_reader(fasta)?;
     let mut fasta_writer = io::open_fasta_writer(output)?;
@@ -103,14 +224,12 @@ fn main() -> Result<()> {
         "read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tsupport_n\tsupport_span\tdecision"
     )?;
 
-    // tweakables (eventually CLI or cfg.fold2)
-    let max_depth = 5usize;
-
     let mut num_foldbacks = 0;
     let mut num_foldbacks_cut = 0usize;
     let mut num_foldbacks_kept_real = 0usize;
 
     let mut sig_scratch = SigScratch::default();
+    let mut refine_scratch = &mut RefineScratch::default();
 
     while let Some(record) = fasta_reader.next() {
         let r = record?;
@@ -150,7 +269,12 @@ fn main() -> Result<()> {
         if let Some(fb) = fold {
             num_foldbacks += 1;
 
-            let refined = foldback::refine_breakpoint(&seq, fb.split_pos, &cfg.shared);
+            let refined = foldback::refine_breakpoint(
+                &seq,
+                fb.split_pos,
+                &cfg.shared,
+                &mut fold_scratch.refine,
+            );
 
             if let Some(rf) = refined {
                 // signature + decision if possible
@@ -160,8 +284,8 @@ fn main() -> Result<()> {
                             &seq,
                             rf.split_pos,
                             &cfg.shared,
-                            1000,
-                            12,
+                            cfg.sig.flank_bp,
+                            cfg.sig.take,
                             &mut sig_scratch,
                         ) {
                             if let Some(st) = support.get(&sig) {

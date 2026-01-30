@@ -5,10 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
-bio = "3.0.0"
 calm_io = "0.1.1"
 clap = { version = "4.5.54", features = ["cargo"] }
 flate2 = "1.1.8"
 gxhash = "3.5.0"
+needletail = "0.6.3"
+noodles = { version = "0.104.0", features = ["fasta"] }
 packed-seq = "4.4.1"
 simd-minimizers = "2.2.0"

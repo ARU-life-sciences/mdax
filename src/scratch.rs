@@ -1,3 +1,5 @@
+// scratch buffers to reuse
+// so that we don't have to allocate memory repeatedly
 use gxhash::HashMapExt;
 
 use crate::foldback::BinStat;
@@ -16,6 +18,8 @@ pub struct FoldScratch {
     pub repetitive: gxhash::HashMap<u64, ()>,
     pub stats: gxhash::HashMap<i32, BinStat>,
     pub best_pts: Vec<(i32, i32)>,
+
+    pub refine: RefineScratch,
 }
 
 impl FoldScratch {
@@ -30,6 +34,7 @@ impl FoldScratch {
             repetitive: gxhash::HashMap::new(),
             stats: gxhash::HashMap::new(),
             best_pts: Vec::new(),
+            refine: RefineScratch::default(),
         }
     }
 
@@ -54,4 +59,11 @@ pub struct SigScratch {
 
     // combined values (for hashing)
     pub combined: Vec<u64>,
+}
+
+#[derive(Debug, Default)]
+pub struct RefineScratch {
+    pub right_rc: Vec<u8>,
+    pub prev: Vec<usize>,
+    pub curr: Vec<usize>,
 }

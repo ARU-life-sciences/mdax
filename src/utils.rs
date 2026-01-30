@@ -28,40 +28,37 @@ pub fn div_floor(x: i32, d: i32) -> i32 {
 // all candidates are "bad" under the current band.
 //
 // Complexity: O(len(a) * band)
-pub fn banded_edit_distance(a: &[u8], b: &[u8], band: usize) -> usize {
+pub fn banded_edit_distance_scratch(
+    a: &[u8],
+    b: &[u8],
+    band: usize,
+    prev: &mut Vec<usize>,
+    curr: &mut Vec<usize>,
+) -> usize {
     let n = a.len();
     let m = b.len();
+    let inf = band + 1;
 
-    if n == 0 {
-        return m.min(band + 1);
-    }
-    if m == 0 {
-        return n.min(band + 1);
-    }
+    prev.resize(m + 1, inf);
+    curr.resize(m + 1, inf);
 
-    let maxd = band;
-    let inf = maxd + 1;
-
-    let mut prev = vec![inf; m + 1];
-    let mut curr = vec![inf; m + 1];
-
+    // init prev row
     prev[0] = 0;
     for j in 1..=m {
-        prev[j] = if j <= maxd { j } else { inf };
+        prev[j] = if j <= band { j } else { inf };
     }
 
     for i in 1..=n {
-        let i_is = i as isize;
-        let band_is = maxd as isize;
-
-        let j_min = (1isize.max(i_is - band_is)) as usize;
-        let j_max = (m as isize).min(i_is + band_is) as usize;
-
-        // reset current row
+        // reset curr row to inf
         for v in curr.iter_mut() {
             *v = inf;
         }
-        curr[0] = if i <= maxd { i } else { inf };
+        curr[0] = if i <= band { i } else { inf };
+
+        let i_is = i as isize;
+        let band_is = band as isize;
+        let j_min = (1isize.max(i_is - band_is)) as usize;
+        let j_max = (m as isize).min(i_is + band_is) as usize;
 
         let mut row_best = inf;
 
@@ -77,15 +74,14 @@ pub fn banded_edit_distance(a: &[u8], b: &[u8], band: usize) -> usize {
             row_best = row_best.min(v);
         }
 
-        // Early exit: if best in row already exceeds band, we can stop.
-        if row_best > maxd {
-            return maxd + 1;
+        if row_best > band {
+            return band + 1;
         }
 
-        std::mem::swap(&mut prev, &mut curr);
+        std::mem::swap(prev, curr);
     }
 
-    prev[m].min(maxd + 1)
+    prev[m].min(band + 1)
 }
 
 // Write reverse-complement of `src` into `dst`.

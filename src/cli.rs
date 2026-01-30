@@ -1,4 +1,4 @@
-use crate::utils::RefineMode;
+use crate::{cfg::CallMode, utils::RefineMode};
 use clap::{Arg, ArgMatches, Command, ValueEnum, builder::PossibleValue, value_parser};
 use std::path::PathBuf;
 
@@ -63,18 +63,35 @@ pub fn build_cli() -> ArgMatches {
         // Prevents calling short/random palindromic matches.
         .arg(
             Arg::new("min_span")
-                .help("Minimum evidence span (bp) for calling a foldback/concatemer")
+                .help("Override: minimum evidence span (bp) for calling a foldback/concatemer")
                 .long("min-span")
-                .default_value("2000")
                 .value_parser(value_parser!(usize)),
         )
         .arg(
-            Arg::new("min_delta")
-                .help("Minimum repeat offset (bp) to ignore local tandem repeats")
-                .long("min-delta")
-                .default_value("2000")
-                .value_parser(value_parser!(usize)),
+            Arg::new("min_identity")
+              .long("min-identity")
+              .help("Override: minimum refinement identity for foldback second pass")
+              .value_parser(value_parser!(f32)),
         )
+        .arg(
+            Arg::new("min_support")
+              .long("min-support")
+              .help("Override: minimum support reads for 'real' foldback")
+              .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("split_tol_bp")
+              .long("split-tol-bp")
+              .help("Override: max split span (bp) within a signature cluster")
+              .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("max_depth")
+              .long("max-depth")
+              .help("Override: maximum recursion depth for chopping")
+              .value_parser(value_parser!(usize)),
+        )
+        // TODO: deleted min_delta, I think this was just for concatemers
         .arg(
             Arg::new("end_guard")
                 .help("Do not call breakpoints within this distance of read ends (bp)")
@@ -86,7 +103,7 @@ pub fn build_cli() -> ArgMatches {
             Arg::new("refine_window")
                 .help("Refinement half-window around coarse split (bp)")
                 .long("refine-window")
-                .default_value("200")
+                .default_value("100")
                 .value_parser(value_parser!(usize)),
         )
         .arg(
@@ -98,7 +115,7 @@ pub fn build_cli() -> ArgMatches {
         )
         .arg(
             Arg::new("max_ed_rate")
-                .help("ONT refinement bandwidth as fraction of arm (e.g. 0.2)")
+                .help("ONT refinement bandwidth as fraction of arm")
                 .long("max-ed-rate")
                 .default_value("0.25")
                 .value_parser(value_parser!(f32)),
@@ -107,9 +124,8 @@ pub fn build_cli() -> ArgMatches {
         // Higher values reduce false positives but require more coverage of the palindrome.
         .arg(
             Arg::new("min_matches")
-                .help("Minimum minimizer matches supporting a foldback candidate")
+                .help("Override: minimum minimizer matches supporting a foldback candidate")
                 .long("min-matches")
-                .default_value("20")
                 .value_parser(value_parser!(usize)),
         )
         .arg(
@@ -139,7 +155,22 @@ pub fn build_cli() -> ArgMatches {
                 .help("Refine breakpoints for reads")
                 .short('m')
                 .long("refine-mode")
+                .default_value("hifi")
                 .value_parser(value_parser!(RefineMode)),
+        )
+        .arg(
+              Arg::new("mode")
+                .help("Detection/correction strictness: strict reduces calls, permissive increases calls")
+                .long("mode")
+                .default_value("balanced")
+                .value_parser(value_parser!(CallMode)),
+        )
+        .arg(
+            Arg::new("fairness_baseline")
+                .long("fairness-baseline")
+                .hide(true) 
+                .help("Developer-only: lock parameters for fair benchmarking")
+                .action(clap::ArgAction::SetTrue),
         );
 
     c.get_matches()
@@ -181,5 +212,39 @@ impl std::str::FromStr for RefineMode {
             }
         }
         Err(format!("invalid variant: {s}"))
+    }
+}
+
+impl ValueEnum for CallMode {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[CallMode::Strict, CallMode::Balanced, CallMode::Permissive]
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        Some(match self {
+            CallMode::Strict => PossibleValue::new("strict")
+                .help("Fewer calls/cuts; higher thresholds; keeps more reads"),
+            CallMode::Balanced => PossibleValue::new("balanced").help("Reasonable defaults"),
+            CallMode::Permissive => PossibleValue::new("permissive")
+                .help("More calls/cuts; lower thresholds; exploratory"),
+        })
+    }
+}
+
+impl std::fmt::Display for CallMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value().unwrap().get_name().fmt(f)
+    }
+}
+
+impl std::str::FromStr for CallMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        for variant in Self::value_variants() {
+            if variant.to_possible_value().unwrap().matches(s, false) {
+                return Ok(*variant);
+            }
+        }
+        Err(format!("invalid mode: {s}"))
     }
 }
