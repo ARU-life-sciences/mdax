@@ -1,3 +1,13 @@
+pub fn write_fasta(f: &mut impl std::io::Write, id: &str, seq: &[u8]) -> std::io::Result<()> {
+    f.write_all(b">")?;
+    f.write_all(id.as_bytes())?;
+    f.write_all(b"\n")?;
+    // write sequence as a single line (fastest)
+    f.write_all(seq)?;
+    f.write_all(b"\n")?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Refined {
     pub split_pos: usize,

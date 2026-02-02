@@ -1,5 +1,5 @@
 use crate::{cfg::CallMode, utils::RefineMode};
-use clap::{Arg, ArgMatches, Command, ValueEnum, builder::PossibleValue, value_parser};
+use clap::{builder::PossibleValue, value_parser, Arg, ArgMatches, Command, ValueEnum};
 use std::path::PathBuf;
 
 pub fn build_cli() -> ArgMatches {

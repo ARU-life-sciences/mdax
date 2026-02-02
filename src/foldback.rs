@@ -206,8 +206,8 @@ pub fn detect_foldback(
         &mut scratch.val_f,
     );
 
-    scratch.rc.clear();
-    scratch.rc.extend_from_slice(seq);
+    scratch.rc.resize(seq.len(), 0);
+    scratch.rc.copy_from_slice(seq);
     revcomp_in_place(&mut scratch.rc);
 
     sampled_minimizers_into(

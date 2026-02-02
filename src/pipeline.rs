@@ -1,11 +1,6 @@
 use anyhow::Result;
 use crossbeam_channel as chan;
 use gxhash::{HashMap, HashMapExt};
-use noodles::fasta::{
-    Record,
-    record::{Definition, Sequence},
-};
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -18,7 +13,7 @@ use crate::{
     },
     foldback, io,
     scratch::{FoldScratch, SigScratch},
-    utils::RefineMode,
+    utils::{RefineMode, write_fasta},
 };
 
 #[derive(Default, Debug, Clone)]
@@ -262,7 +257,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
     use std::io::Write;
 
     let (tx, rx) = chan::bounded::<Job>(chan_cap);
-    let (out_tx, out_rx) = chan::bounded::<OutRec>(chan_cap);
+    let (out_tx, out_rx) = chan::bounded::<OutRec>(chan_cap * 8);
 
     // ----------------
     // Reader thread
@@ -291,7 +286,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
     // Writer thread (single)
     // ----------------
     let writer_handle = thread::spawn(move || -> Result<()> {
-        let mut fasta_writer = noodles::fasta::io::Writer::new(fasta_file);
+        let mut fasta_out = std::io::BufWriter::new(fasta_file);
         let mut tsv_writer = tsv_sink.into_writer();
 
         // TSV header once
@@ -300,40 +295,15 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
             "read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tsupport_n\tsupport_span\tdecision"
         )?;
 
-        let mut next: u64 = 0;
-        let mut buf: BTreeMap<u64, OutRec> = BTreeMap::new();
-
         // This loop ends when ALL out_tx senders are dropped (after workers exit)
         while let Ok(rec) = out_rx.recv() {
-            buf.insert(rec.idx, rec);
+            // FASTA
+            write_fasta(&mut fasta_out, &rec.id, &rec.kept_seq)?;
 
-            while let Some(r) = buf.remove(&next) {
-                // FASTA
-                let def = Definition::new(r.id.as_str(), None);
-                let seq = Sequence::from(r.kept_seq);
-                let record = Record::new(def, seq);
-                fasta_writer.write_record(&record)?;
-
-                // TSV
-                if let Some(line) = r.tsv_row {
-                    writeln!(tsv_writer, "{line}")?;
-                }
-
-                next += 1;
-            }
-        }
-
-        // Flush any remaining in-order records (should normally be none)
-        while let Some(r) = buf.remove(&next) {
-            let def = Definition::new(r.id.as_str(), None);
-            let seq = Sequence::from(r.kept_seq);
-            let record = Record::new(def, seq);
-            fasta_writer.write_record(&record)?;
-
-            if let Some(line) = r.tsv_row {
+            // TSV
+            if let Some(line) = rec.tsv_row {
                 writeln!(tsv_writer, "{line}")?;
             }
-            next += 1;
         }
 
         tsv_writer.flush()?;

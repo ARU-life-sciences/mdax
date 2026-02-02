@@ -193,10 +193,6 @@ mod tests {
 
     use calm_io::stderrln;
     use gxhash::HashMapExt;
-    use noodles::fasta::{
-        self as fasta,
-        record::{Definition, Sequence},
-    };
     use std::fs::File;
     use std::io::BufWriter;
     use std::sync::Arc;
@@ -271,12 +267,9 @@ mod tests {
 
     fn write_fasta(path: &std::path::Path, records: &[(&str, &[u8])]) {
         let f = File::create(path).expect("create temp fasta");
-        let mut w = fasta::io::Writer::new(BufWriter::new(f));
+        let mut w = std::io::BufWriter::new(f);
         for (id, seq) in records {
-            let definition = Definition::new(*id, None);
-            let sequence = Sequence::from(seq.to_vec());
-            let record = fasta::Record::new(definition, sequence);
-            w.write_record(&record).expect("write record");
+            crate::utils::write_fasta(&mut w, id, seq).unwrap();
         }
     }
 
