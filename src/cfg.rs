@@ -192,7 +192,7 @@ impl CallMode {
                 min_support: 2,
                 split_tol_bp: 100,
                 max_depth: 8,
-                sig_flank_bp: 400,
+                sig_flank_bp: 200,
                 sig_take: 6,
                 sig_value_shift: 8,
             },

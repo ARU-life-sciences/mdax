@@ -9,6 +9,47 @@ use crate::{
     scratch::SigScratch,
 };
 
+// NOTE: This function destructively filters `matches` in-place.
+pub fn foldback_signature_from_local_matches(
+    matches: &mut Vec<(usize, u64)>, // (pos, val)
+    split: usize,
+    window_bp: usize,
+    take: usize,
+    value_shift: u8,
+) -> Option<u64> {
+    // Keep only matches close to the junction
+    matches.retain(|(pos, _)| {
+        let d = if *pos > split {
+            *pos - split
+        } else {
+            split - *pos
+        };
+        d <= window_bp
+    });
+
+    if matches.len() < take {
+        return None;
+    }
+
+    // Extract values only
+    let mut vals: Vec<u64> = matches.iter().map(|(_, v)| *v).collect();
+
+    // MinHash-style reduction
+    vals.sort_unstable();
+    vals.truncate(take);
+
+    if value_shift > 0 {
+        for v in vals.iter_mut() {
+            *v >>= value_shift;
+        }
+        vals.sort_unstable();
+    }
+
+    let mut h = gxhash::GxHasher::default();
+    vals.hash(&mut h);
+    Some(h.finish())
+}
+
 pub fn foldback_signature_from_matches(
     best_vals: &mut Vec<u64>,
     take: usize,
@@ -145,7 +186,9 @@ pub fn is_real_foldback(sig: u64, support: &HashMap<u64, SupportStats>, cfg: &Md
 mod tests {
     use super::*;
     use crate::cfg::{FoldOnlyCfg, FoldSecondPassCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg};
+    use crate::foldback::detect_foldback;
     use crate::pipeline::pass1_build_support;
+    use crate::scratch::FoldScratch;
     use crate::utils::RefineMode;
 
     use calm_io::stderrln;
@@ -267,6 +310,7 @@ mod tests {
             sig: SigCfg {
                 flank_bp: 1000,
                 take: 8,
+                value_shift: 0,
             },
         }
     }
@@ -316,11 +360,12 @@ mod tests {
 
         let shared = shared_for_sig(9, 11, 5);
         let mut sig_scratch = SigScratch::default();
+        let value_shift = 0;
 
-        let sig1 =
-            foldback_signature(&seq, split, &shared, 200, 8, &mut sig_scratch).expect("sig1");
-        let sig2 =
-            foldback_signature(&seq, split, &shared, 200, 8, &mut sig_scratch).expect("sig2");
+        let sig1 = foldback_signature(&seq, split, &shared, 200, 8, &mut sig_scratch, value_shift)
+            .expect("sig1");
+        let sig2 = foldback_signature(&seq, split, &shared, 200, 8, &mut sig_scratch, value_shift)
+            .expect("sig2");
 
         // should be the same signature for same input
         assert_eq!(sig1, sig2);
@@ -344,10 +389,19 @@ mod tests {
 
         let shared = shared_for_sig(9, 11, 5);
         let mut sig_scratch = SigScratch::default();
+        let value_shift = 0;
 
         // fingerprint around the true junction positions in each read
-        let sig1 =
-            foldback_signature(&seq1, split1, &shared, 200, 8, &mut sig_scratch).expect("sig1");
+        let sig1 = foldback_signature(
+            &seq1,
+            split1,
+            &shared,
+            200,
+            8,
+            &mut sig_scratch,
+            value_shift,
+        )
+        .expect("sig1");
         let sig2 = foldback_signature(
             &seq2,
             split2 + prefix.len(),
@@ -355,6 +409,7 @@ mod tests {
             200,
             8,
             &mut sig_scratch,
+            value_shift,
         )
         .expect("sig2");
 
@@ -371,11 +426,28 @@ mod tests {
 
         let shared = shared_for_sig(9, 11, 5);
         let mut sig_scratch = SigScratch::default();
+        let value_shift = 0;
 
-        let sig1 =
-            foldback_signature(&seq1, split1, &shared, 200, 8, &mut sig_scratch).expect("sig1");
-        let sig2 =
-            foldback_signature(&seq2, split2, &shared, 200, 8, &mut sig_scratch).expect("sig2");
+        let sig1 = foldback_signature(
+            &seq1,
+            split1,
+            &shared,
+            200,
+            8,
+            &mut sig_scratch,
+            value_shift,
+        )
+        .expect("sig1");
+        let sig2 = foldback_signature(
+            &seq2,
+            split2,
+            &shared,
+            200,
+            8,
+            &mut sig_scratch,
+            value_shift,
+        )
+        .expect("sig2");
 
         assert_ne!(sig1, sig2);
     }
@@ -411,6 +483,7 @@ mod tests {
             sig: SigCfg {
                 flank_bp: 1000,
                 take: 8,
+                value_shift: 0,
             },
         };
 
@@ -510,9 +583,18 @@ mod tests {
             let left = pseudo_dna(2500, 10_000 + seed);
             let (seq, split) = make_clean_foldback(&left, b"");
             let mut sig_scratch = SigScratch::default();
+            let value_shift = 0;
 
-            let sig = foldback_signature(&seq, split, &shared, 1000, 12, &mut sig_scratch)
-                .expect("sig should exist for long enough reads");
+            let sig = foldback_signature(
+                &seq,
+                split,
+                &shared,
+                1000,
+                12,
+                &mut sig_scratch,
+                value_shift,
+            )
+            .expect("sig should exist for long enough reads");
 
             if !seen.insert(sig) {
                 collisions += 1;
@@ -538,8 +620,16 @@ mod tests {
         for (b, _seed) in [(b'A', 1u64), (b'C', 2), (b'G', 3), (b'T', 4)] {
             let left = poly(b, 2500);
             let (seq, split) = make_clean_foldback(&left, b"");
-            if let Some(sig) = foldback_signature(&seq, split, &shared, 1000, 12, &mut sig_scratch)
-            {
+            let value_shift = 0;
+            if let Some(sig) = foldback_signature(
+                &seq,
+                split,
+                &shared,
+                1000,
+                12,
+                &mut sig_scratch,
+                value_shift,
+            ) {
                 sigs.insert(sig);
             }
         }
@@ -556,15 +646,27 @@ mod tests {
         let (seq, split) = make_clean_foldback(&left, b"");
 
         let mut sig_scratch = SigScratch::default();
-
-        let sig0 = foldback_signature(&seq, split, &shared, 1000, 12, &mut sig_scratch).unwrap();
+        let value_shift = 0;
+        let sig0 = foldback_signature(
+            &seq,
+            split,
+            &shared,
+            1000,
+            12,
+            &mut sig_scratch,
+            value_shift,
+        )
+        .unwrap();
 
         let mut sig_scratch2 = SigScratch::default();
         // try small jitters
         let mut same = 0usize;
         for dj in [-20isize, -10, -5, 5, 10, 20] {
             let s2 = (split as isize + dj) as usize;
-            if let Some(sig) = foldback_signature(&seq, s2, &shared, 1000, 12, &mut sig_scratch2) {
+            let value_shift = 0;
+            if let Some(sig) =
+                foldback_signature(&seq, s2, &shared, 1000, 12, &mut sig_scratch2, value_shift)
+            {
                 if sig == sig0 {
                     same += 1;
                 }
@@ -599,5 +701,61 @@ mod tests {
         let (&sig, st) = support.iter().next().unwrap();
         assert!(is_real_foldback(sig, &support, &cfg2));
         assert_eq!(st.n, 3);
+    }
+
+    #[test]
+    fn local_match_signature_stable_under_refinement_jitter() {
+        let cfg = cfg_for_pass1();
+
+        let left = pseudo_dna(3000, 123);
+        let (seq, split) = make_clean_foldback(&left, b"");
+
+        let mut scratch = FoldScratch::new();
+
+        let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch).unwrap();
+
+        let mut sigs = std::collections::HashSet::new();
+
+        for dj in [-30isize, -10, 0, 10, 30] {
+            let s = (fb.split_pos as isize + dj) as usize;
+            let sig = foldback_signature_from_local_matches(
+                &mut scratch.best_matches.clone(),
+                s,
+                cfg.sig.flank_bp,
+                cfg.sig.take,
+                cfg.sig.value_shift,
+            );
+            if let Some(sig) = sig {
+                sigs.insert(sig);
+            }
+        }
+
+        assert_eq!(
+            sigs.len(),
+            1,
+            "local match-based signature should be stable to small split jitter"
+        );
+    }
+
+    #[test]
+    fn local_match_signature_ignores_distant_matches() {
+        let mut matches = vec![
+            (1000, 1),
+            (1020, 2),
+            (980, 3),
+            (50_000, 999), // far away
+            (60_000, 888), // far away
+        ];
+
+        let sig = foldback_signature_from_local_matches(
+            &mut matches,
+            1000,
+            100, // tight window
+            3,
+            0,
+        );
+
+        assert!(sig.is_some());
+        assert!(matches.len() <= 3, "distant matches should be removed");
     }
 }

@@ -72,6 +72,10 @@ fn main() -> Result<()> {
     let mut split_tol_bp = *args
         .get_one::<usize>("split_tol_bp")
         .unwrap_or(&t.split_tol_bp);
+    let mut sig_flank_bp = *args
+        .get_one::<usize>("sig_flank_bp")
+        .unwrap_or(&t.sig_flank_bp);
+    let mut sig_take = *args.get_one::<usize>("sig_take").unwrap_or(&t.sig_take);
 
     let mut k = *args.get_one::<usize>("k").expect("defaulted k of 17");
     let mut w = *args.get_one::<usize>("w").expect("defaulted w of 21");
@@ -89,10 +93,6 @@ fn main() -> Result<()> {
     let mut end_guard = *args.get_one::<usize>("end_guard").unwrap();
     let mut fold_diag_tol = *args.get_one::<i32>("fold_diag_tol").unwrap();
 
-    // TODO: override on cli later?
-    let mut sig_flank_bp = t.sig_flank_bp;
-    let mut sig_take = t.sig_take;
-
     let msg = [
         fmt_param("min_matches", min_matches, t.min_matches),
         fmt_param("min_span", min_span, t.min_span),
@@ -100,6 +100,8 @@ fn main() -> Result<()> {
         fmt_param("min_support", min_support, t.min_support),
         fmt_param("split_tol_bp", split_tol_bp, t.split_tol_bp),
         fmt_param("max_depth", max_depth, t.max_depth),
+        fmt_param("sig_flank_bp", sig_flank_bp, t.sig_flank_bp),
+        fmt_param("sig_take", sig_take, t.sig_take),
     ]
     .join("\n  ");
 

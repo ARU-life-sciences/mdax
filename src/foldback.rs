@@ -1,6 +1,7 @@
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
 use crate::fingerprint::{
-    SupportStats, foldback_signature, foldback_signature_from_matches, is_real_foldback,
+    SupportStats, foldback_signature, foldback_signature_from_local_matches,
+    foldback_signature_from_matches, is_real_foldback,
 };
 use crate::minimizer::sampled_minimizers_into;
 use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
@@ -302,9 +303,9 @@ pub fn detect_foldback(
     // ---- 3) second phase: collect points only for best bin ----
     let cap = scratch.stats.get(&best_bin).map(|s| s.count).unwrap_or(0);
     scratch.best_pts.clear();
-    scratch.best_vals.clear();
+    scratch.best_matches.clear();
     scratch.best_pts.reserve(cap);
-    scratch.best_vals.reserve(cap);
+    scratch.best_matches.reserve(cap);
 
     for (&prc, &vrc) in pos_rc.iter().zip(val_rc.iter()) {
         if scratch.repetitive.contains_key(&vrc) {
@@ -321,7 +322,8 @@ pub fn detect_foldback(
             let bin = div_floor(d, shared.fold_diag_tol.max(1));
             if bin == best_bin {
                 scratch.best_pts.push((p1, p2));
-                scratch.best_vals.push(vrc); // store the shared seed value
+                // TODO: is this correct?
+                scratch.best_matches.push((p2 as usize, vrc));
             }
         }
     }
@@ -406,14 +408,16 @@ pub fn recursive_foldback_cut<'a>(
         }
 
         // Prefer evidence-based signature (more robust to refinement jitter).
-        let sig = foldback_signature_from_matches(
-            &mut scratch.best_vals,
+        let sig = foldback_signature_from_local_matches(
+            &mut scratch.best_matches,
+            rf.split_pos,
+            cfg.sig.flank_bp,
             cfg.sig.take,
             cfg.sig.value_shift,
         )
         .or_else(|| {
             // fallback: flank signature, but quantize split
-            let q = 50usize;
+            let q = 150usize;
             let split_q = (rf.split_pos / q) * q;
 
             foldback_signature(
@@ -441,6 +445,88 @@ pub fn recursive_foldback_cut<'a>(
         let split = rf.split_pos.min(seq.len());
         seq = &seq[..split];
     }
+    Ok(seq)
+}
+
+pub fn recursive_foldback_cut_from_first<'a>(
+    mut seq: &'a [u8],
+    first_fb: FoldBreakpoint,
+    first_rf: Refined,
+    cfg: &MdaxCfg,
+    support: &HashMap<u64, SupportStats>,
+    max_depth: usize,
+    scratch: &mut FoldScratch,
+    sig_scratch: &mut SigScratch,
+) -> anyhow::Result<&'a [u8]> {
+    // We already have the first hit/refine. After the first cut, detect/refine normally.
+    let mut fb_opt = Some(first_fb);
+    let mut rf_opt = Some(first_rf);
+
+    for _ in 0..max_depth {
+        // --- 1) detect foldback (skip for first iteration) ---
+        let fb = match fb_opt.take() {
+            Some(fb) => fb,
+            None => match detect_foldback(seq, &cfg.shared, &cfg.fold, scratch) {
+                Some(fb) => fb,
+                None => break,
+            },
+        };
+
+        // --- 2) refine breakpoint (skip for first iteration) ---
+        let rf = match rf_opt.take() {
+            Some(rf) => rf,
+            None => match refine_breakpoint(seq, fb.split_pos, &cfg.shared, &mut scratch.refine) {
+                Some(rf) => rf,
+                None => break,
+            },
+        };
+
+        if rf.identity_est < cfg.fold2.min_identity {
+            break;
+        }
+
+        // --- 3) signature (prefer local matches computed by detect_foldback) ---
+        // Important: on the first iteration, scratch.best_matches is already populated
+        // because pass2 called detect_foldback before calling this function.
+        let sig = foldback_signature_from_local_matches(
+            &mut scratch.best_matches,
+            rf.split_pos,
+            cfg.sig.flank_bp,
+            cfg.sig.take,
+            cfg.sig.value_shift,
+        )
+        .or_else(|| {
+            // fallback: flank signature, quantize split
+            let q = 150usize;
+            let split_q = (rf.split_pos / q) * q;
+
+            foldback_signature(
+                seq,
+                split_q,
+                &cfg.shared,
+                cfg.sig.flank_bp,
+                cfg.sig.take,
+                sig_scratch,
+                cfg.sig.value_shift,
+            )
+        });
+
+        let Some(sig) = sig else {
+            break;
+        };
+
+        if is_real_foldback(sig, support, cfg) {
+            // real -> don't cut
+            break;
+        }
+
+        // artefact -> cut left
+        let split = rf.split_pos.min(seq.len());
+        seq = &seq[..split];
+
+        // next iteration will (re)detect/refine on the shortened seq
+    }
+
     Ok(seq)
 }
 

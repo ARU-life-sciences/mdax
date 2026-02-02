@@ -166,6 +166,18 @@ pub fn build_cli() -> ArgMatches {
                 .value_parser(value_parser!(CallMode)),
         )
         .arg(
+            Arg::new("sig_flank_bp")
+                .long("sig-flank-bp")
+                .help("Window (bp) around split for match-based fingerprinting")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("sig_take")
+                .long("sig-take")
+                .help("Number of minimizer hashes retained for foldback fingerprint")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
             Arg::new("fairness_baseline")
                 .long("fairness-baseline")
                 .hide(true) 

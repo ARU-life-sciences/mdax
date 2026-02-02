@@ -13,7 +13,8 @@ use std::thread;
 use crate::{
     cfg::MdaxCfg,
     fingerprint::{
-        SupportStats, foldback_signature, foldback_signature_from_matches, is_real_foldback,
+        SupportStats, foldback_signature, foldback_signature_from_local_matches,
+        foldback_signature_from_matches, is_real_foldback,
     },
     foldback, io,
     scratch::{FoldScratch, SigScratch},
@@ -168,11 +169,11 @@ pub fn pass1_build_support<P: AsRef<Path>>(
 
                     // Prefer evidence-based signature from the matched minimizer seeds
                     // that supported the best anti-diagonal bin (more tolerant to split jitter).
-                    let sig = foldback_signature_from_matches(&mut fold_scratch.best_vals, cfg.sig.take, cfg.sig.value_shift)
+                    let sig = foldback_signature_from_local_matches(&mut fold_scratch.best_matches, rf.split_pos, cfg.sig.flank_bp, cfg.sig.take, cfg.sig.value_shift)
                         .or_else(|| {
                             // Fallback to flank-based signature (still useful, but more split-sensitive).
                             // Quantize split so pass1/pass2 behave consistently.
-                            let q = 50usize;
+                            let q = 150usize;
                             let split_q = (rf.split_pos / q) * q;
 
                             foldback_signature(
@@ -368,42 +369,42 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
 
             while let Ok(job) = rx.recv() {
                 dbg.bump("jobs");
-                dbg_every!(dbg.jobs, 50_000, "[pass2 worker] jobs={} detected={} refined={} ident_ok={} sig_ok={} in_support={}",
-                    dbg.jobs, dbg.detected, dbg.refined, dbg.ident_ok, dbg.sig_ok, dbg.sig_in_support);
+                dbg_every!(
+                    dbg.jobs,
+                    50_000,
+                    "[pass2 worker] jobs={} detected={} refined={} ident_ok={} sig_ok={} in_support={}",
+                    dbg.jobs,
+                    dbg.detected,
+                    dbg.refined,
+                    dbg.ident_ok,
+                    dbg.sig_ok,
+                    dbg.sig_in_support
+                );
 
                 let id_str = std::str::from_utf8(&job.id)?.to_string();
                 let len = job.seq.len();
 
+                // 1) Coarse detect ONCE
                 let fold = foldback::detect_foldback(&job.seq, &cfg.shared, &cfg.fold, &mut fold_scratch);
-                let sig_from_matches_pre = fold.as_ref().and_then(|_fb| {
-                    foldback_signature_from_matches(
-                        &mut fold_scratch.best_vals,
-                        cfg.sig.take,
-                        cfg.sig.value_shift,
-                    )
-                });
 
                 if fold.is_some() {
                     dbg.bump("detected");
                 }
 
-                // kept sequence
-                let kept_seq: Vec<u8> = if fold.is_some() {
-                    let kept = foldback::recursive_foldback_cut(
-                        &job.seq,
-                        &cfg,
-                        &support,
-                        max_depth,
-                        &mut fold_scratch,
-                        &mut sig_scratch,
-                    )?;
-                    if kept.len() < job.seq.len() {
-                        num_cut += 1;
-                    }
-                    kept.to_vec()
-                } else {
-                    job.seq.clone()
-                };
+                // Signature from minimizer matches produced by detect_foldback (cheap, reuse)
+                // NOTE: best_matches is populated inside detect_foldback, so only valid if fold.is_some().
+                let sig_from_matches_pre: Option<u64> = fold.as_ref().and_then(|fb| {
+                    foldback_signature_from_local_matches(
+                        &mut fold_scratch.best_matches,
+                        fb.split_pos,          // coarse split is fine for match-based signature
+                        cfg.sig.flank_bp,
+                        cfg.sig.take,
+                        cfg.sig.value_shift,
+                    )
+                });
+
+                // We'll decide what sequence we keep as a slice, then allocate once at end.
+                let mut kept_slice: &[u8] = &job.seq;
 
                 // TSV row (optional)
                 let mut tsv_row: Option<String> = None;
@@ -411,6 +412,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                 if let Some(fb) = fold {
                     num_foldbacks += 1;
 
+                    // 2) Refine ONCE
                     let refined_call = foldback::refine_breakpoint(
                         &job.seq,
                         fb.split_pos,
@@ -418,6 +420,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                         &mut fold_scratch.refine,
                     );
 
+                    // optional: HiFi refine to get stable sig_split/sig_ident if you want
                     let refined_sig = foldback::refine_breakpoint(
                         &job.seq,
                         fb.split_pos,
@@ -427,20 +430,20 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
 
                     if let Some(rf_call) = refined_call {
                         dbg.bump("refined");
+
                         let (sig_split, sig_ident) = if let Some(rf_sig) = refined_sig.as_ref() {
                             (rf_sig.split_pos, rf_sig.identity_est)
                         } else {
                             (rf_call.split_pos, rf_call.identity_est)
                         };
 
+                        // 3) Decide + recurse WITHOUT double detection
                         let (decision, support_n, support_span) = if sig_ident >= cfg.fold2.min_identity {
                             dbg.bump("ident_ok");
-                            
-                            // Prefer evidence-based signature for support lookup.
-                        let sig = sig_from_matches_pre
-                            .or_else(|| {
-                                // fallback: flank-based, using quantized split for consistency
-                                let q = 50usize;
+
+                            // Prefer evidence-based signature for support lookup
+                            let sig = sig_from_matches_pre.or_else(|| {
+                                let q = 150usize;
                                 let split_q = (sig_split / q) * q;
 
                                 foldback_signature(
@@ -450,25 +453,50 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                     cfg.sig.flank_bp,
                                     cfg.sig.take,
                                     &mut sig_scratch,
-                                    cfg.sig.value_shift
+                                    cfg.sig.value_shift,
                                 )
                             });
+
                             if let Some(sig) = sig {
                                 dbg.bump("sig_ok");
-                                if let Some(st) = support.get(&sig) {
+
+                                // classify real/artefact (support-aware)
+                                let (real, n, span) = if let Some(st) = support.get(&sig) {
                                     dbg.bump("sig_in_support");
                                     if hit_sig_sample.len() < 5 {
                                         hit_sig_sample.push((sig, st.n));
                                     }
-                                    let real = is_real_foldback(sig, &support, &cfg);
-                                    if real { num_real += 1; }
-                                    (if real { "real" } else { "artefact" }, st.n, st.split_span())
+                                    (is_real_foldback(sig, &support, &cfg), st.n, st.split_span())
                                 } else {
                                     if miss_sig_sample.len() < 5 {
                                         miss_sig_sample.push(sig);
                                     }
-                                    ("unknown", 0, 0)
+                                    (false, 0, 0)
+                                };
+
+                                // IMPORTANT: only cut if NOT real
+                                if !real {
+                                    // *** B1 change: seed recursion with first detection+refine ***
+                                    let kept = foldback::recursive_foldback_cut_from_first(
+                                        &job.seq,
+                                        fb.clone(),
+                                        rf_call.clone(),
+                                        &cfg,
+                                        &support,
+                                        max_depth,
+                                        &mut fold_scratch,
+                                        &mut sig_scratch,
+                                    )?;
+
+                                    if kept.len() < job.seq.len() {
+                                        num_cut += 1;
+                                    }
+                                    kept_slice = kept;
+                                } else {
+                                    num_real += 1;
                                 }
+
+                                (if real { "real" } else { "artefact" }, n, span)
                             } else {
                                 ("unknown", 0, 0)
                             }
@@ -476,6 +504,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                             ("low_ident", 0, 0)
                         };
 
+                        // TSV output (no extra detect/refine)
                         tsv_row = Some(format!(
                             "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}\t{}\t{}\t{}",
                             fb.split_pos,
@@ -494,13 +523,19 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                     }
                 }
 
-                out_tx.send(OutRec {
-                    idx: job.idx,
-                    id: id_str,
-                    kept_seq,
-                    tsv_row,
-                }).map_err(|e| anyhow::anyhow!("out channel send failed: {e}"))?;
+                // Allocate once for output record
+                let kept_seq: Vec<u8> = kept_slice.to_vec();
+
+                out_tx
+                    .send(OutRec {
+                        idx: job.idx,
+                        id: id_str,
+                        kept_seq,
+                        tsv_row,
+                    })
+                    .map_err(|e| anyhow::anyhow!("out channel send failed: {e}"))?;
             }
+
 
             eprintln!(
                 "[pass2 worker done] jobs={} detected={} refined={} ident_ok={} sig_ok={} in_support={} miss_sigs={:?} hit_sigs={:?}",

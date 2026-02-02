@@ -18,7 +18,7 @@ pub struct FoldScratch {
     pub repetitive: gxhash::HashMap<u64, ()>,
     pub stats: gxhash::HashMap<i32, BinStat>,
     pub best_pts: Vec<(i32, i32)>,
-    pub best_vals: Vec<u64>,
+    pub best_matches: Vec<(usize, u64)>,
 
     pub refine: RefineScratch,
 }
@@ -35,7 +35,7 @@ impl FoldScratch {
             repetitive: gxhash::HashMap::new(),
             stats: gxhash::HashMap::new(),
             best_pts: Vec::new(),
-            best_vals: Vec::new(),
+            best_matches: Vec::new(),
             refine: RefineScratch::default(),
         }
     }
