@@ -4,22 +4,20 @@ mod fingerprint;
 mod foldback;
 mod io;
 mod minimizer;
+mod pipeline;
 mod scratch;
 mod utils;
 
 use anyhow::Result;
 use calm_io::stderrln;
-use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::{
     cfg::{
         CallMode, FairnessParams, FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg,
         SharedCfg, SigCfg,
     },
-    fingerprint::{foldback_pass1_support, is_real_foldback},
-    foldback::recursive_foldback_cut,
-    scratch::{RefineScratch, SigScratch},
     utils::RefineMode,
 };
 
@@ -164,8 +162,16 @@ fn main() -> Result<()> {
         sig: SigCfg {
             flank_bp: sig_flank_bp,
             take: sig_take,
+            // TODO: maybe use in cli later
+            value_shift: t.sig_value_shift,
         },
     };
+
+    // so we use hifi initial, for fast ont
+    let mut shared_fast = cfg.shared.clone();
+    shared_fast.refine.mode = RefineMode::HiFi;
+    // shared_fast.refine.window = shared_fast.refine.window.min(50);
+    // shared_fast.refine.arm    = shared_fast.refine.arm.min(120);
 
     if fairness_baseline {
         stderrln!("FAIRNESS BASELINE ENABLED (developer mode)")?;
@@ -180,10 +186,19 @@ fn main() -> Result<()> {
 
     stderrln!("Mode={mode:?} effective parameters:\n  {msg}")?;
 
-    let mut fold_scratch = scratch::FoldScratch::new();
+    // choose threads + channel capacity
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
 
-    // first pass to store support for foldbacks
-    let support = foldback_pass1_support(&fasta, &cfg, &mut fold_scratch)?;
+    // keep this modest to avoid buffering too much sequence
+    let chan_cap = 512usize;
+
+    let cfg_arc = Arc::new(cfg);
+
+    // PASS 1
+    let support = pipeline::pass1_build_support(&fasta, cfg_arc.clone(), threads, chan_cap)?;
     stderrln!("Foldback support map entries: {}", support.len())?;
 
     let mut n1 = 0usize;
@@ -214,130 +229,54 @@ fn main() -> Result<()> {
         spans.get((spans.len() * 95) / 100).copied().unwrap_or(0),
     )?;
 
-    let mut fasta_reader = io::open_fasta_reader(fasta)?;
-    let mut fasta_writer = io::open_fasta_writer(output)?;
-
-    // output tsv
-    let mut tsv = io::open_tsv_writer(report)?;
-    writeln!(
-        tsv,
-        "read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tsupport_n\tsupport_span\tdecision"
+    let total_n: u64 = support.values().map(|s| s.n as u64).sum();
+    stderrln!(
+        "Support uniqueness: clusters={} total_n={} avg_n={:.3}",
+        support.len(),
+        total_n,
+        (total_n as f64 / support.len().max(1) as f64),
     )?;
 
-    let mut num_foldbacks = 0;
-    let mut num_foldbacks_cut = 0usize;
-    let mut num_foldbacks_kept_real = 0usize;
+    stderrln!(
+        "Support sanity: total_clusters={} total_support_reads={} max_n={}",
+        support.len(),
+        support.values().map(|s| s.n as u64).sum::<u64>(),
+        support.values().map(|s| s.n).max().unwrap_or(0),
+    )?;
 
-    let mut sig_scratch = SigScratch::default();
-    let mut refine_scratch = &mut RefineScratch::default();
+    // PASS 2
+    // PASS 2 writers
+    let fasta_out = output.clone();
+    let tsv_out = report.clone();
 
-    while let Some(record) = fasta_reader.next() {
-        let r = record?;
-        let seq = r.seq();
-        let id = std::str::from_utf8(r.id())?;
-        let len = seq.len();
+    let fasta_file = std::fs::File::create(&fasta_out)
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", fasta_out.display()))?;
 
-        let fold = foldback::detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut fold_scratch);
+    // report can be "-" (stdout)
+    let tsv_sink: pipeline::TsvSink = if tsv_out.to_string_lossy() == "-" {
+        pipeline::TsvSink::Stdout
+    } else {
+        let f = std::fs::File::create(&tsv_out)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", tsv_out.display()))?;
+        pipeline::TsvSink::File(f)
+    };
 
-        // ---- FASTA output (foldback correction) ----
-        if let Some(_) = fold.as_ref() {
-            // Decide whether to cut recursively
-            let kept = recursive_foldback_cut(
-                &seq,
-                &cfg,
-                &support,
-                max_depth,
-                &mut fold_scratch,
-                &mut sig_scratch,
-            )?;
+    let support_arc = Arc::new(support);
 
-            // i.e. if we got a recursive cut
-            if kept.len() < seq.len() {
-                // we actually cut at least once
-                num_foldbacks_cut += 1;
-                let out_id = io::split_id(id, 1);
-                io::write_fasta_record(&mut fasta_writer, &out_id, kept)?;
-            } else {
-                io::write_fasta_record(&mut fasta_writer, id, &seq)?;
-            }
-        } else {
-            // no foldback => passthrough
-            io::write_fasta_record(&mut fasta_writer, id, &seq)?;
-        }
-
-        // ---- Foldback TSV row ----
-        if let Some(fb) = fold {
-            num_foldbacks += 1;
-
-            let refined = foldback::refine_breakpoint(
-                &seq,
-                fb.split_pos,
-                &cfg.shared,
-                &mut fold_scratch.refine,
-            );
-
-            if let Some(rf) = refined {
-                // signature + decision if possible
-                let (decision, support_n, support_span) =
-                    if rf.identity_est >= cfg.fold2.min_identity {
-                        if let Some(sig) = fingerprint::foldback_signature(
-                            &seq,
-                            rf.split_pos,
-                            &cfg.shared,
-                            cfg.sig.flank_bp,
-                            cfg.sig.take,
-                            &mut sig_scratch,
-                        ) {
-                            if let Some(st) = support.get(&sig) {
-                                let real = is_real_foldback(sig, &support, &cfg);
-                                if real {
-                                    num_foldbacks_kept_real += 1;
-                                }
-                                (
-                                    if real { "real" } else { "artefact" },
-                                    st.n,
-                                    st.split_span(),
-                                )
-                            } else {
-                                ("unknown", 0, 0)
-                            }
-                        } else {
-                            ("unknown", 0, 0)
-                        }
-                    } else {
-                        ("low_ident", 0, 0)
-                    };
-
-                writeln!(
-                    tsv,
-                    "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}\t{}\t{}\t{}",
-                    fb.split_pos,
-                    rf.split_pos,
-                    fb.matches,
-                    fb.span,
-                    fb.score,
-                    rf.score,
-                    rf.identity_est,
-                    support_n,
-                    support_span,
-                    decision
-                )?;
-            } else {
-                writeln!(
-                    tsv,
-                    "{id}\t{len}\tfoldback\t1\t{}\t\t\t{}\t{}\t\t\t{}\t\t\t0\t0\tunknown",
-                    fb.split_pos, fb.matches, fb.span, fb.score
-                )?;
-            }
-        }
-    }
+    let (num_foldbacks, num_cut, num_real) = pipeline::pass2_correct_and_write(
+        &fasta,
+        cfg_arc.clone(),
+        support_arc.clone(),
+        max_depth,
+        threads,
+        chan_cap,
+        fasta_file,
+        tsv_sink,
+    )?;
 
     stderrln!("Total foldbacks detected: {}", num_foldbacks)?;
-    stderrln!("Total foldbacks cut (>=1 recursion): {}", num_foldbacks_cut)?;
-    stderrln!(
-        "Total foldbacks classified real (if enabled): {}",
-        num_foldbacks_kept_real
-    )?;
+    stderrln!("Total foldbacks cut (>=1 recursion): {}", num_cut)?;
+    stderrln!("Total foldbacks classified real (if enabled): {}", num_real)?;
 
     Ok(())
 }

@@ -154,6 +154,7 @@ pub struct ModeTuning {
     pub max_depth: usize,    // recursion depth
     pub sig_flank_bp: usize,
     pub sig_take: usize,
+    pub sig_value_shift: u8,
 }
 
 impl CallMode {
@@ -169,6 +170,7 @@ impl CallMode {
                 max_depth: 2,
                 sig_flank_bp: 800,
                 sig_take: 10,
+                sig_value_shift: 0,
             },
             // balanced: your current-ish defaults
             CallMode::Balanced => ModeTuning {
@@ -180,6 +182,7 @@ impl CallMode {
                 max_depth: 5,
                 sig_flank_bp: 600,
                 sig_take: 8,
+                sig_value_shift: 4,
             },
             // permissive: more calls/cuts (good for exploration)
             CallMode::Permissive => ModeTuning {
@@ -191,6 +194,7 @@ impl CallMode {
                 max_depth: 8,
                 sig_flank_bp: 400,
                 sig_take: 6,
+                sig_value_shift: 8,
             },
         }
     }
@@ -265,6 +269,7 @@ impl FairnessParams {
 pub struct SigCfg {
     pub flank_bp: usize,
     pub take: usize,
+    pub value_shift: u8,
 }
 
 impl Default for SigCfg {
@@ -272,6 +277,7 @@ impl Default for SigCfg {
         Self {
             flank_bp: 1000,
             take: 12,
+            value_shift: 0, // the default is exact
         }
     }
 }

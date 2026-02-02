@@ -1,5 +1,7 @@
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
-use crate::fingerprint::{SupportStats, foldback_signature, is_real_foldback};
+use crate::fingerprint::{
+    SupportStats, foldback_signature, foldback_signature_from_matches, is_real_foldback,
+};
 use crate::minimizer::sampled_minimizers_into;
 use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
 use crate::utils::{
@@ -300,7 +302,9 @@ pub fn detect_foldback(
     // ---- 3) second phase: collect points only for best bin ----
     let cap = scratch.stats.get(&best_bin).map(|s| s.count).unwrap_or(0);
     scratch.best_pts.clear();
-    scratch.best_pts.reserve(cap); // keeps capacity across reads
+    scratch.best_vals.clear();
+    scratch.best_pts.reserve(cap);
+    scratch.best_vals.reserve(cap);
 
     for (&prc, &vrc) in pos_rc.iter().zip(val_rc.iter()) {
         if scratch.repetitive.contains_key(&vrc) {
@@ -317,6 +321,7 @@ pub fn detect_foldback(
             let bin = div_floor(d, shared.fold_diag_tol.max(1));
             if bin == best_bin {
                 scratch.best_pts.push((p1, p2));
+                scratch.best_vals.push(vrc); // store the shared seed value
             }
         }
     }
@@ -400,16 +405,32 @@ pub fn recursive_foldback_cut<'a>(
             break;
         }
 
-        let Some(sig) = foldback_signature(
-            seq,
-            rf.split_pos,
-            &cfg.shared,
-            cfg.sig.flank_bp,
+        // Prefer evidence-based signature (more robust to refinement jitter).
+        let sig = foldback_signature_from_matches(
+            &mut scratch.best_vals,
             cfg.sig.take,
-            sig_scratch,
-        ) else {
+            cfg.sig.value_shift,
+        )
+        .or_else(|| {
+            // fallback: flank signature, but quantize split
+            let q = 50usize;
+            let split_q = (rf.split_pos / q) * q;
+
+            foldback_signature(
+                seq,
+                split_q,
+                &cfg.shared,
+                cfg.sig.flank_bp,
+                cfg.sig.take,
+                sig_scratch,
+                cfg.sig.value_shift,
+            )
+        });
+
+        let Some(sig) = sig else {
             break;
         };
+
         if is_real_foldback(sig, support, cfg) {
             // don't cut
             break;

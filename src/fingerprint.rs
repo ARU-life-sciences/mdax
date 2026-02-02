@@ -1,15 +1,38 @@
 // a junction fingerprint module for foldback structures
 
-use gxhash::{GxHasher, HashMap, HashMapExt};
+use gxhash::{GxHasher, HashMap};
 use std::hash::{Hash, Hasher};
 
 use crate::{
     cfg::{MdaxCfg, SharedCfg},
-    foldback, io,
     minimizer::sampled_minimizers_into,
-    scratch::{self, RefineScratch, SigScratch},
-    utils::RefineMode,
+    scratch::SigScratch,
 };
+
+pub fn foldback_signature_from_matches(
+    best_vals: &mut Vec<u64>,
+    take: usize,
+    value_shift: u8,
+) -> Option<u64> {
+    if best_vals.len() < take {
+        return None;
+    }
+
+    // sort and take smallest 'take' (minhash)
+    best_vals.sort_unstable();
+    best_vals.truncate(take);
+
+    if value_shift > 0 {
+        for v in best_vals.iter_mut() {
+            *v >>= value_shift; // drop low bits
+        }
+        best_vals.sort_unstable(); // keep deterministic ordering after shift
+    }
+
+    let mut h = gxhash::GxHasher::default();
+    best_vals.hash(&mut h);
+    Some(h.finish())
+}
 
 // Compute a reproducible fingerprint for a foldback junction at `split`.
 // Returns None if flanks exceed bounds or not enough minimizers.
@@ -20,6 +43,7 @@ pub fn foldback_signature(
     flank_bp: usize,
     take: usize,
     scratch: &mut SigScratch,
+    value_shift: u8,
 ) -> Option<u64> {
     if split < flank_bp || split + flank_bp > seq.len() {
         return None;
@@ -65,6 +89,13 @@ pub fn foldback_signature(
     scratch.combined.extend_from_slice(&scratch.val_r[..take]);
     scratch.combined.sort_unstable();
 
+    if take > 0 && value_shift > 0 {
+        for v in scratch.combined.iter_mut() {
+            *v >>= value_shift;
+        }
+        scratch.combined.sort_unstable();
+    }
+
     let mut h = GxHasher::default();
     scratch.combined.hash(&mut h);
     Some(h.finish())
@@ -103,63 +134,6 @@ impl SupportStats {
     }
 }
 
-// TODO: should this be in foldback.rs?
-pub fn foldback_pass1_support<P: AsRef<std::path::Path>>(
-    fasta_path: P,
-    cfg: &MdaxCfg,
-    scratch: &mut scratch::FoldScratch,
-) -> anyhow::Result<HashMap<u64, SupportStats>> {
-    // clone cfg but force fast refine for pass1
-    // this should help ONT runtime
-    let mut cfg1 = cfg.clone();
-    cfg1.shared.refine.mode = RefineMode::HiFi;
-
-    let mut reader = io::open_fasta_reader(fasta_path)?;
-    let mut support: HashMap<u64, SupportStats> = HashMap::new();
-    let mut sig_scratch = SigScratch::default();
-
-    while let Some(rec) = reader.next() {
-        let r = rec?;
-        let seq = r.seq();
-
-        let fb = match foldback::detect_foldback(&seq, &cfg.shared, &cfg.fold, scratch) {
-            Some(x) => x,
-            None => continue,
-        };
-
-        let refined =
-            match foldback::refine_breakpoint(&seq, fb.split_pos, &cfg.shared, &mut scratch.refine)
-            {
-                Some(rf) => rf,
-                None => continue,
-            };
-
-        if refined.identity_est < cfg.fold2.min_identity {
-            continue;
-        }
-
-        let sig = match foldback_signature(
-            &seq,
-            refined.split_pos,
-            &cfg.shared,
-            cfg.sig.flank_bp,
-            cfg.sig.take,
-            &mut sig_scratch,
-        ) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        // enter into the map
-        support
-            .entry(sig)
-            .and_modify(|st| st.update(refined.split_pos, refined.identity_est))
-            .or_insert_with(|| SupportStats::new(refined.split_pos, refined.identity_est));
-    }
-
-    Ok(support)
-}
-
 pub fn is_real_foldback(sig: u64, support: &HashMap<u64, SupportStats>, cfg: &MdaxCfg) -> bool {
     let Some(st) = support.get(&sig) else {
         return false;
@@ -171,15 +145,18 @@ pub fn is_real_foldback(sig: u64, support: &HashMap<u64, SupportStats>, cfg: &Md
 mod tests {
     use super::*;
     use crate::cfg::{FoldOnlyCfg, FoldSecondPassCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg};
+    use crate::pipeline::pass1_build_support;
     use crate::utils::RefineMode;
 
     use calm_io::stderrln;
+    use gxhash::HashMapExt;
     use noodles::fasta::{
         self as fasta,
         record::{Definition, Sequence},
     };
     use std::fs::File;
     use std::io::BufWriter;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn pseudo_dna(len: usize, seed: u64) -> Vec<u8> {
@@ -312,9 +289,10 @@ mod tests {
             &path,
             &[("r1", &seq), ("r2", &seq), ("r3", &seq), ("decoy", &decoy)],
         );
-        let mut scratch = scratch::FoldScratch::new();
 
-        let support = foldback_pass1_support(&path, &cfg, &mut scratch).expect("pass1 support");
+        let cfg2 = cfg.clone();
+
+        let support = pass1_build_support(&path, Arc::new(cfg), 1, 1).expect("pass1 support");
 
         // remove file
         let _ = std::fs::remove_file(&path);
@@ -328,7 +306,7 @@ mod tests {
         let (_sig, st) = support.iter().next().unwrap();
         assert_eq!(st.n, 3, "should have 3 supporting reads");
         assert_eq!(st.split_span(), 0, "identical reads should cluster tightly");
-        assert!(st.mean_ident >= cfg.fold2.min_identity);
+        assert!(st.mean_ident >= cfg2.fold2.min_identity);
     }
 
     #[test]
@@ -505,8 +483,9 @@ mod tests {
             &[("r1", &s1), ("r2", &s2), ("r3", &s3), ("decoy", &decoy)],
         );
 
-        let mut scratch = crate::scratch::FoldScratch::new();
-        let support = foldback_pass1_support(&path, &cfg, &mut scratch).unwrap();
+        let cfg2 = cfg.clone();
+
+        let support = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(
@@ -516,7 +495,7 @@ mod tests {
         );
         let (_sig, st) = support.iter().next().unwrap();
         assert_eq!(st.n, 3);
-        assert!(st.split_span() <= cfg.fold2.split_tol_bp);
+        assert!(st.split_span() <= cfg2.fold2.split_tol_bp);
     }
 
     #[test]
@@ -610,14 +589,15 @@ mod tests {
 
         let path = tmp_fasta_path("mdax_real_logic");
         write_fasta(&path, &[("r1", &seq), ("r2", &seq), ("r3", &seq)]);
-        let mut scratch = crate::scratch::FoldScratch::new();
 
-        let support = foldback_pass1_support(&path, &cfg, &mut scratch).unwrap();
+        let cfg2 = cfg.clone();
+
+        let support = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(support.len(), 1);
         let (&sig, st) = support.iter().next().unwrap();
-        assert!(is_real_foldback(sig, &support, &cfg));
+        assert!(is_real_foldback(sig, &support, &cfg2));
         assert_eq!(st.n, 3);
     }
 }

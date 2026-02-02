@@ -348,6 +348,7 @@ dependencies = [
  "anyhow",
  "calm_io",
  "clap",
+ "crossbeam-channel",
  "flate2",
  "gxhash",
  "needletail",
