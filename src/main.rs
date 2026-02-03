@@ -18,7 +18,7 @@ use crate::{
         CallMode, FairnessParams, FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg,
         SharedCfg, SigCfg,
     },
-    utils::RefineMode,
+    utils::{RefineMode, compact_histogram},
 };
 
 fn fmt_param<T: std::fmt::Display + PartialEq>(
@@ -34,6 +34,16 @@ fn fmt_param<T: std::fmt::Display + PartialEq>(
 }
 
 fn main() -> Result<()> {
+    elog!(
+        "WELCOME",
+        "This is `mdax`, a foldback detector v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    elog!(
+        "WELCOME",
+        "Developed by Max Brown at Anglia Ruskin University <max.carter-brown@aru.ac.uk>"
+    );
+
     let args = cli::build_cli();
 
     // for testing
@@ -72,10 +82,11 @@ fn main() -> Result<()> {
     let mut split_tol_bp = *args
         .get_one::<usize>("split_tol_bp")
         .unwrap_or(&t.split_tol_bp);
-    let mut sig_flank_bp = *args
+    // TODO: include these in fairness?
+    let sig_flank_bp = *args
         .get_one::<usize>("sig_flank_bp")
         .unwrap_or(&t.sig_flank_bp);
-    let mut sig_take = *args.get_one::<usize>("sig_take").unwrap_or(&t.sig_take);
+    let sig_take = *args.get_one::<usize>("sig_take").unwrap_or(&t.sig_take);
 
     let mut k = *args.get_one::<usize>("k").expect("defaulted k of 17");
     let mut w = *args.get_one::<usize>("w").expect("defaulted w of 21");
@@ -186,8 +197,6 @@ fn main() -> Result<()> {
         )?;
     }
 
-    stderrln!("Mode={mode:?} effective parameters:\n  {msg}")?;
-
     // choose threads + channel capacity
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -197,54 +206,46 @@ fn main() -> Result<()> {
     // keep this modest to avoid buffering too much sequence
     let chan_cap = 512usize;
 
+    elog!("INIT", "Starting with mode: {mode:?}");
+    elog!(
+        "INIT",
+        "Threads available: {threads}; Specified chunk size: {}",
+        chan_cap
+    );
+    elog!("INIT", "Parameter Summary:\n  {msg}");
+
     let cfg_arc = Arc::new(cfg);
 
     // PASS 1
     let support = pipeline::pass1_build_support(&fasta, cfg_arc.clone(), threads, chan_cap)?;
-    stderrln!("Foldback support map entries: {}", support.len())?;
+    elog!("SUPPORT MAP", "Number of entries: {}", support.len());
 
-    let mut n1 = 0usize;
-    let mut n2 = 0usize;
-    let mut n3 = 0usize;
-    let mut nge4 = 0usize;
-    let mut spans: Vec<usize> = Vec::new();
-
+    // Collect histogram of clusters into buckets based on their size
+    let mut histogram = std::collections::HashMap::new();
     for st in support.values() {
-        match st.n {
-            0 | 1 => n1 += 1,
-            2 => n2 += 1,
-            3 => n3 += 1,
-            _ => nge4 += 1,
-        }
-        spans.push(st.split_span());
+        *histogram.entry(st.n).or_insert(0) += 1;
     }
-    spans.sort_unstable();
 
-    stderrln!(
-        "Support clusters: total={}  n=1:{} n=2:{} n=3:{} n>=4:{}  span_median:{} span_p95:{}",
-        support.len(),
-        n1,
-        n2,
-        n3,
-        nge4,
-        spans.get(spans.len() / 2).copied().unwrap_or(0),
-        spans.get((spans.len() * 95) / 100).copied().unwrap_or(0),
-    )?;
+    // Print histogram
+    elog!("SUPPORT HISTOGRAM", "Cluster Size Distribution:");
+    compact_histogram(&histogram, 30)?;
 
     let total_n: u64 = support.values().map(|s| s.n as u64).sum();
-    stderrln!(
-        "Support uniqueness: clusters={} total_n={} avg_n={:.3}",
+    elog!(
+        "SUPPORT UNIQUENESS",
+        "clusters={} total_n={} avg_n={:.3}",
         support.len(),
         total_n,
         (total_n as f64 / support.len().max(1) as f64),
-    )?;
+    );
 
-    stderrln!(
-        "Support sanity: total_clusters={} total_support_reads={} max_n={}",
+    elog!(
+        "SUPPORT SANITY",
+        "total_clusters={} total_support_reads={} max_n={}",
         support.len(),
         support.values().map(|s| s.n as u64).sum::<u64>(),
         support.values().map(|s| s.n).max().unwrap_or(0),
-    )?;
+    );
 
     // PASS 2
     // PASS 2 writers
@@ -276,9 +277,17 @@ fn main() -> Result<()> {
         tsv_sink,
     )?;
 
-    stderrln!("Total foldbacks detected: {}", num_foldbacks)?;
-    stderrln!("Total foldbacks cut (>=1 recursion): {}", num_cut)?;
-    stderrln!("Total foldbacks classified real (if enabled): {}", num_real)?;
+    elog!("SUMMARY", "Total foldbacks detected: {}", num_foldbacks);
+    elog!(
+        "SUMMARY",
+        "Total foldbacks cut (>=1 recursion): {}",
+        num_cut
+    );
+    elog!(
+        "SUMMARY",
+        "Total foldbacks classified real (if enabled): {}",
+        num_real
+    );
 
     Ok(())
 }

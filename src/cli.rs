@@ -1,12 +1,37 @@
+//! CLI definition for `mdax` chimeric read detection and clean-up.
+//!
+//! This module is responsible for:
+//! - Declaring CLI arguments (paths, thresholds, presets)
+//! - Providing clap parsing via `build_cli()`
+//! - Wiring custom enums (`RefineMode`, `CallMode`) into clap as `ValueEnum`
+//!
+//! Design notes:
+//! - Most “real knobs” live in `cfg.rs` as strongly typed config structs.
+//! - The CLI exposes either:
+//!   - a high-level preset (`--mode strict|balanced|permissive`), or
+//!   - explicit overrides (`--min-identity`, `--min-support`, ...).
+//! - Enums are implemented as `ValueEnum + FromStr` so clap can parse them cleanly.
+
 use crate::{cfg::CallMode, utils::RefineMode};
 use clap::{builder::PossibleValue, value_parser, Arg, ArgMatches, Command, ValueEnum};
 use std::path::PathBuf;
 
+/// Build and parse the command-line interface, returning clap’s `ArgMatches`.
+///
+/// This constructs a `Command` with:
+/// - positional `input` FASTA/FASTQ (potentially gzipped)
+/// - output FASTA path
+/// - optional TSV report destination (`-` for stdout)
+/// - detection/refinement thresholds (either as a preset `--mode` or explicit overrides)
 pub fn build_cli() -> ArgMatches {
-    let c = Command::new("fos")
+    let c = Command::new("mdax")
         .version(clap::crate_version!())
         .author("Max Carter-Brown")
         .about("Remove inverted duplication chimeras, fast")
+        // ----------------------------
+        // Inputs / outputs
+        // ----------------------------
+        //
         // Positional input FASTA file (optionally gzipped).
         // This is the read library to scan for foldback/palindrome artefacts.
         .arg(
