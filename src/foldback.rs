@@ -1,7 +1,6 @@
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
 use crate::fingerprint::{
-    SupportStats, foldback_signature, foldback_signature_from_local_matches,
-    foldback_signature_from_matches, is_real_foldback,
+    SupportStats, foldback_signature, foldback_signature_from_local_matches, is_real_foldback,
 };
 use crate::minimizer::sampled_minimizers_into;
 use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
@@ -385,67 +384,6 @@ fn fold_breakpoint_from_pts(
         matches: chain.len(),
         span,
     })
-}
-
-pub fn recursive_foldback_cut<'a>(
-    mut seq: &'a [u8],
-    cfg: &MdaxCfg,
-    support: &HashMap<u64, SupportStats>,
-    max_depth: usize,
-    scratch: &mut FoldScratch,
-    sig_scratch: &mut SigScratch,
-) -> anyhow::Result<&'a [u8]> {
-    for _ in 0..max_depth {
-        let Some(fb) = detect_foldback(seq, &cfg.shared, &cfg.fold, scratch) else {
-            break;
-        };
-        let Some(rf) = refine_breakpoint(seq, fb.split_pos, &cfg.shared, &mut scratch.refine)
-        else {
-            break;
-        };
-        if rf.identity_est < cfg.fold2.min_identity {
-            break;
-        }
-
-        // Prefer evidence-based signature (more robust to refinement jitter).
-        let sig = foldback_signature_from_local_matches(
-            &mut scratch.best_matches,
-            rf.split_pos,
-            cfg.sig.flank_bp,
-            cfg.sig.take,
-            cfg.sig.value_shift,
-        )
-        .or_else(|| {
-            // fallback: flank signature, but quantize split
-            let q = 150usize;
-            let split_q = (rf.split_pos / q) * q;
-
-            foldback_signature(
-                seq,
-                split_q,
-                &cfg.shared,
-                cfg.sig.flank_bp,
-                cfg.sig.take,
-                sig_scratch,
-                cfg.sig.value_shift,
-            )
-        });
-
-        let Some(sig) = sig else {
-            break;
-        };
-
-        if is_real_foldback(sig, support, cfg) {
-            // don't cut
-            break;
-        }
-
-        // artefact -> cut left
-
-        let split = rf.split_pos.min(seq.len());
-        seq = &seq[..split];
-    }
-    Ok(seq)
 }
 
 pub fn recursive_foldback_cut_from_first<'a>(

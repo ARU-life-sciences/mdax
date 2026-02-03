@@ -50,31 +50,6 @@ pub fn foldback_signature_from_local_matches(
     Some(h.finish())
 }
 
-pub fn foldback_signature_from_matches(
-    best_vals: &mut Vec<u64>,
-    take: usize,
-    value_shift: u8,
-) -> Option<u64> {
-    if best_vals.len() < take {
-        return None;
-    }
-
-    // sort and take smallest 'take' (minhash)
-    best_vals.sort_unstable();
-    best_vals.truncate(take);
-
-    if value_shift > 0 {
-        for v in best_vals.iter_mut() {
-            *v >>= value_shift; // drop low bits
-        }
-        best_vals.sort_unstable(); // keep deterministic ordering after shift
-    }
-
-    let mut h = gxhash::GxHasher::default();
-    best_vals.hash(&mut h);
-    Some(h.finish())
-}
-
 // Compute a reproducible fingerprint for a foldback junction at `split`.
 // Returns None if flanks exceed bounds or not enough minimizers.
 pub fn foldback_signature(

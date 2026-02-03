@@ -5,7 +5,6 @@
 //! Note: output is unordered, which is much faster
 
 use anyhow::Result;
-use calm_io::stderrln;
 use crossbeam_channel as chan;
 use gxhash::{HashMap, HashMapExt};
 use std::path::Path;

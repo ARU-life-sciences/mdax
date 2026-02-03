@@ -39,14 +39,6 @@ impl FoldScratch {
             refine: RefineScratch::default(),
         }
     }
-
-    #[inline]
-    pub fn clear(&mut self) {
-        self.idx_f.clear();
-        self.repetitive.clear();
-        self.stats.clear();
-        self.best_pts.clear();
-    }
 }
 
 #[derive(Debug, Default)]

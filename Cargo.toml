@@ -11,6 +11,5 @@ crossbeam-channel = "0.5.15"
 flate2 = "1.1.8"
 gxhash = "3.5.0"
 needletail = "0.6.3"
-noodles = { version = "0.104.0", features = ["fasta"] }
 packed-seq = "4.4.1"
 simd-minimizers = "2.2.0"
