@@ -1,4 +1,23 @@
-// a junction fingerprint module for foldback structures
+//! Foldback junction fingerprinting + support statistics.
+//!
+//! This module provides two related pieces of functionality:
+//! 1) **Signature / fingerprint** construction for a foldback junction.
+//!    The signature is a compact `u64` intended to be stable across reads that
+//!    share the *same underlying junction*, while being cheap to compute.
+//!
+//! 2) **Support aggregation** keyed by signature.
+//!    Pass1 builds a `HashMap<sig, SupportStats>` describing how often a signature
+//!    appears and how tightly its split positions cluster.
+//!
+//! The core idea is MinHash-ish:
+//! - sample minimizers (cheap sequence sketch)
+//! - keep the smallest `take` values (stable subset)
+//! - hash the resulting small list into a `u64` fingerprint
+//!
+//! Stability knobs:
+//! - canonical minimizers (`forward_only=false`) increase strand-agnostic stability
+//! - quantization via `value_shift` can reduce sensitivity to small value jitter
+//! - `window_bp` / `flank_bp` bounds keep the signature local to the junction
 
 use gxhash::{GxHasher, HashMap};
 use std::hash::{Hash, Hasher};
@@ -9,7 +28,30 @@ use crate::{
     scratch::SigScratch,
 };
 
-// NOTE: This function destructively filters `matches` in-place.
+/// Compute a foldback junction fingerprint using *local match evidence* gathered by coarse detection.
+///
+/// This variant is designed to be cheap in pass2 because it reuses matchpoints already computed
+/// while detecting the foldback (i.e. avoid re-sampling minimizers from scratch).
+///
+/// Inputs:
+/// - `matches`: `(pos, val)` tuples produced by coarse detection, where `pos` is a read coordinate
+///   (or an evidence coordinate) and `val` is a minimizer hash.
+/// - `split`: coarse/refined split position (bp).
+/// - `window_bp`: only matchpoints within this distance of `split` are kept.
+/// - `take`: signature size (how many smallest hashes to retain).
+/// - `value_shift`: optional right shift applied before hashing (coarse quantization).
+///
+/// Returns:
+/// - `Some(sig)` if enough evidence remains after filtering.
+/// - `None` if fewer than `take` matchpoints are available near the junction.
+///
+/// Side effect:
+/// This function *destructively filters* `matches` in-place (`retain`), permanently dropping
+/// matchpoints far from the junction. This is intentional to keep the signature local and stable.
+///
+/// Why locality helps:
+/// - junction-adjacent evidence is most informative for the breakpoint identity
+/// - distant repeats can introduce collisions and reduce specificity
 pub fn foldback_signature_from_local_matches(
     matches: &mut Vec<(usize, u64)>, // (pos, val)
     split: usize,
@@ -27,17 +69,23 @@ pub fn foldback_signature_from_local_matches(
         d <= window_bp
     });
 
+    // If we don't have enough local evidence, we can't build a stable signature.
     if matches.len() < take {
         return None;
     }
 
-    // Extract values only
+    // Extract minimizer hash values only.
+    // (We ignore positions after locality filtering; the signature is value-based.)
     let mut vals: Vec<u64> = matches.iter().map(|(_, v)| *v).collect();
 
     // MinHash-style reduction
+    // sort and keep the smallest `take` values to get a stable sketch-like subset.
     vals.sort_unstable();
     vals.truncate(take);
 
+    // Optional quantization:
+    // shifting values reduces sensitivity to fine-grained hash differences.
+    // After shifting, re-sort so the "smallest take" property remains meaningful.
     if value_shift > 0 {
         for v in vals.iter_mut() {
             *v >>= value_shift;
@@ -50,8 +98,25 @@ pub fn foldback_signature_from_local_matches(
     Some(h.finish())
 }
 
-// Compute a reproducible fingerprint for a foldback junction at `split`.
-// Returns None if flanks exceed bounds or not enough minimizers.
+/// Compute a reproducible fingerprint for a foldback junction at `split` using sequence flanks.
+///
+/// This is the “direct-from-sequence” signature builder. It is a robust fallback when you
+/// don't have match evidence from coarse detection (or when you prefer a purely sequence-based key).
+///
+/// Approach:
+/// - take `flank_bp` bases on the left of the split
+/// - take `flank_bp` bases on the right of the split, reverse-complement them
+/// - sample canonical minimizers in each flank
+/// - keep the smallest `take` minimizer values from each side
+/// - concatenate, sort, optionally quantize (`value_shift`), and hash into `u64`
+///
+/// Returns `None` if:
+/// - the requested flanks exceed sequence bounds, or
+/// - either side yields fewer than `take` minimizers (insufficient sketch density).
+///
+/// Performance notes:
+/// - Uses `SigScratch` to avoid allocations across calls.
+/// - Constructs a lightweight minimizer config rather than cloning `SharedCfg`.
 pub fn foldback_signature(
     seq: &[u8],
     split: usize,
@@ -68,18 +133,21 @@ pub fn foldback_signature(
     let left = &seq[split - flank_bp..split];
     let right = &seq[split..split + flank_bp];
 
-    // canonical minimizers for signature stability
-    // (avoid cloning the whole config each call)
+    // Use canonical minimizers for signature stability:
+    // a k-mer and its reverse-complement map to the same value.
+    //
+    // We build a small MinimizerCfg rather than cloning the whole SharedCfg each call.
     let mcfg = crate::cfg::MinimizerCfg {
         k: shared.minimizer.k,
         w: shared.minimizer.w,
         forward_only: false,
     };
 
-    // left minimizers -> scratch.val_l
+    // Sample minimizers from the left flank into scratch buffers.
     sampled_minimizers_into(left, &mcfg, &mut scratch.pos_l, &mut scratch.val_l);
 
-    // right minimizers, but RC orientation
+    // Sample minimizers from the right flank, but in reverse-complement orientation.
+    // This makes the two arms comparable under a foldback model.
     scratch.right_rc.clear();
     scratch.right_rc.extend_from_slice(right);
     crate::utils::revcomp_in_place(&mut scratch.right_rc);
@@ -91,6 +159,7 @@ pub fn foldback_signature(
         &mut scratch.val_r,
     );
 
+    // Need at least `take` minimizers from each side to build a stable signature.
     if scratch.val_l.len() < take || scratch.val_r.len() < take {
         return None;
     }
@@ -117,13 +186,26 @@ pub fn foldback_signature(
     Some(h.finish())
 }
 
-// gather the support statistics for a given junction fingerprint
+// Support statistics (pass1 aggregation; pass2 decisions)
 
+/// Aggregate support statistics for a given junction signature.
+///
+/// Stored per signature in the pass1 support map and used in pass2 to decide whether
+/// a foldback is “real” (genome-templated) or an artefact (amplification-induced).
+///
+/// Semantics:
+/// - `n`: number of reads that produced this signature
+/// - `min_split` / `max_split`: range of observed refined split positions
+/// - `mean_ident`: running mean of refinement identity estimates
 #[derive(Debug, Clone, Default)]
 pub struct SupportStats {
+    /// Number of observations (reads) contributing to this signature.
     pub n: usize,
+    /// Minimum observed split position (bp) across reads.
     pub min_split: usize,
+    /// Maximum observed split position (bp) across reads.
     pub max_split: usize,
+    /// Running mean of `identity_est` across reads.
     pub mean_ident: f32,
 }
 
@@ -137,6 +219,12 @@ impl SupportStats {
         }
     }
 
+    /// Update stats with an additional observation.
+    ///
+    /// Updates:
+    /// - increments `n`
+    /// - expands `[min_split, max_split]` to include `split`
+    /// - updates `mean_ident` via an incremental mean (stable and O(1))
     pub fn update(&mut self, split: usize, ident: f32) {
         self.n += 1;
         self.min_split = self.min_split.min(split);
@@ -145,16 +233,33 @@ impl SupportStats {
         self.mean_ident += (ident - self.mean_ident) / self.n as f32;
     }
 
+    /// Return the spread of split positions across reads for this signature.
+    ///
+    /// A small span indicates consistent breakpoint localization (typical for a real junction).
+    /// A large span suggests noise, signature collisions, or heterogeneous events.
     pub fn split_span(&self) -> usize {
         self.max_split.saturating_sub(self.min_split)
     }
 }
 
+/// Decide whether a foldback junction is "real" based on pass1 support statistics.
 pub fn is_real_foldback(sig: u64, support: &HashMap<u64, SupportStats>, cfg: &MdaxCfg) -> bool {
     let Some(st) = support.get(&sig) else {
         return false;
     };
-    st.n >= cfg.fold2.min_support && st.split_span() <= cfg.fold2.split_tol_bp
+
+    // Read-space split positions are not expected to cluster tightly across reads.
+    // The signature already anchors the locus; use support count as the primary gate.
+    if st.n < cfg.fold2.min_support {
+        return false;
+    }
+
+    // Optional: add an identity-based support gate if you want
+    if cfg.fold2.min_support_ident > 0.0 && (st.mean_ident as f64) < cfg.fold2.min_support_ident {
+        return false;
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -169,7 +274,6 @@ mod tests {
     use calm_io::stderrln;
     use gxhash::HashMapExt;
     use std::fs::File;
-    use std::io::BufWriter;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -272,8 +376,8 @@ mod tests {
             },
             fold2: FoldSecondPassCfg {
                 min_support: 3,
-                split_tol_bp: 100,
                 min_identity: 0.60,
+                min_support_ident: 0.0,
             },
             sig: SigCfg {
                 flank_bp: 1000,
@@ -445,8 +549,8 @@ mod tests {
             fold: FoldOnlyCfg { min_arm: 20 },
             fold2: crate::cfg::FoldSecondPassCfg {
                 min_support: 3,
-                split_tol_bp: 50,
                 min_identity: 0.6,
+                min_support_ident: 0.0,
             },
             sig: SigCfg {
                 flank_bp: 1000,
@@ -524,8 +628,6 @@ mod tests {
             &[("r1", &s1), ("r2", &s2), ("r3", &s3), ("decoy", &decoy)],
         );
 
-        let cfg2 = cfg.clone();
-
         let support = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
         let _ = std::fs::remove_file(&path);
 
@@ -536,7 +638,6 @@ mod tests {
         );
         let (_sig, st) = support.iter().next().unwrap();
         assert_eq!(st.n, 3);
-        assert!(st.split_span() <= cfg2.fold2.split_tol_bp);
     }
 
     #[test]
@@ -676,7 +777,7 @@ mod tests {
         let cfg = cfg_for_pass1();
 
         let left = pseudo_dna(3000, 123);
-        let (seq, split) = make_clean_foldback(&left, b"");
+        let (seq, _split) = make_clean_foldback(&left, b"");
 
         let mut scratch = FoldScratch::new();
 

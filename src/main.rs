@@ -34,6 +34,8 @@ fn fmt_param<T: std::fmt::Display + PartialEq>(
 }
 
 fn main() -> Result<()> {
+    let args = cli::build_cli();
+
     elog!(
         "WELCOME",
         "This is `mdax`, a foldback detector v{}",
@@ -43,8 +45,6 @@ fn main() -> Result<()> {
         "WELCOME",
         "Developed by Max Brown at Anglia Ruskin University <max.carter-brown@aru.ac.uk>"
     );
-
-    let args = cli::build_cli();
 
     // for testing
     let fairness_baseline = args.get_flag("fairness_baseline")
@@ -79,9 +79,6 @@ fn main() -> Result<()> {
     let mut min_support = *args
         .get_one::<usize>("min_support")
         .unwrap_or(&t.min_support);
-    let mut split_tol_bp = *args
-        .get_one::<usize>("split_tol_bp")
-        .unwrap_or(&t.split_tol_bp);
     // TODO: include these in fairness?
     let sig_flank_bp = *args
         .get_one::<usize>("sig_flank_bp")
@@ -109,7 +106,6 @@ fn main() -> Result<()> {
         fmt_param("min_span", min_span, t.min_span),
         fmt_param("min_identity", min_identity, t.min_identity),
         fmt_param("min_support", min_support, t.min_support),
-        fmt_param("split_tol_bp", split_tol_bp, t.split_tol_bp),
         fmt_param("max_depth", max_depth, t.max_depth),
         fmt_param("sig_flank_bp", sig_flank_bp, t.sig_flank_bp),
         fmt_param("sig_take", sig_take, t.sig_take),
@@ -128,7 +124,6 @@ fn main() -> Result<()> {
         min_span = f.min_span;
         min_identity = f.min_identity;
         min_support = f.min_support;
-        split_tol_bp = f.split_tol_bp;
         max_depth = f.max_depth;
 
         // minimizers
@@ -169,8 +164,8 @@ fn main() -> Result<()> {
         fold2: FoldSecondPassCfg {
             // TODO: sensible defaults + add to cli
             min_support,
-            split_tol_bp,
             min_identity,
+            min_support_ident: 0.0,
         },
         sig: SigCfg {
             flank_bp: sig_flank_bp,
@@ -214,7 +209,7 @@ fn main() -> Result<()> {
     );
     elog!("INIT", "Parameter Summary:\n  {msg}");
 
-    let cfg_arc = Arc::new(cfg);
+    let cfg_arc = Arc::new(cfg.clone());
 
     // PASS 1
     let support = pipeline::pass1_build_support(&fasta, cfg_arc.clone(), threads, chan_cap)?;
@@ -247,6 +242,33 @@ fn main() -> Result<()> {
         support.values().map(|s| s.n).max().unwrap_or(0),
     );
 
+    let mut ge_support_clusters = 0usize;
+    let mut ge_support_ident_clusters = 0usize;
+    let mut real_clusters = 0usize;
+
+    for st in support.values() {
+        if st.n >= cfg.fold2.min_support {
+            ge_support_clusters += 1;
+
+            let ident_ok = cfg.fold2.min_support_ident <= 0.0
+                || (st.mean_ident as f64) >= cfg.fold2.min_support_ident;
+
+            if ident_ok {
+                ge_support_ident_clusters += 1;
+                real_clusters += 1;
+            }
+        }
+    }
+
+    elog!(
+        "SUPPORT GATE",
+        "clusters: total={} ge_support={} ge_support_ident={} real={}",
+        support.len(),
+        ge_support_clusters,
+        ge_support_ident_clusters,
+        real_clusters
+    );
+
     // PASS 2
     // PASS 2 writers
     let fasta_out = output.clone();
@@ -266,7 +288,7 @@ fn main() -> Result<()> {
 
     let support_arc = Arc::new(support);
 
-    let (num_foldbacks, num_cut, num_real) = pipeline::pass2_correct_and_write(
+    let (foldback_reads, cut_reads, real_reads) = pipeline::pass2_correct_and_write(
         &fasta,
         cfg_arc.clone(),
         support_arc.clone(),
@@ -277,17 +299,13 @@ fn main() -> Result<()> {
         tsv_sink,
     )?;
 
-    elog!("SUMMARY", "Total foldbacks detected: {}", num_foldbacks);
+    elog!("SUMMARY", "Foldback reads detected: {}", foldback_reads);
     elog!(
         "SUMMARY",
-        "Total foldbacks cut (>=1 recursion): {}",
-        num_cut
+        "Foldback reads cut (>=1 recursion): {}",
+        cut_reads
     );
-    elog!(
-        "SUMMARY",
-        "Total foldbacks classified real (if enabled): {}",
-        num_real
-    );
+    elog!("SUMMARY", "Foldback reads classified real: {}", real_reads);
 
     Ok(())
 }

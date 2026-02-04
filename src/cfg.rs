@@ -178,25 +178,22 @@ pub struct FoldSecondPassCfg {
     /// treat it as *real* and therefore **do not** cut/correct (unless overridden).
     pub min_support: usize,
 
-    /// Required tight clustering of refined split positions (bp) for “real”.
-    ///
-    /// Even if the signature is shared, a truly templated junction should have
-    /// breakpoints that cluster fairly tightly; wide scatter suggests noise.
-    pub split_tol_bp: usize,
-
     /// Minimum refinement identity estimate required to accept as a foldback candidate.
     ///
     /// This is applied in pass2 before computing/looking up signatures, to avoid
     /// spending work on low-confidence calls.
     pub min_identity: f32,
+
+    /// Minimum support identity estimate required to accept as a foldback candidate.
+    pub min_support_ident: f64,
 }
 
 impl Default for FoldSecondPassCfg {
     fn default() -> Self {
         Self {
             min_support: 3,
-            split_tol_bp: 100,
             min_identity: 0.60,
+            min_support_ident: 0.0,
         }
     }
 }

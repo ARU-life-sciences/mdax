@@ -40,6 +40,8 @@ struct DebugCounts {
     sig_ok: u64,
     /// (pass2 only) how many signatures were found in the support map
     sig_in_support: u64,
+    /// (pass2 only) how many signatures were NOT found in the support map
+    sig_not_in_support: u64,
 }
 
 impl DebugCounts {
@@ -57,6 +59,7 @@ impl DebugCounts {
             "ident_ok" => self.ident_ok += 1,
             "sig_ok" => self.sig_ok += 1,
             "sig_in_support" => self.sig_in_support += 1,
+            "sig_not_in_support" => self.sig_not_in_support += 1,
             _ => {}
         }
     }
@@ -591,6 +594,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                     }
                                     (is_real_foldback(sig, &support, &cfg), st.n, st.split_span())
                                 } else {
+                                    dbg.bump("sig_not_in_support");
                                     if miss_sig_sample.len() < 5 {
                                         miss_sig_sample.push(sig);
                                     }
@@ -671,15 +675,16 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
 
             elog!(
                 "PASS2 WORKER DONE",
-                "jobs={}, detected={}, refined={}, cut={}, real={}, support_hits={}, support_misses={}",
+                "reads={} detected={} refined={} cut_reads={} real_reads={} reads_with_support_sig={} reads_without_support_sig={}",
                 dbg.jobs,
                 dbg.detected,
                 dbg.refined,
                 num_cut,
                 num_real,
                 dbg.sig_in_support,
-                miss_sig_sample.len()
+                dbg.sig_not_in_support
             );
+
 
             Ok((num_foldbacks, num_cut, num_real))
         }));

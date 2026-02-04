@@ -237,27 +237,25 @@ pub fn revcomp_in_place(seq: &mut [u8]) {
 /// For logging the support clusters in `main.rs`
 pub fn compact_histogram(
     buckets: &std::collections::HashMap<usize, usize>,
-    scale: usize,
+    width: usize,
 ) -> Result<()> {
     use std::collections::BTreeMap;
 
-    // Aggregate buckets into ranges of 10
+    // Aggregate into ranges of 10
     let mut range_buckets: BTreeMap<usize, usize> = BTreeMap::new();
     for (&key, &count) in buckets {
-        let range_start = (key / 10) * 10; // Define range bucket (e.g., 1–10, 11–20, etc.)
+        let range_start = (key / 10) * 10;
         *range_buckets.entry(range_start).or_insert(0) += count;
     }
 
-    // Determine the scaling factor for histogram visualization
-    let max_count = *range_buckets.values().max().unwrap_or(&1);
-    let scale_factor = (scale as f64 / max_count as f64).ceil() as usize;
+    let max_count = *range_buckets.values().max().unwrap_or(&1) as f64;
+    let ratio = width as f64 / max_count; // <= 1.0 typically
 
-    // Print histogram
     for (range_start, &count) in &range_buckets {
         let range_end = range_start + 9;
-        let bar_width = count * scale_factor;
-        let bar: String = "█".repeat(bar_width.min(scale));
-        stderrln!("{:>3}–{:>3}: {:>5} {}", range_start, range_end, count, bar)?;
+        let bar_width = ((count as f64) * ratio).round() as usize;
+        let bar = "█".repeat(bar_width.min(width));
+        stderrln!("{:>3}–{:>3}: {:>6} {}", range_start, range_end, count, bar)?;
     }
     Ok(())
 }
