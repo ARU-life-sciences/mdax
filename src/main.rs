@@ -8,7 +8,7 @@ mod pipeline;
 mod scratch;
 mod utils;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use calm_io::stderrln;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -175,12 +175,6 @@ fn main() -> Result<()> {
         },
     };
 
-    // so we use hifi initial, for fast ont
-    let mut shared_fast = cfg.shared.clone();
-    shared_fast.refine.mode = RefineMode::HiFi;
-    // shared_fast.refine.window = shared_fast.refine.window.min(50);
-    // shared_fast.refine.arm    = shared_fast.refine.arm.min(120);
-
     if fairness_baseline {
         stderrln!("FAIRNESS BASELINE ENABLED (developer mode)")?;
         stderrln!(
@@ -193,10 +187,16 @@ fn main() -> Result<()> {
     }
 
     // choose threads + channel capacity
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .max(1);
+    let available_threads = std::thread::available_parallelism().map(|n| n.get())?;
+
+    let threads = *args.get_one::<usize>("threads").unwrap();
+    if threads > available_threads {
+        bail!(
+            "Requested {} threads, but only {} are available",
+            threads,
+            available_threads
+        );
+    }
 
     // keep this modest to avoid buffering too much sequence
     let chan_cap = 512usize;

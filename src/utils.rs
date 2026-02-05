@@ -6,26 +6,6 @@
 use anyhow::Result;
 use calm_io::stderrln;
 
-/// Write one FASTA record to `f` as a single-line sequence.
-///
-/// This is intentionally minimal and allocation-free:
-/// - writes `>` + `id` + newline
-/// - writes `seq` on **one line** (fastest / simplest; avoids line wrapping)
-/// - writes trailing newline
-///
-/// Notes:
-/// - `seq` is assumed to already be ASCII bases (A/C/G/T/N) but we don't enforce it.
-/// - We use `impl Write` to avoid dynamic dispatch in hot code.
-pub fn write_fasta(f: &mut impl std::io::Write, id: &str, seq: &[u8]) -> std::io::Result<()> {
-    f.write_all(b">")?;
-    f.write_all(id.as_bytes())?;
-    f.write_all(b"\n")?;
-    // write sequence as a single line (fastest)
-    f.write_all(seq)?;
-    f.write_all(b"\n")?;
-    Ok(())
-}
-
 /// Result of breakpoint refinement around a coarse split.
 ///
 /// `Refined` captures the minimal information needed downstream:
@@ -160,24 +140,51 @@ pub fn banded_edit_distance_scratch(
     prev[m].min(band + 1)
 }
 
-/// Write the reverse-complement of `src` into `dst`.
-///
-/// This is a low-level, allocation-free primitive for situations where you want to
-/// reuse an output buffer (e.g. inside inner loops).
-///
-/// Requirements:
-/// - `src.len() == dst.len()` (enforced by debug_assert)
-/// - `dst` may alias `src`? (Not safe for in-place use; use `revcomp_in_place` instead.)
-///
-/// Non-ACGT bases are mapped to `N` via `comp()`.
+/// Reverse-complement lookup table for ASCII bases.
+/// Unknowns map to 'N'. Preserves case for A/C/G/T/N.
+#[rustfmt::skip]
+pub const RC_LUT: [u8; 256] = {
+    let mut t = [b'N'; 256];
+    t[b'A' as usize] = b'T'; t[b'C' as usize] = b'G'; t[b'G' as usize] = b'C'; t[b'T' as usize] = b'A'; t[b'N' as usize] = b'N';
+    t[b'a' as usize] = b't'; t[b'c' as usize] = b'g'; t[b'g' as usize] = b'c'; t[b't' as usize] = b'a'; t[b'n' as usize] = b'n';
+    // common ambiguity codes (optional; keep if you expect them)
+    t[b'R' as usize] = b'Y'; t[b'Y' as usize] = b'R';
+    t[b'S' as usize] = b'S'; t[b'W' as usize] = b'W';
+    t[b'K' as usize] = b'M'; t[b'M' as usize] = b'K';
+    t[b'B' as usize] = b'V'; t[b'V' as usize] = b'B';
+    t[b'D' as usize] = b'H'; t[b'H' as usize] = b'D';
+    t[b'r' as usize] = b'y'; t[b'y' as usize] = b'r';
+    t[b's' as usize] = b's'; t[b'w' as usize] = b'w';
+    t[b'k' as usize] = b'm'; t[b'm' as usize] = b'k';
+    t[b'b' as usize] = b'v'; t[b'v' as usize] = b'b';
+    t[b'd' as usize] = b'h'; t[b'h' as usize] = b'd';
+    t
+};
+
+/// Reverse-complement in place.
+/// Hot path: two-pointer swap + LUT, minimal branching.
 #[inline]
-pub fn revcomp_into(src: &[u8], dst: &mut [u8]) {
-    debug_assert_eq!(src.len(), dst.len());
+pub fn revcomp_in_place(seq: &mut [u8]) {
     let mut i = 0usize;
-    let mut j = src.len();
-    while i < src.len() {
+    let mut j = seq.len();
+
+    // Safety: pointer ops are bounds-checked via i/j invariants.
+    while i < j {
         j -= 1;
-        dst[i] = comp(src[j]);
+        if i == j {
+            // middle element (odd length)
+            let b = unsafe { *seq.get_unchecked(i) };
+            unsafe { *seq.get_unchecked_mut(i) = RC_LUT[b as usize] };
+            break;
+        }
+
+        let a = unsafe { *seq.get_unchecked(i) };
+        let b = unsafe { *seq.get_unchecked(j) };
+        unsafe {
+            *seq.get_unchecked_mut(i) = RC_LUT[b as usize];
+            *seq.get_unchecked_mut(j) = RC_LUT[a as usize];
+        }
+
         i += 1;
     }
 }
@@ -202,35 +209,23 @@ pub fn comp(b: u8) -> u8 {
     }
 }
 
-/// Reverse-complement a sequence **in place**.
-///
-/// This swaps and complements from both ends toward the middle:
-/// - O(n) time
-/// - O(1) extra memory
-///
-/// Behavior:
-/// - A/C/G/T (case-insensitive) are complemented as expected.
-/// - Any other byte is converted to `N` (including already-ambiguous bases).
-///
-/// Edge cases:
-/// - Empty slice: no-op.
-/// - Odd length: the middle base is complemented once after the loop.
-pub fn revcomp_in_place(seq: &mut [u8]) {
-    let mut i = 0usize;
-    let mut j = seq.len().saturating_sub(1);
-    while i < j {
-        // Complement first, then swap, so we don't need a temp buffer of original bases.
-        let a = comp(seq[i]);
-        let b = comp(seq[j]);
-        seq[i] = b;
-        seq[j] = a;
-        i += 1;
-        j = j.saturating_sub(1);
-    }
+/// Reverse-complement `src` into preallocated `dst`.
+/// `dst` will be resized to match `src` length.
+/// This avoids allocations if `dst` is reused.
+#[inline]
+pub fn revcomp_into(dst: &mut Vec<u8>, src: &[u8]) {
+    let n = src.len();
+    dst.resize(n, 0);
 
-    // If length is odd, complement the middle element.
-    if i == j && i < seq.len() {
-        seq[i] = comp(seq[i]);
+    // Write dst[k] = RC(src[n-1-k])
+    // Use raw pointers to keep bounds checks out of the inner loop.
+    unsafe {
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        for k in 0..n {
+            let b = *sp.add(n - 1 - k);
+            *dp.add(k) = RC_LUT[b as usize];
+        }
     }
 }
 

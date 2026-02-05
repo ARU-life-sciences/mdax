@@ -348,7 +348,7 @@ mod tests {
         let f = File::create(path).expect("create temp fasta");
         let mut w = std::io::BufWriter::new(f);
         for (id, seq) in records {
-            crate::utils::write_fasta(&mut w, id, seq).unwrap();
+            crate::utils::write_fasta(&mut w, id.as_bytes(), seq).expect("write fasta record");
         }
     }
 

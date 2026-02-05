@@ -463,7 +463,31 @@ Guidance:\n\
                 .hide(true) 
                 .help("Developer-only: lock parameters for fair benchmarking")
                 .action(clap::ArgAction::SetTrue),
-        );
+        )
+        .arg(
+            Arg::new("threads")
+                .long("threads")
+                .short('t')
+                .default_value("1")
+                .value_parser(value_parser!(usize))
+                .help("Number of worker threads to use.")
+                .long_help("Number of worker threads to parallelise foldback detection and correction.\n\
+\n\
+`mdax` uses a multi-threaded pipeline with a single reader and writer thread and \
+multiple worker threads for detection, refinement, and classification.\n\
+\n\
+Notes:\n\
+- Increasing threads improves performance up to the point where the workload \
+becomes memory- or I/O-bound.\n\
+- For compute-only runs (e.g. -o /dev/null -r /dev/null), scaling typically \
+plateaus well below the total number of CPU cores.\n\
+- For runs that write FASTA/TSV output, disk I/O can dominate wall-clock time, \
+and increasing threads may provide little or no speedup.\n\
+\n\
+Default is a single core, multithreading will likely give gains up to 24-32 threads."
+        )
+    );
+
 
     c.get_matches()
 }

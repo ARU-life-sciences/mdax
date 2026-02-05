@@ -5,10 +5,10 @@ use crate::fingerprint::{
 use crate::minimizer::sampled_minimizers_into;
 use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
 use crate::utils::{
-    RefineMode, Refined, banded_edit_distance_scratch, comp, div_floor, revcomp_in_place,
-    revcomp_into,
+    RefineMode, Refined, banded_edit_distance_scratch, comp, div_floor, revcomp_into,
 };
 use gxhash::HashMap;
+use std::ops::Range;
 
 #[derive(Copy, Clone, Debug)]
 pub struct BinStat {
@@ -135,14 +135,14 @@ pub fn refine_breakpoint_banded_ed(
     let mut best_s = s0;
     let mut best_ed: usize = usize::MAX;
 
-    scratch.right_rc.resize(cfg.refine.arm, b'N');
     let mut found = false;
 
     for s in (s0 - cfg.refine.window)..=(s0 + cfg.refine.window) {
         let left = &seq[s - cfg.refine.arm..s];
         let right = &seq[s..s + cfg.refine.arm];
 
-        revcomp_into(right, &mut scratch.right_rc);
+        // Fill scratch.right_rc with revcomp(right)
+        revcomp_into(&mut scratch.right_rc, right);
 
         let ed = banded_edit_distance_scratch(
             left,
@@ -152,7 +152,6 @@ pub fn refine_breakpoint_banded_ed(
             &mut scratch.curr,
         );
 
-        // If ed == band+1, true distance is > band => treat as failure
         if ed > band {
             continue;
         }
@@ -205,9 +204,7 @@ pub fn detect_foldback(
         &mut scratch.val_f,
     );
 
-    scratch.rc.resize(seq.len(), 0);
-    scratch.rc.copy_from_slice(seq);
-    revcomp_in_place(&mut scratch.rc);
+    revcomp_into(&mut scratch.rc, seq);
 
     sampled_minimizers_into(
         &scratch.rc,
@@ -386,25 +383,39 @@ fn fold_breakpoint_from_pts(
     })
 }
 
-pub fn recursive_foldback_cut_from_first<'a>(
-    mut seq: &'a [u8],
-    first_fb: FoldBreakpoint,
-    first_rf: Refined,
+pub fn recursive_foldback_cut_from_first_range(
+    seq: &[u8],               // original full sequence
+    mut keep: Range<usize>,   // current keep window into `seq`
+    first_fb: FoldBreakpoint, // split_pos is assumed relative to `seq` (full coords)
+    first_rf: Refined,        // split_pos is assumed relative to `seq` (full coords)
     cfg: &MdaxCfg,
     support: &HashMap<u64, SupportStats>,
     max_depth: usize,
     scratch: &mut FoldScratch,
     sig_scratch: &mut SigScratch,
-) -> anyhow::Result<&'a [u8]> {
-    // We already have the first hit/refine. After the first cut, detect/refine normally.
+) -> anyhow::Result<Range<usize>> {
+    // We already have the first hit/refine (full coords). After first cut, detect/refine on the view.
     let mut fb_opt = Some(first_fb);
     let mut rf_opt = Some(first_rf);
 
     for _ in 0..max_depth {
+        // View of the sequence we are currently considering
+        let view = &seq[keep.clone()];
+
         // --- 1) detect foldback (skip for first iteration) ---
         let fb = match fb_opt.take() {
-            Some(fb) => fb,
-            None => match detect_foldback(seq, &cfg.shared, &cfg.fold, scratch) {
+            Some(mut fb) => {
+                // Convert full-coord split into view-local coord if needed.
+                // (If keep.start==0, this is a no-op.)
+                if fb.split_pos >= keep.start {
+                    fb.split_pos -= keep.start;
+                } else {
+                    // If inconsistent, bail rather than panic.
+                    break;
+                }
+                fb
+            }
+            None => match detect_foldback(view, &cfg.shared, &cfg.fold, scratch) {
                 Some(fb) => fb,
                 None => break,
             },
@@ -412,8 +423,15 @@ pub fn recursive_foldback_cut_from_first<'a>(
 
         // --- 2) refine breakpoint (skip for first iteration) ---
         let rf = match rf_opt.take() {
-            Some(rf) => rf,
-            None => match refine_breakpoint(seq, fb.split_pos, &cfg.shared, &mut scratch.refine) {
+            Some(mut rf) => {
+                if rf.split_pos >= keep.start {
+                    rf.split_pos -= keep.start;
+                } else {
+                    break;
+                }
+                rf
+            }
+            None => match refine_breakpoint(view, fb.split_pos, &cfg.shared, &mut scratch.refine) {
                 Some(rf) => rf,
                 None => break,
             },
@@ -434,12 +452,12 @@ pub fn recursive_foldback_cut_from_first<'a>(
             cfg.sig.value_shift,
         )
         .or_else(|| {
-            // fallback: flank signature, quantize split
+            // fallback: flank signature, quantize split (view-local coords)
             let q = 150usize;
             let split_q = (rf.split_pos / q) * q;
 
             foldback_signature(
-                seq,
+                view,
                 split_q,
                 &cfg.shared,
                 cfg.sig.flank_bp,
@@ -449,23 +467,21 @@ pub fn recursive_foldback_cut_from_first<'a>(
             )
         });
 
-        let Some(sig) = sig else {
-            break;
-        };
+        let Some(sig) = sig else { break };
 
         if is_real_foldback(sig, support, cfg) {
             // real -> don't cut
             break;
         }
 
-        // artefact -> cut left
-        let split = rf.split_pos.min(seq.len());
-        seq = &seq[..split];
+        // artefact -> cut left (i.e., keep prefix of current view)
+        let split = rf.split_pos.min(view.len());
+        keep.end = keep.start + split;
 
-        // next iteration will (re)detect/refine on the shortened seq
+        // next iteration will detect/refine on the shortened view
     }
 
-    Ok(seq)
+    Ok(keep)
 }
 
 #[cfg(test)]

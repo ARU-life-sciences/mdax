@@ -238,6 +238,7 @@ pub struct ModeTuning {
     /// Support threshold for calling a foldback “real”.
     pub min_support: usize,
     /// Required tightness of split clustering (bp) for “real”.
+    #[allow(dead_code)]
     pub split_tol_bp: usize,
     /// Maximum recursion depth for iterative cutting of nested artefacts.
     pub max_depth: usize,
@@ -280,7 +281,7 @@ impl CallMode {
                 max_depth: 5,
                 sig_flank_bp: 600,
                 sig_take: 8,
-                sig_value_shift: 4,
+                sig_value_shift: 0, // not sure this should be > 0
             },
             // permissive: more calls/cuts (good for exploration)
             CallMode::Permissive => ModeTuning {
@@ -316,8 +317,6 @@ pub struct FairnessParams {
     pub min_identity: f32,
     /// Support threshold for “real foldback”.
     pub min_support: usize,
-    /// Required tightness of split clustering (bp) for “real”.
-    pub split_tol_bp: usize,
     /// Maximum recursion depth for iterative cutting.
     pub max_depth: usize,
 
@@ -344,12 +343,6 @@ pub struct FairnessParams {
     pub end_guard: usize,
     /// Foldback diagonal tolerance (LOCKED in baseline preset).
     pub fold_diag_tol: i32,
-
-    // ---- signature ----
-    /// Signature flank size (bp).
-    pub sig_flank_bp: usize,
-    /// Number of signature values retained per side.
-    pub sig_take: usize,
 }
 
 impl FairnessParams {
@@ -365,7 +358,6 @@ impl FairnessParams {
             min_span: 1000,
             min_identity: 0.60,
             min_support: 2,
-            split_tol_bp: 100,
             max_depth: 1,
 
             // minimizers (LOCKED)
@@ -382,10 +374,6 @@ impl FairnessParams {
             // guards (LOCKED)
             end_guard: 1000,
             fold_diag_tol: 120,
-
-            // signature
-            sig_flank_bp: 1000,
-            sig_take: 12,
         }
     }
 }
