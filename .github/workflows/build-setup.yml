@@ -1,0 +1,5 @@
+- name: Enable AVX2 for x86_64 Linux build
+  if: runner.os == 'Linux'
+  run: |
+    echo RUSTFLAGS=-C target-feature=+aes,+sse2,+avx2 >> $GITHUB_ENV
+
