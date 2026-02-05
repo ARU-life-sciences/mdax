@@ -242,7 +242,8 @@ pub fn pass1_build_support<P: AsRef<Path>>(
                             fb.split_pos,
                             &shared_fast,
                             &mut fold_scratch.refine,
-                        ) else {
+                        )?
+                        else {
                             continue;
                         };
                         dbg.bump("refined");
@@ -380,7 +381,6 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
         Ok(())
     });
 
-    // Writer thread
     // Writer thread
     let writer_handle = thread::spawn(move || -> Result<()> {
         use std::io::Write;
@@ -528,14 +528,14 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                             fb.split_pos,
                             &cfg.shared,
                             &mut fold_scratch.refine,
-                        );
+                        )?;
 
                         let refined_sig = foldback::refine_breakpoint(
                             &job.seq,
                             fb.split_pos,
                             &shared_fast,
                             &mut fold_scratch.refine,
-                        );
+                        )?;
 
                         if let Some(rf_call) = refined_call {
                             dbg.bump("refined");

@@ -33,7 +33,6 @@ pub struct Refined {
 /// In `mdax`:
 /// - `HiFi`: cheaper + stable enough for signature coherence in pass1/lookup
 /// - `ONT`: more tolerant to higher indel/substitution error for real read correction (in ONT reads)
-/// But note that `ONT` mode is slower (~1.5x slower?)
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum RefineMode {
     HiFi,
@@ -64,8 +63,8 @@ pub fn div_floor(x: i32, d: i32) -> i32 {
 ///   sentinel value so you can pick the least-bad candidate deterministically.
 ///
 /// Complexity:
-/// - Time: `O(len(a) * band)` (only a diagonal band of the DP matrix is evaluated)
-/// - Space: `O(len(b))` via two rolling rows (`prev`, `curr`)
+/// - Time: `O(len(a) * (2*band + 1))` (clamped by `len(b)`)
+/// - Space: `O(len(b))` for two rolling rows
 ///
 /// `prev` and `curr` are scratch vectors to avoid reallocation in tight loops.
 /// They are resized as needed and overwritten.
@@ -142,12 +141,13 @@ pub fn banded_edit_distance_scratch(
 
 /// Reverse-complement lookup table for ASCII bases.
 /// Unknowns map to 'N'. Preserves case for A/C/G/T/N.
+/// Includes common IUPAC ambiguity complements 
 #[rustfmt::skip]
 pub const RC_LUT: [u8; 256] = {
     let mut t = [b'N'; 256];
     t[b'A' as usize] = b'T'; t[b'C' as usize] = b'G'; t[b'G' as usize] = b'C'; t[b'T' as usize] = b'A'; t[b'N' as usize] = b'N';
     t[b'a' as usize] = b't'; t[b'c' as usize] = b'g'; t[b'g' as usize] = b'c'; t[b't' as usize] = b'a'; t[b'n' as usize] = b'n';
-    // common ambiguity codes (optional; keep if you expect them)
+    // common ambiguity codes
     t[b'R' as usize] = b'Y'; t[b'Y' as usize] = b'R';
     t[b'S' as usize] = b'S'; t[b'W' as usize] = b'W';
     t[b'K' as usize] = b'M'; t[b'M' as usize] = b'K';
@@ -253,4 +253,148 @@ pub fn compact_histogram(
         stderrln!("{:>3}–{:>3}: {:>6} {}", range_start, range_end, count, bar)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A tiny reference Levenshtein for small strings (no banding, no scratch).
+    fn levenshtein(a: &[u8], b: &[u8]) -> usize {
+        let n = a.len();
+        let m = b.len();
+        let mut dp = vec![vec![0usize; m + 1]; n + 1];
+        for i in 0..=n {
+            dp[i][0] = i;
+        }
+        for j in 0..=m {
+            dp[0][j] = j;
+        }
+        for i in 1..=n {
+            for j in 1..=m {
+                let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+                dp[i][j] = (dp[i - 1][j] + 1)
+                    .min(dp[i][j - 1] + 1)
+                    .min(dp[i - 1][j - 1] + cost);
+            }
+        }
+        dp[n][m]
+    }
+
+    #[test]
+    fn div_floor_matches_mathematical_floor() {
+        // Positive / positive
+        assert_eq!(div_floor(7, 3), 2);
+        assert_eq!(div_floor(6, 3), 2);
+
+        // Negative numerator
+        assert_eq!(div_floor(-7, 3), -3); // -2.333 -> -3
+        assert_eq!(div_floor(-6, 3), -2);
+
+        // Negative denominator
+        assert_eq!(div_floor(7, -3), -3); // -2.333 -> -3
+        assert_eq!(div_floor(6, -3), -2);
+
+        // Both negative
+        assert_eq!(div_floor(-7, -3), 2); // 2.333 -> 2
+        assert_eq!(div_floor(-6, -3), 2);
+
+        // Small edges around zero
+        assert_eq!(div_floor(-1, 2), -1);
+        assert_eq!(div_floor(1, -2), -1);
+    }
+
+    #[test]
+    fn comp_is_conservative_and_case_insensitive_for_acgt() {
+        assert_eq!(comp(b'A'), b'T');
+        assert_eq!(comp(b'a'), b'T');
+        assert_eq!(comp(b'C'), b'G');
+        assert_eq!(comp(b'c'), b'G');
+        assert_eq!(comp(b'G'), b'C');
+        assert_eq!(comp(b'g'), b'C');
+        assert_eq!(comp(b'T'), b'A');
+        assert_eq!(comp(b't'), b'A');
+
+        // Ambiguity becomes N
+        assert_eq!(comp(b'R'), b'N');
+        assert_eq!(comp(b'N'), b'N');
+        assert_eq!(comp(b'-'), b'N');
+    }
+
+    #[test]
+    fn revcomp_in_place_even_and_odd_lengths() {
+        let mut s1 = b"ACGT".to_vec();
+        revcomp_in_place(&mut s1);
+        assert_eq!(s1, b"ACGT"); // ACGT is self-revcomp
+
+        let mut s2 = b"AAA".to_vec();
+        revcomp_in_place(&mut s2);
+        assert_eq!(s2, b"TTT");
+
+        let mut s3 = b"ACGTA".to_vec();
+        revcomp_in_place(&mut s3);
+        assert_eq!(s3, b"TACGT");
+    }
+
+    #[test]
+    fn revcomp_into_matches_in_place() {
+        let src = b"AcgTNryKMbvDh".to_vec(); // includes mixed case + ambiguity
+        let mut dst = Vec::new();
+
+        revcomp_into(&mut dst, &src);
+
+        let mut in_place = src.clone();
+        revcomp_in_place(&mut in_place);
+
+        assert_eq!(dst, in_place);
+    }
+
+    #[test]
+    fn banded_edit_distance_returns_exact_when_within_band() {
+        let a = b"ACGTACGTACGT";
+        let b = b"ACGTTCGTACGT"; // 1 substitution
+        let true_ed = levenshtein(a, b);
+        assert_eq!(true_ed, 1);
+
+        let mut prev = Vec::new();
+        let mut curr = Vec::new();
+        let ed = banded_edit_distance_scratch(a, b, 2, &mut prev, &mut curr);
+        assert_eq!(ed, 1);
+    }
+
+    #[test]
+    fn banded_edit_distance_returns_band_plus_one_when_outside_band() {
+        let a = b"AAAAAAAAAAAA";
+        let b = b"TTTTTTTTTTTT"; // 12 substitutions
+        let true_ed = levenshtein(a, b);
+        assert_eq!(true_ed, 12);
+
+        let mut prev = Vec::new();
+        let mut curr = Vec::new();
+        let band = 3;
+        let ed = banded_edit_distance_scratch(a, b, band, &mut prev, &mut curr);
+        assert_eq!(ed, band + 1);
+    }
+
+    #[test]
+    fn banded_edit_distance_symmetric_sanity_with_large_band() {
+        // With band >= max(len), it should behave like full Levenshtein.
+        let a = b"GATTACA";
+        let b = b"GCATGCU";
+
+        let true_ed = levenshtein(a, b);
+
+        let mut prev = Vec::new();
+        let mut curr = Vec::new();
+        let band = a.len().max(b.len());
+
+        let ed_ab = banded_edit_distance_scratch(a, b, band, &mut prev, &mut curr);
+
+        let mut prev2 = Vec::new();
+        let mut curr2 = Vec::new();
+        let ed_ba = banded_edit_distance_scratch(b, a, band, &mut prev2, &mut curr2);
+
+        assert_eq!(ed_ab, true_ed);
+        assert_eq!(ed_ba, true_ed);
+    }
 }

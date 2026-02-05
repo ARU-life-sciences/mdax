@@ -204,7 +204,7 @@ fn main() -> Result<()> {
     elog!("INIT", "Starting with mode: {mode:?}");
     elog!(
         "INIT",
-        "Threads available: {threads}; Specified chunk size: {}",
+        "Threads used/available: {threads}/{available_threads}; Specified chunk size: {}",
         chan_cap
     );
     elog!("INIT", "Parameter Summary:\n  {msg}");

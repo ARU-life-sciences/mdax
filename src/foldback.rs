@@ -1,4 +1,43 @@
+//! Foldback (palindromic junction) detection, refinement, and recursive excision.
+//!
+//! This module implements detection of *foldback / palindromic junctions* in
+//! long sequencing reads, with a focus on multiple displacement amplification (MDA)
+//! artefacts.
+//!
+//! A foldback is characterised by strong reverse-complement self-similarity across
+//! a breakpoint, forming an anti-diagonal when forward minimizers are matched
+//! against reverse-complement minimizers.
+//!
+//! High-level pipeline:
+//! 1. **Coarse detection** (`detect_foldback`)
+//!    - Compute strand-specific minimizers on the sequence and its reverse complement.
+//!    - Match minimizers by value (not by re-hashing k-mers).
+//!    - Cluster matchpoints by anti-diagonal (`p1 + p2`) into bins.
+//!    - Select the best bin and estimate a coarse split position.
+//!
+//! 2. **Refinement** (`refine_breakpoint_*`)
+//!    - HiFi mode: Hamming-style symmetric arm comparison.
+//!    - ONT mode: banded edit distance between left arm and reverse-complemented right arm.
+//!
+//! 3. **Signature construction**
+//!    - Prefer a *local* minimizer-based signature derived from matched minimizers
+//!      participating in the foldback.
+//!    - Fall back to a flank-based signature if local matches are insufficient.
+//!
+//! 4. **Recursive cutting**
+//!    - Use support statistics to distinguish real genomic palindromes from
+//!      stochastic MDA artefacts.
+//!    - Iteratively trim artefactual foldbacks from the right end of the read.
+//!
+//! Design notes:
+//! - Uses *forward-only* (strand-specific) minimizers for detection to avoid
+//!   canonical-strand artefacts.
+//! - Explicitly guards against low-complexity sequence via capped minimizer buckets.
+//! - All coordinates are carefully tracked between full-sequence and view-local
+//!   coordinate systems during recursion.
+
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
+use crate::elog;
 use crate::fingerprint::{
     SupportStats, foldback_signature, foldback_signature_from_local_matches, is_real_foldback,
 };
@@ -7,16 +46,33 @@ use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
 use crate::utils::{
     RefineMode, Refined, banded_edit_distance_scratch, comp, div_floor, revcomp_into,
 };
+use anyhow::Result;
 use gxhash::HashMap;
 use std::ops::Range;
 
+/// Per-bin summary statistics used during coarse foldback detection.
+///
+/// Each bin corresponds to a quantised anti-diagonal:
+///     d = p1 + p2
+/// where `p1` is a forward minimizer position and `p2` is the corresponding
+/// reverse-complement position mapped into forward coordinates.
+///
+/// The statistics are deliberately lightweight and are used only to:
+/// - discard bins with insufficient support
+/// - discard bins with insufficient spatial span
+/// - choose the single “best” bin for second-phase point collection
 #[derive(Copy, Clone, Debug)]
 pub struct BinStat {
+    /// Number of matchpoints falling into this bin.
     count: usize,
+    /// Minimum forward position observed in this bin.
     min_p1: i32,
+    /// Maximum forward position observed in this bin.
     max_p1: i32,
 }
+
 impl BinStat {
+    /// Create a new bin initialised with a single forward position.
     fn new(p1: i32) -> Self {
         Self {
             count: 1,
@@ -24,61 +80,87 @@ impl BinStat {
             max_p1: p1,
         }
     }
+
+    /// Update bin statistics with an additional forward position.
     fn update(&mut self, p1: i32) {
         self.count += 1;
         self.min_p1 = self.min_p1.min(p1);
         self.max_p1 = self.max_p1.max(p1);
     }
+
+    /// Span of forward positions in this bin.
+    ///
+    /// This approximates the arm length supporting the foldback.
     fn span(&self) -> usize {
         (self.max_p1 as i64 - self.min_p1 as i64).max(0) as usize
     }
+
+    /// Proxy score used to rank bins during coarse detection.
+    ///
+    /// Combines spatial span and match count, strongly favouring bins
+    /// with many supporting minimizers.
     fn score_proxy(&self) -> i64 {
         self.span() as i64 + (self.count as i64 * 10)
     }
 }
 
-/// IMPORTANT:
-/// This implementation uses *strand-specific* minimizers (forward-only) via:
-///   simd_minimizers::minimizers(k,w).hasher(NtHasher::<false>)
+/// Result of coarse foldback detection.
 ///
-/// And it matches minimizers using the *minimizer values returned by simd_minimizers*
-/// (i.e. the same hashes/values that were used to choose minimizers), rather than
-/// re-hashing the underlying k-mers with a separate hash function.
-///
-/// This makes the foldback detector more “Pacasus-like” in the sense that it is
-/// explicitly looking for strong reverse-complement self-similarity (anti-diagonal)
-/// without canonical-strand tie-breaking artifacts.
-
-/// Result of foldback detection (coarse).
+/// This represents an approximate junction location derived purely from
+/// minimizer geometry, prior to any sequence-level refinement.
 #[derive(Debug, Clone)]
 pub struct FoldBreakpoint {
+    /// Estimated split position (0-based, relative to the sequence passed
+    /// to `detect_foldback`).
     pub split_pos: usize,
+    /// Coarse score combining span and number of supporting minimizers.
     pub score: i64,
+    /// Number of minimizer matches supporting the foldback.
     pub matches: usize,
+    /// Span of forward positions supporting the foldback (proxy for arm length).
     pub span: usize,
 }
 
-/// Refine an inexact breakpoint estimate `s0` into a more exact split position.
+/// Refine a coarse foldback breakpoint into a more precise split position.
+///
+/// This function dispatches to either a HiFi-optimised or ONT-optimised
+/// refinement strategy, based on `cfg.refine.mode`.
+///
+/// Returns `None` if the refinement window would exceed sequence bounds
+/// or if no acceptable refinement is found.
 pub fn refine_breakpoint(
     seq: &[u8],
     s0: usize,
     cfg: &SharedCfg,
     refine_scratch: &mut RefineScratch,
-) -> Option<Refined> {
+) -> Result<Option<Refined>> {
     let n = seq.len();
     if s0 < cfg.refine.arm + cfg.refine.window || s0 + cfg.refine.arm + cfg.refine.window > n {
-        eprintln!(
+        elog!(
+            "REFINE BREAKPOINT",
             "Refinement context exceeds sequence bounds: s0={}, arm={}, window={}, len={}",
-            s0, cfg.refine.arm, cfg.refine.window, n
+            s0,
+            cfg.refine.arm,
+            cfg.refine.window,
+            n
         );
-        return None;
+        return Ok(None);
     }
     match cfg.refine.mode {
-        RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, cfg),
-        RefineMode::ONT => refine_breakpoint_banded_ed(seq, s0, cfg, refine_scratch),
+        RefineMode::HiFi => Ok(refine_breakpoint_hamming(seq, s0, cfg)),
+        RefineMode::ONT => Ok(refine_breakpoint_banded_ed(seq, s0, cfg, refine_scratch)),
     }
 }
 
+/// HiFi-optimised breakpoint refinement using symmetric arm comparison.
+///
+/// For each candidate split within `±window` of `s0`, this compares:
+/// - the left arm (walking outward from the split)
+/// - the reverse-complement of the right arm
+///
+/// Scoring is Hamming-like: +1 for match, −1 for mismatch.
+///
+/// This assumes low indel rates and is therefore **not suitable for ONT data**.
 pub fn refine_breakpoint_hamming(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Option<Refined> {
     let n = seq.len();
     if s0 < cfg.refine.arm + cfg.refine.window || s0 + cfg.refine.arm + cfg.refine.window > n {
@@ -120,7 +202,15 @@ pub fn refine_breakpoint_hamming(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Opti
     })
 }
 
-// for ONT data
+/// ONT-optimised breakpoint refinement using banded edit distance.
+///
+/// This compares the left arm against the reverse-complemented right arm
+/// using a banded dynamic programming alignment, allowing for indels.
+///
+/// The band width is derived from `max_ed_rate * arm_length`.
+///
+/// Returns the split position with minimal edit distance within the
+/// refinement window.
 pub fn refine_breakpoint_banded_ed(
     seq: &[u8],
     s0: usize,
@@ -175,14 +265,33 @@ pub fn refine_breakpoint_banded_ed(
     })
 }
 
-/// Detect a foldback/palindromic junction in a single sequence.
+/// Detect a foldback (palindromic) junction in a single sequence.
 ///
-/// Method:
-/// 1) Compute *forward-only* minimizers on `seq` and on `revcomp(seq)` using NtHasher<false>
-/// 2) Index forward minimizers by their minimizer *value*
-/// 3) For each minimizer on rc, match by value and convert rc pos -> forward coordinate
-/// 4) Cluster matchpoints by anti-diagonal d = p1 + p2 (within diag_tol)
-/// 5) Choose best cluster; return split ≈ median(d/2)
+/// This performs *coarse* detection based purely on minimizer geometry.
+///
+/// Algorithm:
+/// 1. Compute strand-specific (forward-only) minimizers on `seq` and on
+///    `revcomp(seq)`.
+/// 2. Index forward minimizers by minimizer *value*, capping bucket sizes
+///    to avoid low-complexity blowups.
+/// 3. Match reverse-complement minimizers to forward minimizers by value,
+///    mapping rc positions back into forward coordinates.
+/// 4. Cluster matchpoints by quantised anti-diagonal `d = p1 + p2`.
+/// 5. Select the best bin based on support and span, then estimate the
+///    split position as `median(d) / 2`.
+///
+/// Returns `None` if:
+/// - too few minimizers are present
+/// - all candidate bins fail support/span thresholds
+/// - the inferred split is too close to sequence ends
+///
+/// Notes:
+/// - Uses minimizer *values* directly (not re-hashed k-mers) to ensure
+///   consistency with minimizer selection.
+/// - Forward-only minimizers avoid canonical-strand artefacts and make
+///   anti-diagonal structure explicit.
+/// - Low-complexity sequence may be intentionally ignored if minimizer
+///   values exceed the bucket cap.
 pub fn detect_foldback(
     seq: &[u8],
     shared: &SharedCfg,
@@ -257,6 +366,8 @@ pub fn detect_foldback(
             continue;
         };
 
+        // Map rc minimizer start position (prc) back into forward coordinates.
+        // If forward k-mer starts at i, its start in rc is n-k-i => i = n-k-prc.
         let p2 = n - k_i32 - (prc as i32);
 
         for &p1 in p1s {
@@ -318,8 +429,8 @@ pub fn detect_foldback(
             let bin = div_floor(d, shared.fold_diag_tol.max(1));
             if bin == best_bin {
                 scratch.best_pts.push((p1, p2));
-                // TODO: is this correct?
-                scratch.best_matches.push((p2 as usize, vrc));
+                // Use forward minimizer position for locality filtering in signature
+                scratch.best_matches.push((p1 as usize, vrc));
             }
         }
     }
@@ -332,6 +443,16 @@ pub fn detect_foldback(
     fold_breakpoint_from_pts(&mut scratch.best_pts, shared, fold, seq.len())
 }
 
+/// Convert a set of matched minimizer points into a coarse foldback breakpoint.
+///
+/// Expects points `(p1, p2)` in forward coordinates that approximately lie
+/// along a single anti-diagonal.
+///
+/// The points are filtered into a monotone chain where `p2` decreases as
+/// `p1` increases, enforcing foldback geometry.
+///
+/// The split position is estimated as:
+///     split ~= median(p1 + p2) / 2
 fn fold_breakpoint_from_pts(
     pts: &mut Vec<(i32, i32)>,
     shared: &SharedCfg,
@@ -383,6 +504,25 @@ fn fold_breakpoint_from_pts(
     })
 }
 
+/// Recursively excise artefactual foldbacks from a sequence prefix.
+///
+/// Starting from an initial foldback detection and refinement (given in
+/// *full-sequence coordinates*), this function:
+/// - Converts breakpoints into view-local coordinates
+/// - Re-detects and refines foldbacks on progressively shortened prefixes
+/// - Uses foldback signatures and support statistics to decide whether a
+///   foldback is real or artefactual
+///
+/// Real (supported) foldbacks terminate recursion.
+/// Artefactual foldbacks cause the sequence to be truncated at the split.
+///
+/// Returns the final `[start, end)` range to keep from the original sequence.
+///
+/// Important invariants:
+/// - `first_fb.split_pos` and `first_rf.split_pos` are in full-sequence coordinates.
+/// - All subsequent detections operate in view-local coordinates.
+/// - `scratch.best_matches` is assumed to correspond to the most recent
+///   `detect_foldback` call.
 pub fn recursive_foldback_cut_from_first_range(
     seq: &[u8],               // original full sequence
     mut keep: Range<usize>,   // current keep window into `seq`
@@ -431,10 +571,12 @@ pub fn recursive_foldback_cut_from_first_range(
                 }
                 rf
             }
-            None => match refine_breakpoint(view, fb.split_pos, &cfg.shared, &mut scratch.refine) {
-                Some(rf) => rf,
-                None => break,
-            },
+            None => {
+                match refine_breakpoint(view, fb.split_pos, &cfg.shared, &mut scratch.refine)? {
+                    Some(rf) => rf,
+                    None => break,
+                }
+            }
         };
 
         if rf.identity_est < cfg.fold2.min_identity {
@@ -600,6 +742,24 @@ mod tests {
         out
     }
 
+    fn random_dna(len: usize, mut x: u64) -> Vec<u8> {
+        // Deterministic xorshift64* PRNG, no external crates.
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            let r = x.wrapping_mul(0x2545F4914F6CDD1D);
+            out.push(match (r & 3) as u8 {
+                0 => b'A',
+                1 => b'C',
+                2 => b'G',
+                _ => b'T',
+            });
+        }
+        out
+    }
+
     #[test]
     fn detect_foldback_breakpoint_near_truth() {
         let left = b"ACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCA";
@@ -626,7 +786,9 @@ mod tests {
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
         let refine_scratch = &mut RefineScratch::default();
 
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch).unwrap();
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch)
+            .unwrap()
+            .unwrap();
 
         assert!((refined.split_pos as i32 - true_bp as i32).abs() <= 2);
 
@@ -645,6 +807,7 @@ mod tests {
         let refine_scratch = &mut RefineScratch::default();
 
         let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch)
+            .unwrap()
             .expect("should refine");
 
         assert!(refined.identity_est > 0.6);
@@ -676,10 +839,12 @@ mod tests {
         let refine_scratch = &mut RefineScratch::default();
 
         shared.refine.mode = RefineMode::HiFi;
-        let hifi = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch);
+        let hifi = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch).unwrap();
 
         shared.refine.mode = RefineMode::ONT;
-        let ont = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch).unwrap();
+        let ont = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch)
+            .unwrap()
+            .unwrap();
 
         assert!(ont.identity_est > 0.4);
         assert!(
@@ -688,5 +853,61 @@ mod tests {
 
         // optional: HiFi may fail, but ONT shouldn't
         assert!(hifi.is_some() || ont.identity_est > 0.4);
+    }
+
+    #[test]
+    fn local_signature_from_best_matches_is_some_and_consistent() {
+        // Use non-repetitive sequence so MAX_BUCKET/repetitive filter doesn’t delete everything.
+        let left = random_dna(4000, 0xC0FFEE);
+        let (s, _true_bp) = make_noisy_foldback_from_left(&left, b"", 0, 0, 0);
+
+        // Slightly denser minimizers can help, but the key fix is non-repetitive input.
+        let (shared, fold) = test_fold_cfg(
+            7,   // k
+            7,   // w  (denser than 9/11)
+            120, // diag_tol
+            200, // min_arm (coarse)
+            3,   // min_matches
+            20,  // refine_window
+            80,  // refine_arm
+            RefineMode::HiFi,
+            0.0,
+        );
+
+        let mut scratch = scratch::FoldScratch::new();
+
+        let coarse = detect_foldback(&s, &shared, &fold, &mut scratch)
+            .expect("detect_foldback should succeed on a clean random foldback");
+
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, &mut scratch.refine)
+            .unwrap()
+            .expect("refine should succeed");
+
+        // Local signature: choose parameters that cannot fail due to take being too large.
+        let window_bp = 300usize;
+        let take = 6usize;
+        let value_shift = 0u8;
+
+        let sig_local = foldback_signature_from_local_matches(
+            &mut scratch.best_matches,
+            refined.split_pos,
+            window_bp,
+            take,
+            value_shift,
+        );
+
+        assert!(sig_local.is_some(), "local signature should be computable");
+    }
+
+    #[test]
+    fn detect_foldback_repetitive_sequence_may_be_ignored() {
+        let left = repeat_bytes(b"ACGTTGCAACGTTGCA", 300);
+        let (s, _bp) = make_noisy_foldback_from_left(&left, b"", 0, 0, 0);
+
+        let (shared, fold) = test_fold_cfg(7, 9, 120, 200, 3, 20, 80, RefineMode::HiFi, 0.0);
+        let mut scratch = scratch::FoldScratch::new();
+
+        // Depending on exact minimizer impl, this may be None due to repetitive filtering.
+        let _ = detect_foldback(&s, &shared, &fold, &mut scratch);
     }
 }

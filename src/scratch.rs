@@ -1,29 +1,86 @@
-// scratch buffers to reuse
-// so that we don't have to allocate memory repeatedly
+//! Scratch buffers for foldback detection, refinement, and signature construction.
+//!
+//! These structs exist purely to reuse allocations across many reads and avoid
+//! repeated heap churn in the hot path.
+//!
+//! Invariants / usage patterns:
+//! - Buffers are reused and are not required to be empty on entry.
+//! - Callers should treat contents as ephemeral: each algorithm overwrites or
+//!   clears what it needs.
+//! - Some functions destructively filter buffers (e.g. `best_matches`), which is
+//!   safe as long as the next call repopulates them.
 use gxhash::HashMapExt;
 
 use crate::foldback::BinStat;
 
+/// Scratch space for `detect_foldback` + subsequent operations that reuse the
+/// matched minimizers.
+///
+/// This holds:
+/// - the reverse-complemented sequence (`rc`)
+/// - minimizer outputs for the forward sequence and its reverse complement
+/// - hash-map indices used during minimizer matching and anti-diagonal binning
+/// - the winning anti-diagonal's matchpoints and a local match list used for
+///   constructing a junction signature
+///
+/// Coordinate conventions:
+/// - `pos_f` and `pos_rc` are minimizer *start positions* relative to the input
+///   passed to `detect_foldback`.
+/// - During matching, rc positions are mapped into forward coordinates via
+///   `p2 = n - k - prc` (where `n = seq.len()`).
+/// - `best_pts` stores `(p1, p2)` pairs in forward coordinates.
+/// - `best_matches` stores `(pos, value)` pairs in forward coordinates, intended
+///   for locality filtering around a refined split position.
 pub struct FoldScratch {
-    // ...
+    /// Reverse complement of the most recent sequence passed to `detect_foldback`.
     pub rc: Vec<u8>,
-    // minimizer buffers
+
+    // --- Minimizer buffers ---
+    /// Minimizer start positions on the forward sequence.
     pub pos_f: Vec<u32>,
+    /// Minimizer values on the forward sequence.
     pub val_f: Vec<u64>,
+    /// Minimizer start positions on the reverse-complement sequence.
     pub pos_rc: Vec<u32>,
+    /// Minimizer values on the reverse-complement sequence.
     pub val_rc: Vec<u64>,
 
-    // ...
+    // --- Matching / binning state ---
+    /// Index of forward minimizer value -> list of forward positions where it occurs.
+    ///
+    /// Used to join rc minimizers to forward minimizers by value.
     pub idx_f: gxhash::HashMap<u64, Vec<i32>>,
+
+    /// Set of minimizer values marked as repetitive and therefore ignored.
+    ///
+    /// This is populated when a minimizer value exceeds a bucket cap in `idx_f`,
+    /// to prevent quadratic blowups on low-complexity sequence.
     pub repetitive: gxhash::HashMap<u64, ()>,
+
+    /// Per-bin statistics keyed by anti-diagonal bin (`(p1+p2)/diag_tol`).
     pub stats: gxhash::HashMap<i32, BinStat>,
+
+    /// Matchpoints `(p1, p2)` for the selected best anti-diagonal bin.
     pub best_pts: Vec<(i32, i32)>,
+
+    /// Local match list for signature construction: `(pos, minimizer_value)`.
+    ///
+    /// Important:
+    /// - `pos` is in forward coordinates (relative to the same sequence view as
+    ///   the refined split).
+    /// - This buffer may be **destructively filtered** by signature functions
+    ///   (e.g. `foldback_signature_from_local_matches`).
     pub best_matches: Vec<(usize, u64)>,
 
+    /// Scratch for refinement stage.
     pub refine: RefineScratch,
 }
 
 impl FoldScratch {
+    /// Construct a fresh scratch object with empty buffers.
+    ///
+    /// Note: buffers will grow to match the largest read processed; we reuse the
+    /// same `FoldScratch` across reads to amortize allocations.
     pub fn new() -> Self {
         Self {
             rc: Vec::new(),
@@ -41,20 +98,40 @@ impl FoldScratch {
     }
 }
 
+/// Scratch space for foldback signature computation.
+///
+/// This is used by both flank-based signatures and local-match signatures.
+/// Buffers are reused across calls to avoid allocating minimizer output vectors
+/// and intermediate combined-value storage.
+///
+/// Coordinate conventions:
+/// - `pos_l/val_l` and `pos_r/val_r` are minimizer outputs relative to the
+///   left/right flanks extracted for signature computation.
 #[derive(Debug, Default)]
 pub struct SigScratch {
+    /// Reverse-complement buffer for the right flank (or other right-hand context).
     pub right_rc: Vec<u8>,
 
-    // minimizer output buffers
+    /// Minimizer start positions on left flank.
     pub pos_l: Vec<u32>,
+    /// Minimizer values on left flank.
     pub val_l: Vec<u64>,
+    /// Minimizer start positions on right flank (usually on reverse-complemented right).
     pub pos_r: Vec<u32>,
+    /// Minimizer values on right flank.
     pub val_r: Vec<u64>,
 
-    // combined values (for hashing)
+    /// Combined minimizer values used as the final hash input.
     pub combined: Vec<u64>,
 }
 
+/// Scratch space for breakpoint refinement.
+///
+/// Holds:
+/// - `right_rc`: reverse complement of the right arm
+/// - `prev`/`curr`: dynamic programming rows for banded edit distance
+///
+/// The DP buffers are sized to the refinement arm length and reused per call.
 #[derive(Debug, Default)]
 pub struct RefineScratch {
     pub right_rc: Vec<u8>,
