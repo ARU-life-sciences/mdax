@@ -487,6 +487,7 @@ pub fn recursive_foldback_cut_from_first_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::revcomp_in_place;
     use crate::{
         cfg::{FoldOnlyCfg, MinimizerCfg, RefineCfg, SharedCfg},
         scratch,
@@ -552,7 +553,7 @@ mod tests {
         }
 
         let mut rc = l.clone();
-        super::revcomp_in_place(&mut rc);
+        revcomp_in_place(&mut rc);
 
         let mut s = Vec::with_capacity(l.len() + join.len() + rc.len());
         s.extend_from_slice(&l);

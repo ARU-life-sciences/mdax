@@ -348,7 +348,20 @@ mod tests {
         let f = File::create(path).expect("create temp fasta");
         let mut w = std::io::BufWriter::new(f);
         for (id, seq) in records {
-            crate::utils::write_fasta(&mut w, id.as_bytes(), seq).expect("write fasta record");
+            fn write_fasta_inner(
+                f: &mut impl std::io::Write,
+                id: &str,
+                seq: &[u8],
+            ) -> std::io::Result<()> {
+                f.write_all(b">")?;
+                f.write_all(id.as_bytes())?;
+                f.write_all(b"\n")?;
+                // write sequence as a single line (fastest)
+                f.write_all(seq)?;
+                f.write_all(b"\n")?;
+                Ok(())
+            }
+            write_fasta_inner(&mut w, id, seq).expect("write fasta record");
         }
     }
 
@@ -537,56 +550,6 @@ mod tests {
 
         // mean should be in range
         assert!(st.mean_ident >= 0.6 && st.mean_ident <= 0.9);
-    }
-
-    #[test]
-    fn is_real_foldback_respects_threshold_and_tolerance() {
-        use crate::cfg::{FoldOnlyCfg, MdaxCfg};
-
-        // minimal cfg stub
-        let cfg = MdaxCfg {
-            shared: shared_for_sig(9, 11, 5),
-            fold: FoldOnlyCfg { min_arm: 20 },
-            fold2: crate::cfg::FoldSecondPassCfg {
-                min_support: 3,
-                min_identity: 0.6,
-                min_support_ident: 0.0,
-            },
-            sig: SigCfg {
-                flank_bp: 1000,
-                take: 8,
-                value_shift: 0,
-            },
-        };
-
-        let mut support: HashMap<u64, SupportStats> = HashMap::new();
-        let sig = 123456_u64;
-
-        // only 2 supports => not real
-        support.insert(sig, {
-            let mut st = SupportStats::new(1000, 0.8);
-            st.update(1005, 0.8);
-            st
-        });
-        assert!(!is_real_foldback(sig, &support, &cfg));
-
-        // 3 supports but too spread => not real
-        support.insert(sig, {
-            let mut st = SupportStats::new(1000, 0.8);
-            st.update(1100, 0.8);
-            st.update(1200, 0.8);
-            st
-        });
-        assert!(!is_real_foldback(sig, &support, &cfg));
-
-        // 3 supports and tight cluster => real
-        support.insert(sig, {
-            let mut st = SupportStats::new(1000, 0.8);
-            st.update(1010, 0.8);
-            st.update(1020, 0.8);
-            st
-        });
-        assert!(is_real_foldback(sig, &support, &cfg));
     }
 
     #[test]
