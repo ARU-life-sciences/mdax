@@ -2,7 +2,23 @@
 
 Read in HiFi or ONT raw data generated from Multiple Displacement Amplification methods, and correct reads. This tool currently only corrects 'foldback' or 'invert' chimeras.
 
-More information to follow.
+## Install
+
+Currently you'll have to clone this repo, have Rust installed, and compile:
+
+```bash
+# install Rust first (https://rust-lang.org/tools/install/)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# clone and cd
+git clone github.com/ARU-life-sciences/mdax
+cd mdax
+# use SIMD instructions
+RUSTFLAGS='-C target-feature=+aes,+sse2,+avx2' cargo build --release
+# or if you want in PATH
+RUSTFLAGS='-C target-feature=+aes,+sse2,+avx2' cargo install --path=.
+```
+
+## Usage
 
 There are lots of options (see below), but to get started:
 
