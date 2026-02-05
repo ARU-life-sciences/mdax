@@ -13,3 +13,8 @@ gxhash = "3.5.0"
 needletail = "0.6.3"
 packed-seq = "4.4.1"
 simd-minimizers = "2.2.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
