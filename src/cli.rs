@@ -74,6 +74,7 @@ The TSV is intended for *debugging, QC, and post filtering*:\n\
 - refined_score: Score assigned after breakpoint refinement.\n\
 - identity_est: Estimated nucleotide identity between the two foldback arms.\n\
 - support_n: Number of other reads supporting the same foldback junction.\n\
+- support_rank_frac: Relative prominence of this junction within the dataset, computed by ranking all junctions by support_n (descending) and normalising the rank to [0,1]. Values near 1 indicate highly recurrent junctions; values near 0 indicate rare/singleton events.\n\
 - support_span: Total supporting span (bp) aggregated across supporting reads.\n\
 - decision: Final classification based on thresholds (real, artefact, unknown, low_ident).\n\
 \n\
