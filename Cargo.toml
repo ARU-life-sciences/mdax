@@ -20,6 +20,14 @@ needletail = "0.6.3"
 packed-seq = "4.4.1"
 simd-minimizers = "2.2.0"
 
+[[bin]]
+name = "mdax"
+path = "src/main.rs"
+
+[[bin]]
+name = "irx"
+path = "src/bin/irx.rs"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

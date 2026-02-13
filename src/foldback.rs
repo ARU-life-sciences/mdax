@@ -104,6 +104,18 @@ impl BinStat {
     }
 }
 
+/// A multi-hit foldback call: breakpoint + the supporting matchpoints.
+#[derive(Debug, Clone)]
+pub struct FoldHit {
+    pub fb: FoldBreakpoint,
+    /// Matchpoints (p1,p2) in window-local forward coordinates.
+    pub pts: Vec<(i32, i32)>,
+    /// Local match list (pos,value) in forward coords (useful for signatures later if desired).
+    pub matches: Vec<(usize, u64)>,
+    /// Anti-diagonal bin id (mostly for debugging).
+    pub bin: i32,
+}
+
 /// Result of coarse foldback detection.
 ///
 /// This represents an approximate junction location derived purely from
@@ -441,6 +453,183 @@ pub fn detect_foldback(
 
     // reuse existing scoring logic
     fold_breakpoint_from_pts(&mut scratch.best_pts, shared, fold, seq.len())
+}
+
+/// Detect up to `k_hits` foldback candidates in `seq`, ranked by proxy score.
+///
+/// This does the same coarse minimizer geometry as `detect_foldback`, but
+/// returns multiple bins instead of only the best bin.
+///
+/// Notes:
+/// - This allocates per-hit `Vec`s for pts/matches. That’s fine for `irx`,
+///   but `mdax` should keep using `detect_foldback()` for speed.
+pub fn detect_foldbacks_topk(
+    seq: &[u8],
+    shared: &SharedCfg,
+    fold: &FoldOnlyCfg,
+    scratch: &mut FoldScratch,
+    k_hits: usize,
+) -> Vec<FoldHit> {
+    let k = shared.minimizer.k;
+    let w = shared.minimizer.w;
+
+    if k_hits == 0 {
+        return Vec::new();
+    }
+    if seq.len() < k + w + 10 {
+        return Vec::new();
+    }
+
+    // forward minimizers
+    sampled_minimizers_into(
+        seq,
+        &shared.minimizer,
+        &mut scratch.pos_f,
+        &mut scratch.val_f,
+    );
+
+    revcomp_into(&mut scratch.rc, seq);
+
+    sampled_minimizers_into(
+        &scratch.rc,
+        &shared.minimizer,
+        &mut scratch.pos_rc,
+        &mut scratch.val_rc,
+    );
+
+    let pos_f = &scratch.pos_f;
+    let val_f = &scratch.val_f;
+    let pos_rc = &scratch.pos_rc;
+    let val_rc = &scratch.val_rc;
+
+    if pos_f.len() < shared.min_matches || pos_rc.len() < shared.min_matches {
+        return Vec::new();
+    }
+
+    // ---- index forward minimizers ----
+    const MAX_BUCKET: usize = 64;
+    scratch.idx_f.clear();
+    scratch.repetitive.clear();
+
+    for (&p, &v) in pos_f.iter().zip(val_f.iter()) {
+        if scratch.repetitive.contains_key(&v) {
+            continue;
+        }
+        let e = scratch.idx_f.entry(v).or_default();
+        if e.len() < MAX_BUCKET {
+            e.push(p as i32);
+        } else {
+            scratch.idx_f.remove(&v);
+            scratch.repetitive.insert(v, ());
+        }
+    }
+
+    // ---- bin stats ----
+    let n = seq.len() as i32;
+    let k_i32 = k as i32;
+
+    scratch.stats.clear();
+
+    for (&prc, &vrc) in pos_rc.iter().zip(val_rc.iter()) {
+        if scratch.repetitive.contains_key(&vrc) {
+            continue;
+        }
+        let Some(p1s) = scratch.idx_f.get(&vrc) else {
+            continue;
+        };
+
+        let p2 = n - k_i32 - (prc as i32);
+
+        for &p1 in p1s {
+            let d = p1 + p2;
+            let bin = div_floor(d, shared.fold_diag_tol.max(1));
+            scratch
+                .stats
+                .entry(bin)
+                .and_modify(|st| st.update(p1))
+                .or_insert_with(|| BinStat::new(p1));
+        }
+    }
+
+    // ---- rank bins ----
+    let mut cands: Vec<(i32, i64, usize)> = Vec::new(); // (bin, score, count)
+    for (&bin, st) in scratch.stats.iter() {
+        if st.count < shared.min_matches {
+            continue;
+        }
+        if st.span() < fold.min_arm {
+            continue;
+        }
+        cands.push((bin, st.score_proxy(), st.count));
+    }
+
+    if cands.is_empty() {
+        return Vec::new();
+    }
+
+    cands.sort_by(|a, b| b.1.cmp(&a.1)); // score desc
+
+    // ---- collect hits for top bins ----
+    let mut out: Vec<FoldHit> = Vec::with_capacity(cands.len().min(k_hits));
+
+    // Optional: within-window dedup on split position (prevents “same locus” multiple bins)
+    let mut seen_split_bins: Vec<usize> = Vec::new();
+    let split_dedup_bp = (shared.fold_diag_tol.abs() as usize).max(1); // cheap heuristic
+
+    for (bin, _score, _count) in cands.into_iter().take(k_hits * 4) {
+        // collect pts for this bin
+        let mut pts: Vec<(i32, i32)> = Vec::new();
+        let mut matches: Vec<(usize, u64)> = Vec::new();
+
+        for (&prc, &vrc) in pos_rc.iter().zip(val_rc.iter()) {
+            if scratch.repetitive.contains_key(&vrc) {
+                continue;
+            }
+            let Some(p1s) = scratch.idx_f.get(&vrc) else {
+                continue;
+            };
+
+            let p2 = n - k_i32 - (prc as i32);
+
+            for &p1 in p1s {
+                let d = p1 + p2;
+                let b = div_floor(d, shared.fold_diag_tol.max(1));
+                if b == bin {
+                    pts.push((p1, p2));
+                    matches.push((p1 as usize, vrc));
+                }
+            }
+        }
+
+        if pts.len() < shared.min_matches {
+            continue;
+        }
+
+        // compute a FoldBreakpoint from pts (this also validates end_guard, etc.)
+        let Some(fb) = fold_breakpoint_from_pts(&mut pts, shared, fold, seq.len()) else {
+            continue;
+        };
+
+        // split-position dedup (fast)
+        let split_bin = (fb.split_pos / split_dedup_bp) * split_dedup_bp;
+        if seen_split_bins.iter().any(|&x| x == split_bin) {
+            continue;
+        }
+        seen_split_bins.push(split_bin);
+
+        out.push(FoldHit {
+            fb,
+            pts,
+            matches,
+            bin,
+        });
+
+        if out.len() >= k_hits {
+            break;
+        }
+    }
+
+    out
 }
 
 /// Convert a set of matched minimizer points into a coarse foldback breakpoint.

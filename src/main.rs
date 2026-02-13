@@ -1,23 +1,14 @@
-mod cfg;
-mod cli;
-mod fingerprint;
-mod foldback;
-mod io;
-mod minimizer;
-mod pipeline;
-mod scratch;
-mod utils;
-
 use anyhow::{Result, bail};
 use calm_io::stderrln;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::{
+use mdax::{
     cfg::{
         CallMode, FairnessParams, FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg,
         SharedCfg, SigCfg,
     },
+    cli, elog, pipeline,
     utils::{RefineMode, compact_histogram},
 };
 
