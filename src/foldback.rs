@@ -73,6 +73,7 @@ pub struct BinStat {
 
 impl BinStat {
     /// Create a new bin initialised with a single forward position.
+    #[inline]
     fn new(p1: i32) -> Self {
         Self {
             count: 1,
@@ -82,6 +83,7 @@ impl BinStat {
     }
 
     /// Update bin statistics with an additional forward position.
+    #[inline]
     fn update(&mut self, p1: i32) {
         self.count += 1;
         self.min_p1 = self.min_p1.min(p1);
@@ -91,6 +93,7 @@ impl BinStat {
     /// Span of forward positions in this bin.
     ///
     /// This approximates the arm length supporting the foldback.
+    #[inline]
     fn span(&self) -> usize {
         (self.max_p1 as i64 - self.min_p1 as i64).max(0) as usize
     }
@@ -99,8 +102,35 @@ impl BinStat {
     ///
     /// Combines spatial span and match count, strongly favouring bins
     /// with many supporting minimizers.
+    #[inline]
     fn score_proxy(&self) -> i64 {
         self.span() as i64 + (self.count as i64 * 10)
+    }
+    /// Rank bins primarily by count, then span, then proxy (tie-breaker).
+    ///
+    /// For your window sizes and `min_matches`, this is very safe from overflow:
+    /// - count up to ~1e6 => (count<<42) stays < 2^63
+    /// - span up to window len => (span<<16) is tiny by comparison
+    #[inline]
+    fn rank_key(&self) -> i64 {
+        let c = self.count as i64; // dominates
+        let s = self.span() as i64; // next
+        let p = self.score_proxy(); // tie-breaker only
+        (c << 42) + (s << 16) + (p & 0xFFFF)
+    }
+
+    // If you want these externally (optional):
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+    #[inline]
+    pub fn min_p1(&self) -> i32 {
+        self.min_p1
+    }
+    #[inline]
+    pub fn max_p1(&self) -> i32 {
+        self.max_p1
     }
 }
 
@@ -114,6 +144,10 @@ pub struct FoldHit {
     pub matches: Vec<(usize, u64)>,
     /// Anti-diagonal bin id (mostly for debugging).
     pub bin: i32,
+    // TODO: document these
+    pub bin_count: usize,
+    pub bin_span: usize,
+    pub bin_rank: i64,
 }
 
 /// Result of coarse foldback detection.
@@ -468,28 +502,24 @@ pub fn detect_foldbacks_topk(
     shared: &SharedCfg,
     fold: &FoldOnlyCfg,
     scratch: &mut FoldScratch,
-    k_hits: usize,
+    k: usize,
 ) -> Vec<FoldHit> {
-    let k = shared.minimizer.k;
-    let w = shared.minimizer.w;
+    let k = k.max(1);
 
-    if k_hits == 0 {
-        return Vec::new();
-    }
-    if seq.len() < k + w + 10 {
+    let mm_k = shared.minimizer.k;
+    let mm_w = shared.minimizer.w;
+    if seq.len() < mm_k + mm_w + 10 {
         return Vec::new();
     }
 
-    // forward minimizers
+    // ---- minimizers ----
     sampled_minimizers_into(
         seq,
         &shared.minimizer,
         &mut scratch.pos_f,
         &mut scratch.val_f,
     );
-
     revcomp_into(&mut scratch.rc, seq);
-
     sampled_minimizers_into(
         &scratch.rc,
         &shared.minimizer,
@@ -497,21 +527,16 @@ pub fn detect_foldbacks_topk(
         &mut scratch.val_rc,
     );
 
-    let pos_f = &scratch.pos_f;
-    let val_f = &scratch.val_f;
-    let pos_rc = &scratch.pos_rc;
-    let val_rc = &scratch.val_rc;
-
-    if pos_f.len() < shared.min_matches || pos_rc.len() < shared.min_matches {
+    if scratch.pos_f.len() < shared.min_matches || scratch.pos_rc.len() < shared.min_matches {
         return Vec::new();
     }
 
-    // ---- index forward minimizers ----
+    // ---- index forward minimizers by value (cap buckets) ----
     const MAX_BUCKET: usize = 64;
     scratch.idx_f.clear();
     scratch.repetitive.clear();
 
-    for (&p, &v) in pos_f.iter().zip(val_f.iter()) {
+    for (&p, &v) in scratch.pos_f.iter().zip(scratch.val_f.iter()) {
         if scratch.repetitive.contains_key(&v) {
             continue;
         }
@@ -524,21 +549,20 @@ pub fn detect_foldbacks_topk(
         }
     }
 
-    // ---- bin stats ----
+    // ---- per-bin stats ----
     let n = seq.len() as i32;
-    let k_i32 = k as i32;
+    let mm_k_i32 = mm_k as i32;
 
     scratch.stats.clear();
 
-    for (&prc, &vrc) in pos_rc.iter().zip(val_rc.iter()) {
+    for (&prc, &vrc) in scratch.pos_rc.iter().zip(scratch.val_rc.iter()) {
         if scratch.repetitive.contains_key(&vrc) {
             continue;
         }
         let Some(p1s) = scratch.idx_f.get(&vrc) else {
             continue;
         };
-
-        let p2 = n - k_i32 - (prc as i32);
+        let p2 = n - mm_k_i32 - (prc as i32);
 
         for &p1 in p1s {
             let d = p1 + p2;
@@ -551,85 +575,88 @@ pub fn detect_foldbacks_topk(
         }
     }
 
-    // ---- rank bins ----
-    let mut cands: Vec<(i32, i64, usize)> = Vec::new(); // (bin, score, count)
-    for (&bin, st) in scratch.stats.iter() {
-        if st.count < shared.min_matches {
-            continue;
-        }
-        if st.span() < fold.min_arm {
-            continue;
-        }
-        cands.push((bin, st.score_proxy(), st.count));
-    }
+    let mut bins: Vec<(i32, i64, usize, usize)> = scratch
+        .stats
+        .iter()
+        .filter_map(|(&bin, st)| {
+            let cnt = st.count();
+            let sp = st.span();
+            if cnt < shared.min_matches {
+                return None;
+            }
+            if sp < fold.min_arm {
+                return None;
+            }
+            Some((bin, st.rank_key(), cnt, sp))
+        })
+        .collect();
 
-    if cands.is_empty() {
+    bins.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    bins.truncate(k);
+
+    if bins.is_empty() {
         return Vec::new();
     }
 
-    cands.sort_by(|a, b| b.1.cmp(&a.1)); // score desc
+    // ---- collect points per selected bin in one pass ----
+    // We'll build per-bin vectors using a tiny map from bin->index in `bins`.
+    use gxhash::HashMap as GxMap;
 
-    // ---- collect hits for top bins ----
-    let mut out: Vec<FoldHit> = Vec::with_capacity(cands.len().min(k_hits));
+    let mut bin_to_idx: GxMap<i32, usize> = GxMap::default();
+    for (i, (bin, _rk, _cnt, _sp)) in bins.iter().enumerate() {
+        bin_to_idx.insert(*bin, i);
+    }
 
-    // Optional: within-window dedup on split position (prevents “same locus” multiple bins)
-    let mut seen_split_bins: Vec<usize> = Vec::new();
-    let split_dedup_bp = (shared.fold_diag_tol.abs() as usize).max(1); // cheap heuristic
+    let mut pts_per: Vec<Vec<(i32, i32)>> = (0..bins.len()).map(|_| Vec::new()).collect();
+    let mut matches_per: Vec<Vec<(usize, u64)>> = (0..bins.len()).map(|_| Vec::new()).collect();
 
-    for (bin, _score, _count) in cands.into_iter().take(k_hits * 4) {
-        // collect pts for this bin
-        let mut pts: Vec<(i32, i32)> = Vec::new();
-        let mut matches: Vec<(usize, u64)> = Vec::new();
+    for (&prc, &vrc) in scratch.pos_rc.iter().zip(scratch.val_rc.iter()) {
+        if scratch.repetitive.contains_key(&vrc) {
+            continue;
+        }
+        let Some(p1s) = scratch.idx_f.get(&vrc) else {
+            continue;
+        };
+        let p2 = n - mm_k_i32 - (prc as i32);
 
-        for (&prc, &vrc) in pos_rc.iter().zip(val_rc.iter()) {
-            if scratch.repetitive.contains_key(&vrc) {
-                continue;
-            }
-            let Some(p1s) = scratch.idx_f.get(&vrc) else {
-                continue;
-            };
-
-            let p2 = n - k_i32 - (prc as i32);
-
-            for &p1 in p1s {
-                let d = p1 + p2;
-                let b = div_floor(d, shared.fold_diag_tol.max(1));
-                if b == bin {
-                    pts.push((p1, p2));
-                    matches.push((p1 as usize, vrc));
-                }
+        for &p1 in p1s {
+            let d = p1 + p2;
+            let bin = div_floor(d, shared.fold_diag_tol.max(1));
+            if let Some(&ix) = bin_to_idx.get(&bin) {
+                pts_per[ix].push((p1, p2));
+                matches_per[ix].push((p1 as usize, vrc));
             }
         }
+    }
 
+    // ---- compute FoldBreakpoint per bin ----
+    let mut hits = Vec::with_capacity(bins.len());
+
+    for (i, (bin, rk, cnt, sp)) in bins.into_iter().enumerate() {
+        let mut pts = std::mem::take(&mut pts_per[i]);
         if pts.len() < shared.min_matches {
             continue;
         }
 
-        // compute a FoldBreakpoint from pts (this also validates end_guard, etc.)
         let Some(fb) = fold_breakpoint_from_pts(&mut pts, shared, fold, seq.len()) else {
             continue;
         };
 
-        // split-position dedup (fast)
-        let split_bin = (fb.split_pos / split_dedup_bp) * split_dedup_bp;
-        if seen_split_bins.iter().any(|&x| x == split_bin) {
-            continue;
-        }
-        seen_split_bins.push(split_bin);
+        let matches = std::mem::take(&mut matches_per[i]);
 
-        out.push(FoldHit {
+        hits.push(FoldHit {
             fb,
-            pts,
-            matches,
             bin,
+            pts, // already mutated/sorted; fine for bounds
+            matches,
+            bin_count: cnt,
+            bin_span: sp,
+            bin_rank: rk,
         });
-
-        if out.len() >= k_hits {
-            break;
-        }
     }
 
-    out
+    hits.sort_by(|a, b| b.bin_rank.cmp(&a.bin_rank).then_with(|| a.bin.cmp(&b.bin)));
+    hits
 }
 
 /// Convert a set of matched minimizer points into a coarse foldback breakpoint.

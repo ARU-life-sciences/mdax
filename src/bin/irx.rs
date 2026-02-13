@@ -299,6 +299,14 @@ fn main() -> Result<()> {
             }
 
             for hit in hits {
+                // optionally: skip low bin_count / low bin_span *before* refinement
+                if hit.bin_count < cfg.shared.min_matches {
+                    continue;
+                }
+                if hit.bin_span < cfg.fold.min_arm {
+                    continue;
+                }
+
                 let fb = hit.fb;
                 let bin = hit.bin;
 
