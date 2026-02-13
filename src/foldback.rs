@@ -489,6 +489,13 @@ pub fn detect_foldback(
     fold_breakpoint_from_pts(&mut scratch.best_pts, shared, fold, seq.len())
 }
 
+// swap out but keep capacity in scratch
+fn take_vec_preserve_capacity<T>(v: &mut Vec<T>) -> Vec<T> {
+    let mut out = Vec::with_capacity(v.capacity());
+    std::mem::swap(&mut out, v);
+    out
+}
+
 /// Detect up to `k_hits` foldback candidates in `seq`, ranked by proxy score.
 ///
 /// This does the same coarse minimizer geometry as `detect_foldback`, but
@@ -575,40 +582,53 @@ pub fn detect_foldbacks_topk(
         }
     }
 
-    let mut bins: Vec<(i32, i64, usize, usize)> = scratch
-        .stats
-        .iter()
-        .filter_map(|(&bin, st)| {
-            let cnt = st.count();
-            let sp = st.span();
-            if cnt < shared.min_matches {
-                return None;
-            }
-            if sp < fold.min_arm {
-                return None;
-            }
-            Some((bin, st.rank_key(), cnt, sp))
-        })
-        .collect();
+    scratch.top_bins.clear();
 
-    bins.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    bins.truncate(k);
+    for (&bin, st) in scratch.stats.iter() {
+        let cnt = st.count();
+        let sp = st.span();
+        if cnt < shared.min_matches {
+            continue;
+        }
+        if sp < fold.min_arm {
+            continue;
+        }
+        scratch.top_bins.push((bin, st.rank_key(), cnt, sp));
+    }
 
-    if bins.is_empty() {
+    scratch
+        .top_bins
+        .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scratch.top_bins.truncate(k);
+
+    if scratch.top_bins.is_empty() {
         return Vec::new();
     }
 
     // ---- collect points per selected bin in one pass ----
     // We'll build per-bin vectors using a tiny map from bin->index in `bins`.
-    use gxhash::HashMap as GxMap;
-
-    let mut bin_to_idx: GxMap<i32, usize> = GxMap::default();
-    for (i, (bin, _rk, _cnt, _sp)) in bins.iter().enumerate() {
-        bin_to_idx.insert(*bin, i);
+    scratch.bin_to_idx.clear();
+    for (i, (bin, _rk, _cnt, _sp)) in scratch.top_bins.iter().enumerate() {
+        scratch.bin_to_idx.insert(*bin, i);
     }
 
-    let mut pts_per: Vec<Vec<(i32, i32)>> = (0..bins.len()).map(|_| Vec::new()).collect();
-    let mut matches_per: Vec<Vec<(usize, u64)>> = (0..bins.len()).map(|_| Vec::new()).collect();
+    // Ensure per-bin buffers exist and are empty
+    let nb = scratch.top_bins.len();
+    if scratch.pts_per.len() < nb {
+        scratch.pts_per.resize_with(nb, Vec::new);
+    }
+    if scratch.matches_per.len() < nb {
+        scratch.matches_per.resize_with(nb, Vec::new);
+    }
+    for i in 0..nb {
+        scratch.pts_per[i].clear();
+        scratch.matches_per[i].clear();
+
+        // optional but helpful: reserve roughly to avoid growth
+        let (_bin, _rk, cnt, _sp) = scratch.top_bins[i];
+        scratch.pts_per[i].reserve(cnt);
+        scratch.matches_per[i].reserve(cnt);
+    }
 
     for (&prc, &vrc) in scratch.pos_rc.iter().zip(scratch.val_rc.iter()) {
         if scratch.repetitive.contains_key(&vrc) {
@@ -622,18 +642,18 @@ pub fn detect_foldbacks_topk(
         for &p1 in p1s {
             let d = p1 + p2;
             let bin = div_floor(d, shared.fold_diag_tol.max(1));
-            if let Some(&ix) = bin_to_idx.get(&bin) {
-                pts_per[ix].push((p1, p2));
-                matches_per[ix].push((p1 as usize, vrc));
+            if let Some(&ix) = scratch.bin_to_idx.get(&bin) {
+                scratch.pts_per[ix].push((p1, p2));
+                scratch.matches_per[ix].push((p1 as usize, vrc));
             }
         }
     }
 
     // ---- compute FoldBreakpoint per bin ----
-    let mut hits = Vec::with_capacity(bins.len());
+    let mut hits = Vec::with_capacity(scratch.top_bins.len());
 
-    for (i, (bin, rk, cnt, sp)) in bins.into_iter().enumerate() {
-        let mut pts = std::mem::take(&mut pts_per[i]);
+    for (i, (bin, rk, cnt, sp)) in scratch.top_bins.drain(..).enumerate() {
+        let mut pts = take_vec_preserve_capacity(&mut scratch.pts_per[i]);
         if pts.len() < shared.min_matches {
             continue;
         }
@@ -642,13 +662,13 @@ pub fn detect_foldbacks_topk(
             continue;
         };
 
-        let matches = std::mem::take(&mut matches_per[i]);
+        let matches = take_vec_preserve_capacity(&mut scratch.matches_per[i]);
 
         hits.push(FoldHit {
             fb,
             bin,
-            pts, // already mutated/sorted; fine for bounds
-            matches,
+            pts,     // already sorted/mutated; OK
+            matches, // TODO: keep if we want?
             bin_count: cnt,
             bin_span: sp,
             bin_rank: rk,

@@ -74,6 +74,19 @@ pub struct FoldScratch {
 
     /// Scratch for refinement stage.
     pub refine: RefineScratch,
+
+    // --- Multi-hit (top-k) scratch ---
+    /// Candidate bins for top-k selection: (bin, rank_key, count, span)
+    pub top_bins: Vec<(i32, i64, usize, usize)>,
+
+    /// Map bin -> index in `top_bins` (for point collection).
+    pub bin_to_idx: gxhash::HashMap<i32, usize>,
+
+    /// Per-selected-bin matchpoints.
+    pub pts_per: Vec<Vec<(i32, i32)>>,
+
+    /// Per-selected-bin local matches (pos,value).
+    pub matches_per: Vec<Vec<(usize, u64)>>,
 }
 
 impl FoldScratch {
@@ -94,6 +107,10 @@ impl FoldScratch {
             best_pts: Vec::new(),
             best_matches: Vec::new(),
             refine: RefineScratch::default(),
+            top_bins: Vec::new(),
+            bin_to_idx: gxhash::HashMap::new(),
+            pts_per: Vec::new(),
+            matches_per: Vec::new(),
         }
     }
 }

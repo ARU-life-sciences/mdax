@@ -18,7 +18,9 @@ flate2 = "1.1.8"
 gxhash = "3.5.0"
 needletail = "0.6.3"
 packed-seq = "4.4.1"
+rayon = "1.11.0"
 simd-minimizers = "2.2.0"
+thread_local = "1.1.9"
 
 [[bin]]
 name = "mdax"
