@@ -346,8 +346,34 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
 ) -> Result<(u64, u64, u64)> {
     let (tx, rx) = chan::bounded::<BatchJob>(chan_cap);
     const BATCH_SIZE: usize = 256;
-
     let (out_tx, out_rx) = chan::bounded::<OutRec>(chan_cap * 8);
+
+    // Precompute support_rank_frac for every signature (once)
+    // rank_frac: 1.0 = top-ranked (largest n), 0.0 = bottom-ranked.
+    let rank_map: std::collections::HashMap<u64, f32> = {
+        let mut v: Vec<(u64, usize)> = support.iter().map(|(sig, st)| (*sig, st.n)).collect();
+
+        // Sort by descending n, then ascending sig for deterministic tie-break.
+        v.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let m = v.len();
+        let mut rm = std::collections::HashMap::with_capacity(m);
+
+        if m <= 1 {
+            // If 0 or 1 signatures, everything is trivially "top".
+            for (sig, _) in v {
+                rm.insert(sig, 1.0);
+            }
+        } else {
+            for (i, (sig, _n)) in v.into_iter().enumerate() {
+                let rank = i + 1; // 1..=m
+                let frac = 1.0 - ((rank - 1) as f32 / (m - 1) as f32);
+                rm.insert(sig, frac);
+            }
+        }
+        rm
+    };
+    let rank_map = std::sync::Arc::new(rank_map);
 
     // Reader thread
     let input_path = input.as_ref().to_owned();
@@ -403,7 +429,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
 
         // Write TSV header once (via bytes, no formatting)
         tsv_out.write_all(
-        b"read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tsupport_n\tsupport_span\tdecision\n"
+        b"read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tsupport_n\tsupport_rank_frac\tsupport_span\tdecision\n"
     )?;
 
         // User-space batching buffers
@@ -459,6 +485,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
         let support = support.clone();
         let rx = rx.clone();
         let out_tx = out_tx.clone();
+        let rank_map = rank_map.clone();
 
         worker_handles.push(thread::spawn(move || -> Result<(u64, u64, u64)> {
             let mut num_foldbacks: u64 = 0;
@@ -547,7 +574,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                 (rf_call.split_pos, rf_call.identity_est)
                             };
 
-                            let (decision, support_n, support_span) =
+                            let (decision, support_n, support_rank_frac, support_span) = 
                                 if sig_ident >= cfg.fold2.min_identity {
                                     dbg.bump("ident_ok");
 
@@ -568,20 +595,26 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                     if let Some(sig) = sig {
                                         dbg.bump("sig_ok");
 
-                                        let (real, n, span) = if let Some(st) = support.get(&sig)
-                                        {
+                                        let (real, n, rank_frac, span) = if let Some(st) = support.get(&sig) {
                                             dbg.bump("sig_in_support");
                                             if hit_sig_sample.len() < 5 {
                                                 hit_sig_sample.push((sig, st.n));
                                             }
-                                            (is_real_foldback(sig, &support, &cfg), st.n, st.split_span())
+                                            let rf = *rank_map.get(&sig).unwrap_or(&0.0);
+                                            (
+                                                is_real_foldback(sig, &support, &cfg),
+                                                st.n,
+                                                rf,
+                                                st.split_span(),
+                                            )
                                         } else {
                                             dbg.bump("sig_not_in_support");
                                             if miss_sig_sample.len() < 5 {
                                                 miss_sig_sample.push(sig);
                                             }
-                                            (false, 0, 0)
+                                            (false, 0, 0.0, 0)
                                         };
+
 
                                         if !real {
                                             annot = Some(
@@ -611,19 +644,19 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                             num_real += 1;
                                         }
 
-                                        (if real { "real" } else { "artefact" }, n, span)
+                                        (if real { "real" } else { "artefact" }, n, rank_frac, span)
                                     } else {
-                                        ("unknown", 0, 0)
+                                        ("unknown", 0, 0.0, 0)
                                     }
                                 } else {
-                                    ("low_ident", 0, 0)
+                                    ("low_ident", 0, 0.0, 0)
                                 };
 
                             // TSV row: only now do we build id_str
                             let id_str =
                                 std::str::from_utf8(&job.id).unwrap_or("<nonutf8_id>");
                             tsv_row = Some(format!(
-                                "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}\t{}\t{}\t{}",
+                                "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}\t{}\t{:.6}\t{}\t{}",
                                 fb.split_pos,
                                 rf_call.split_pos,
                                 fb.matches,
@@ -632,11 +665,13 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                 rf_call.score,
                                 rf_call.identity_est,
                                 support_n,
+                                support_rank_frac,
                                 support_span,
                                 decision,
                                 id = id_str,
                                 len = len
                             ));
+
                         }
                     }
 
