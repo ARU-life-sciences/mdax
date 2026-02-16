@@ -1,6 +1,6 @@
 # `mdax`
 
-Read in HiFi or ONT raw data generated from Multiple Displacement Amplification methods, and correct reads. This tool currently only corrects 'foldback' or 'invert' chimeras.
+Read in HiFi or ONT raw data generated from Multiple Displacement Amplification methods, and correct reads. This tool currently only corrects 'foldback' or 'invert' chimeras (`mdax`). We also provide a binary to search for long Inverted Repeats (IR's) in assemblies (`irx`).
 
 ## Install
 
@@ -402,3 +402,85 @@ It's a two step pipeline:
 - Pass 2: Correct Reads
     - Reads are reprocessed, and each foldback event is classified as a genomic event (real) or an artefact based on the support map.
     - Artefacts are recursively trimmed or corrected, ensuring high specificity against real, genome-templated events.
+
+## `irx`: detecting 'natural' IR's from assemblies
+
+We provide the program `irx` which uses the core underlying logic from `mdax` to identify IR's from assembly data. It's very fast and parallelises over windows. I'll expand on this but for now...
+
+### Usage
+
+This outputs a table of putative IR's, and extracts with `-f` the repeats into a fasta file.
+
+```bash
+irx -b ir_repeats.tsv -f ir_repeats.fa assembly.fasta.gz
+```
+
+#### TSV output
+
+Core bits:
+
+- contig: Contig / chromosome name (first FASTA header token)
+- start: IR interval start (0-based, inclusive)
+- end: IR interval end (0-based, exclusive)
+- name: Always IR
+- score: Identity estimate ×1000 (rounded; 0–1000 scale)
+- strand: Always . (IR is strand-symmetric)
+
+Breakpoints & similarity:
+
+- break_pos: Refined split position (putative IR center)
+- identity_est: Estimated arm identity (0–1 float)
+- matches: Number of supporting minimizer matches
+- span: Coarse arm span estimate from foldback geometry
+
+Arm coordinates:
+
+- la0, la1: Left arm start/end
+- ra0, ra1: Right arm start/end
+
+Windows:
+
+- win_start, win_end: Sliding window that produced this hit
+- kept_pts: Number of diagonal-consistent matchpoints used for arm bounds
+- bin: Anti-diagonal bin ID (used internally for ranking & dedup)
+
+Annotation:
+
+- arm_len: Length of the shorter arm (bp)
+- spacer: Distance between arms (ra0 - la1)
+- ir_class: Structure class of IR (immediate, spaced, or wide). Configurable in CLI.
+
+#### Fasta header format
+
+```txt
+>contig:start-end|break=BREAK|ident=I|matches=M|span=S|bin=B|class=C|spacer=SP
+```
+
+- contig:start-end — contig name (first FASTA token) and emitted interval in contig coordinates, 0-based half-open.
+- break=BREAK — refined breakpoint (foldback split) position on the contig, in bp.
+- ident=I — refinement identity estimate between the two arms near the breakpoint (approximate; not a full-length alignment), formatted as 0.XXX.
+- matches=M — number of supporting minimizer matchpoints in the coarse detector.
+- span=S — coarse span estimate between arms from the detector (bp).
+- bin=B — anti-diagonal bin id used internally for candidate discovery/dedup.
+- class=C — IR class inferred from arm spacing: immediate, spaced, wide, or unknown (if arm bounds unavailable).
+- spacer=SP — estimated spacer length between arms (ra0 - la1 after arm normalisation); can be <=0 if arms abut/overlap.
+
+#### The stderr output
+
+For example:
+
+```console 
+[irx] OW119596.1: wins=662 cands=634 emitted=92 clamped=0 (0.0%) near_cap=0 (0.0%) arm_missing=0 precap_too_big=0 stageA_dups=0 stageB_dups=542
+```
+
+- Record name of the fasta
+- wins: Number of sliding windows scanned on the contig
+- cands: Total candidates produced by the window scanning after coarse and refine filters, before per contig de-dup
+- emitted: Number of candidates emitted to TSV/FASTA after de-dup
+- clamped (X%): Amongst emitted candidates, how many were clamped due to `--max-interval-bp`. This is policy dependent. % (clamped / emitted)
+- near_cap: Number of emitted IR intervals whose final length is ≥ 95% of `--max-interval-bp`.
+- arm_missing: Number of emitted IRs where no reliable arm bounds were derived from minimizer matchpoints.
+- precap_too_big: Number of emitted IRs whose raw inferred interval exceeded --max-interval-bp before any clamping/drop/penalization.
+- stageA_dups: duplicates removed by Stage A dedup (breakpoint/bin key).
+- stageB_dups: duplicates removed by Stage B dedup (interval overlap on quantized coordinates).
+
