@@ -337,7 +337,7 @@ fn ir_class_from_arms(
         return None;
     }
     // ensure left is left
-    let (la0, la1, ra0, ra1) = normalize_arms(la0, la1, ra0, ra1);
+    let (_la0, la1, ra0, _ra1) = normalize_arms(la0, la1, ra0, ra1);
 
     // spacer between arms (can be negative if overlapping)
     let spacer = ra0 as isize - la1 as isize;
@@ -553,69 +553,6 @@ fn arm_bounds_from_best_pts(
     }
 }
 
-/// Derive arm bounds but keep only points consistent with the refined split.
-///
-/// Key idea:
-/// For a foldback, matchpoints satisfy roughly:
-///     p1 + p2 ~= 2 * split
-///
-/// We keep points where `| (p1+p2) - 2*split | <= tol`,
-/// where `tol = fold_diag_tol * widen`.
-///
-/// Returns (la0, la1, ra0, ra1, kept_pts) in *window-local* coords.
-fn arm_bounds_near_split_diag(
-    best_pts: &[(i32, i32)],
-    split: usize,
-    k: usize,
-    win_len: usize,
-    fold_diag_tol: i32,
-    widen: i32,
-) -> Option<(usize, usize, usize, usize, usize)> {
-    if best_pts.is_empty() {
-        return None;
-    }
-
-    let split2 = 2 * (split as i32);
-    let tol = fold_diag_tol.max(1) * widen.max(1);
-
-    let mut lmin = i32::MAX;
-    let mut lmax = i32::MIN;
-    let mut rmin = i32::MAX;
-    let mut rmax = i32::MIN;
-    let mut kept = 0usize;
-
-    for &(p1, p2) in best_pts {
-        let d = p1 + p2;
-        if (d - split2).abs() > tol {
-            continue;
-        }
-
-        kept += 1;
-        let left = p1.min(p2);
-        let right = p1.max(p2);
-
-        lmin = lmin.min(left);
-        lmax = lmax.max(left);
-        rmin = rmin.min(right);
-        rmax = rmax.max(right);
-    }
-
-    if kept == 0 {
-        return None;
-    }
-
-    let la0 = lmin.max(0) as usize;
-    let la1 = (lmax.max(0) as usize).saturating_add(k).min(win_len);
-    let ra0 = rmin.max(0) as usize;
-    let ra1 = (rmax.max(0) as usize).saturating_add(k).min(win_len);
-
-    if la0 < la1 && ra0 < ra1 {
-        Some((la0, la1, ra0, ra1, kept))
-    } else {
-        None
-    }
-}
-
 /// Pack two u32 values into a u64 (cheap HashSet key).
 ///
 /// Used for Stage-A dedup keys: `(break_bin, diag_bin)`.
@@ -752,9 +689,10 @@ impl CapPolicy {
 struct Stats {
     // pipeline volumes
     windows: u64,
-    hits: u64,
-    refined_ok: u64,
-    ident_ok: u64,
+    // FIXME: not currently used, are these useful?
+    // hits: u64,
+    // refined_ok: u64,
+    // ident_ok: u64,
 
     // after collecting + sorting
     cands_total: u64,
