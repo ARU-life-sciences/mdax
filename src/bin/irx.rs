@@ -48,8 +48,12 @@
 //!   computationally expensive.
 
 use anyhow::Result;
+use block_aligner::cigar::*;
+use block_aligner::scan_block::*;
+use block_aligner::scores::*;
 use clap::{Arg, Command, value_parser};
 use mdax::elog;
+use mdax::utils::revcomp_into;
 use rayon::ThreadPoolBuilder;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -98,7 +102,8 @@ Column meanings:\n\
   score          identity_est scaled to 0..1000 (rounded)\n\
   strand         '.' (IR is not strand-specific here)\n\
   break_pos      Refined split position in contig coords\n\
-  identity_est   Refinement identity estimate (0..1)\n\
+  identity_est   Refinement identity estimate (0..1). Computed locally around breakpoint during refinement.\n\
+  tir_ident      Estimated sequence identity of the IR arms (la0..la1 vs revcomp(ra0..ra1))\n\
   matches        Coarse supporting minimizer matches (fb.matches)\n\
   span           Coarse span between arms (fb.span, bp)\n\
   la0,la1        Left arm bounds (contig coords)\n\
@@ -201,6 +206,7 @@ Higher values may find multiple IRs within the same window, at increased cost.",
                     "Minimum identity estimate (0..1) from the refinement step.\n\n\
 This is a quick, approximate similarity measure between the two arms near the \
 refined split. It is *not* a full alignment of the entire arm intervals.\n\n\
+If you want the full alignment, this is reported in the TSV output `tir_ident`.\n\n
 Typical values:\n\
   - 0.00: allow everything, but possibly quite a few bad IR's\n\
   - 0.20: permissive, good for candidate discovery\n\
@@ -667,6 +673,107 @@ fn write_fasta_record_bytes<W: Write>(
     Ok(())
 }
 
+/// Very fast proxy: block-aligner global score -> identity-like quantity.
+/// Good for filtering/ranking; not exact.
+///
+/// `right_rc` must already be reverse-complemented.
+fn arm_identity_proxy_blockalign(left: &[u8], right_rc: &[u8]) -> Option<f32> {
+    if left.is_empty() || right_rc.is_empty() {
+        return None;
+    }
+
+    // choose query/ref
+    let (q_bytes, r_bytes) = if left.len() <= right_rc.len() {
+        (left, right_rc)
+    } else {
+        (right_rc, left)
+    };
+
+    // block sizes: powers of two; start small, allow growth
+    let min_block = 64usize;
+    let max_len = q_bytes.len().max(r_bytes.len()).max(64);
+    let max_block = 1024usize.min(max_len.next_power_of_two()).max(min_block);
+
+    let gaps = Gaps {
+        open: -5,
+        extend: -1,
+    };
+
+    let q = PaddedBytes::from_bytes::<NucMatrix>(q_bytes, max_block);
+    let r = PaddedBytes::from_bytes::<NucMatrix>(r_bytes, max_block);
+
+    // No TRACE, no X-drop
+    let mut a = Block::<false, false>::new(q.len(), r.len(), max_block);
+    a.align(&q, &r, &NW1, gaps, min_block..=max_block, 0);
+    let res = a.res();
+
+    // crude normalisation: score per aligned base mapped to [0,1]
+    let aln_len = (q.len().min(r.len()).max(1)) as f32;
+    let s = (res.score as f32) / aln_len;
+
+    let proxy = ((s + 1.0) * 0.5).clamp(0.0, 1.0);
+    Some(proxy)
+}
+
+/// Slower, but more accurate than `arm_identity_proxy_blockalign` because it
+/// uses the traceback CIGAR to count matches/mismatches/indels.
+///
+/// `right_rc` must already be reverse-complemented.
+fn arm_identity_trace_blockalign(left: &[u8], right_rc: &[u8]) -> Option<f32> {
+    if left.is_empty() || right_rc.is_empty() {
+        return None;
+    }
+
+    let (q_bytes, r_bytes) = if left.len() <= right_rc.len() {
+        (left, right_rc)
+    } else {
+        (right_rc, left)
+    };
+
+    let min_block = 64usize;
+    let max_len = q_bytes.len().max(r_bytes.len()).max(64);
+    let max_block = 1024usize.min(max_len.next_power_of_two()).max(min_block);
+
+    let gaps = Gaps {
+        open: -5,
+        extend: -1,
+    };
+
+    let q = PaddedBytes::from_bytes::<NucMatrix>(q_bytes, max_block);
+    let r = PaddedBytes::from_bytes::<NucMatrix>(r_bytes, max_block);
+
+    // TRACE=true, X_DROP=false
+    let mut a = Block::<true, false>::new(q.len(), r.len(), max_block);
+    a.align(&q, &r, &NW1, gaps, min_block..=max_block, 0);
+    let res = a.res();
+
+    let mut cigar = Cigar::new(res.query_idx, res.reference_idx);
+    a.trace()
+        .cigar_eq(&q, &r, res.query_idx, res.reference_idx, &mut cigar);
+
+    let mut m: u64 = 0;
+    let mut x: u64 = 0;
+    let mut ins: u64 = 0;
+    let mut del: u64 = 0;
+
+    for op in cigar.to_vec().iter() {
+        match op.op {
+            Operation::Eq => m += op.len as u64,
+            Operation::X => x += op.len as u64,
+            Operation::I => ins += op.len as u64,
+            Operation::D => del += op.len as u64,
+            _ => {}
+        }
+    }
+
+    let denom = m + x + ins + del;
+    if denom == 0 {
+        None
+    } else {
+        Some(m as f32 / denom as f32)
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 enum CapPolicy {
     Clamp,
@@ -861,12 +968,12 @@ fn main() -> Result<()> {
         let header = if classify_ir {
             writeln!(
                 out,
-                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\tmatches\tspan\tla0\tla1\tra0\tra1\twin_start\twin_end\tkept_pts\tbin\tarm_len\tspacer\tir_class"
+                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\twin_start\twin_end\tkept_pts\tbin\tarm_len\tspacer\tir_class"
             )
         } else {
             writeln!(
                 out,
-                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\tmatches\tspan\tla0\tla1\tra0\tra1\twin_start\twin_end\tkept_pts\tbin"
+                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\twin_start\twin_end\tkept_pts\tbin"
             )
         };
         match header {
@@ -1155,6 +1262,8 @@ fn main() -> Result<()> {
 
             let cap_thresh = (max_interval_bp as f64 * 0.95).round() as usize; // “near cap” threshold
 
+            let mut rc_buf: Vec<u8> = Vec::new();
+
             for c in cands {
                 // A: check for duplicate break/bin key. This is very fast and removes exact duplicates and many near-duplicates.
                 if !seen_break_bins.insert(c.key_a) {
@@ -1205,16 +1314,38 @@ fn main() -> Result<()> {
                 let arm_len = (la1n.saturating_sub(la0n)).min(ra1n.saturating_sub(ra0n));
                 let spacer: isize = (ra0n as isize) - (la1n as isize);
                 let ir_class = classify_ir_str(spacer, immediate_bp, wide_bp);
+                let tir_ident =
+                    if la1n > la0n && ra1n > ra0n && la1n <= seq.len() && ra1n <= seq.len() {
+                        let left = &seq[la0n..la1n];
+                        let right = &seq[ra0n..ra1n];
+
+                        // Reuse a preallocated reverse-complement buffer.
+                        revcomp_into(&mut rc_buf, right);
+
+                        // Fast path
+                        let proxy =
+                            arm_identity_proxy_blockalign(left, &rc_buf).unwrap_or(f32::NAN);
+
+                        // Only do expensive traceback for promising candidates
+                        if proxy.is_finite() && proxy >= 0.65 {
+                            arm_identity_trace_blockalign(left, &rc_buf).unwrap_or(proxy)
+                        } else {
+                            proxy
+                        }
+                    } else {
+                        f32::NAN
+                    };
 
                 let row = if classify_ir {
                     writeln!(
                         out,
-                        "{id}\t{}\t{}\tIR\t{}\t.\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{id}\t{}\t{}\tIR\t{}\t.\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         c.start,
                         c.end,
                         c.score,
                         c.break_pos,
                         c.ident,
+                        tir_ident,
                         c.matches,
                         c.span,
                         c.la0,
@@ -1232,12 +1363,13 @@ fn main() -> Result<()> {
                 } else {
                     writeln!(
                         out,
-                        "{id}\t{}\t{}\tIR\t{}\t.\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{id}\t{}\t{}\tIR\t{}\t.\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         c.start,
                         c.end,
                         c.score,
                         c.break_pos,
                         c.ident,
+                        tir_ident,
                         c.matches,
                         c.span,
                         c.la0,

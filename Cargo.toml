@@ -1,6 +1,6 @@
 [package]
 name = "mdax"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 repository = "https://github.com/ARU-life-sciences/mdax"
 homepage = "https://github.com/ARU-life-sciences/mdax"
@@ -11,6 +11,7 @@ categories = ["science", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.100"
+block-aligner = { version = "0.5.1", features = ["simd_avx2"] }
 calm_io = "0.1.1"
 clap = { version = "4.5.54", features = ["cargo"] }
 crossbeam-channel = "0.5.15"

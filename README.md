@@ -430,6 +430,7 @@ Breakpoints & similarity:
 
 - break_pos: Refined split position (putative IR center)
 - identity_est: Estimated arm identity (0–1 float)
+- tir_ident: sequence identity between the inferred inverted-repeat arms (la0..la1 vs revcomp(ra0..ra1)), estimated using SIMD-accelerated alignment.
 - matches: Number of supporting minimizer matches
 - span: Coarse arm span estimate from foldback geometry
 
