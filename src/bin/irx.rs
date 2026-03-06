@@ -596,6 +596,7 @@ fn write_fasta_record_bytes<W: Write>(
     end: usize,
     break_pos: usize,
     ident_milli: u16, // identity*1000 (rounded)
+    tir_ident: f32,
     matches: usize,
     span: usize,
     bin: i32,
@@ -626,6 +627,22 @@ fn write_fasta_record_bytes<W: Write>(
         b'0' + ((frac / 10) % 10) as u8,
         b'0' + (frac % 10) as u8,
     ])?;
+
+    w.write_all(b"|tir_ident=")?;
+    // tir_ident as X.XXX without float formatting
+    if tir_ident.is_finite() && tir_ident >= 0.0 {
+        let tir_milli = (tir_ident.clamp(0.0, 1.0) * 1000.0).round() as u16;
+        write_usize(w, (tir_milli / 1000) as usize)?;
+        w.write_all(b".")?;
+        let frac = tir_milli % 1000;
+        w.write_all(&[
+            b'0' + (frac / 100) as u8,
+            b'0' + ((frac / 10) % 10) as u8,
+            b'0' + (frac % 10) as u8,
+        ])?;
+    } else {
+        w.write_all(b"NaN")?;
+    }
 
     w.write_all(b"|matches=")?;
     write_usize(w, matches)?;
@@ -1401,6 +1418,7 @@ fn main() -> Result<()> {
                             c.end,
                             c.break_pos,
                             ident_milli,
+                            tir_ident,
                             c.matches,
                             c.span,
                             c.bin,
