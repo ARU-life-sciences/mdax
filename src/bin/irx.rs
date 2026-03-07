@@ -73,7 +73,6 @@ use mdax::{
 /// We keep knobs intentionally minimal:
 /// - window geometry (`--window-len`, `--step`)
 /// - number of candidates per window (`--hits-per-window`)
-/// - a simple identity filter (`--min-ident`)
 /// - dedup quantisation (`--dedup-bp`)
 /// - thread count (`--threads`)
 ///
@@ -200,23 +199,6 @@ Higher values may find multiple IRs within the same window, at increased cost.",
                 .long("hits-per-window")
                 .default_value("4")
                 .value_parser(value_parser!(usize)),
-        )
-        .arg(
-            Arg::new("min_ident")
-                .help("Minimum identity of the left/right arms of the putative inverted repeat.")
-                .long_help(
-                    "Minimum identity estimate (0..1) from the refinement step.\n\n\
-This is a quick, approximate similarity measure between the two arms near the \
-refined split. It is *not* a full alignment of the entire arm intervals.\n\n\
-If you want the full alignment, this is reported in the TSV output `tir_ident`.\n\n
-Typical values:\n\
-  - 0.00: allow everything, but possibly quite a few bad IR's\n\
-  - 0.20: permissive, good for candidate discovery\n\
-  - 0.50+: stricter, fewer false positives but may miss diverged IRs",
-                )
-                .long("min-ident")
-                .default_value("0.2")
-                .value_parser(value_parser!(f32)),
         )
         .arg(
             Arg::new("dedup_bp")
@@ -957,7 +939,6 @@ fn main() -> Result<()> {
     let step = *args.get_one::<usize>("step").unwrap();
     let hits_per_window = *args.get_one::<usize>("hits_per_window").unwrap();
     let dedup_bp = *args.get_one::<usize>("dedup_bp").unwrap();
-    let min_ident = *args.get_one::<f32>("min_ident").unwrap();
     let threads = *args.get_one::<usize>("threads").unwrap();
     let max_interval_bp = *args.get_one::<usize>("max_interval_bp").unwrap();
     let diag_widen = *args.get_one::<i32>("diag_widen").unwrap();
@@ -997,8 +978,8 @@ fn main() -> Result<()> {
             min_matches: 20,
             end_guard: 0,
             refine: RefineCfg {
-                window: 200,
-                arm: 500,
+                window: 500,
+                arm: 1000,
                 mode: RefineMode::HiFi,
                 max_ed_rate: 0.25,
             },
@@ -1154,11 +1135,6 @@ fn main() -> Result<()> {
                         .flatten() else {
                             continue;
                         };
-
-                        // Filter by identity estimate.
-                        if rf.identity_est < min_ident {
-                            continue;
-                        }
 
                         // Global break position (contig coords).
                         let break_pos = wstart + rf.split_pos;

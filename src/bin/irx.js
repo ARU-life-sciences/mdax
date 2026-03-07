@@ -6,10 +6,11 @@ const data = IRX_DATA.map((d) => ({
 function formatBp(x) {
   if (x == null || !isFinite(x)) return "";
   const ax = Math.abs(x);
-  if (ax >= 1e9) return `${d3.format(".2f")(x / 1e9)}Gb`;
-  if (ax >= 1e6) return `${d3.format(".2f")(x / 1e6)}Mb`;
-  if (ax >= 1e3) return `${d3.format(".1f")(x / 1e3)}Kb`;
-  return `${x} bp`;
+
+  if (ax >= 1e9) return `${Math.round(x / 1e9)}Gb`;
+  if (ax >= 1e6) return `${Math.round(x / 1e6)}Mb`;
+  if (ax >= 1e3) return `${Math.round(x / 1e3)}Kb`;
+  return `${Math.round(x)} bp`;
 }
 
 function containerWidth(id) {
