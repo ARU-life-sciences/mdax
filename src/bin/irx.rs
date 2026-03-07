@@ -55,6 +55,7 @@ use clap::{Arg, Command, value_parser};
 use mdax::elog;
 use mdax::utils::revcomp_into;
 use rayon::ThreadPoolBuilder;
+use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::{io::Write, path::PathBuf};
@@ -108,6 +109,7 @@ Column meanings:\n\
   span           Coarse span between arms (fb.span, bp)\n\
   la0,la1        Left arm bounds (contig coords)\n\
   ra0,ra1        Right arm bounds (contig coords)\n\
+  contig_len     Length of the contig/chromosome (bp)\n\
   win_start,end  Window bounds that produced this hit (contig coords)\n\
   kept_pts       Number of matchpoints retained near refined anti-diagonal (0 if unfiltered fallback)\n\
   bin            Anti-diagonal bin id (debug / dedup key component)\n\n\
@@ -314,6 +316,18 @@ Recommended: penalize (prevents huge piles of exactly-cap intervals).",
         .long("cap-policy")
         .default_value("penalize")
         .value_parser(["clamp", "drop", "penalize"]),
+    )
+    .arg(
+    Arg::new("html")
+        .help("Optional self-contained HTML dashboard report.")
+        .long_help(
+            "Write an interactive HTML dashboard containing embedded IR data \
+and diagnostic plots.\n\n\
+The report is self-contained except for any external JS libraries referenced \
+by the template.",
+        )
+        .long("html")
+        .value_parser(value_parser!(PathBuf)),
     )
     .get_matches()
 }
@@ -837,6 +851,34 @@ struct Stats {
     precap_too_big: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReportRow {
+    contig: String,
+    start: usize,
+    end: usize,
+    break_pos: usize,
+    identity_est: f32,
+    tir_ident: Option<f32>,
+    matches: usize,
+    span: usize,
+    la0: usize,
+    la1: usize,
+    ra0: usize,
+    ra1: usize,
+    contig_len: usize,
+    win_start: usize,
+    win_end: usize,
+    kept_pts: usize,
+    bin: i32,
+    arm_len: usize,
+    spacer: isize,
+    ir_class: String,
+    interval_len: usize,
+    left_arm_len: usize,
+    right_arm_len: usize,
+    arm_ratio: f32,
+}
+
 /// One candidate IR call, computed in parallel per window and then deduplicated
 /// serially per contig.
 ///
@@ -880,6 +922,29 @@ struct Cand {
     spacer_bp: i32, // or isize/i64
 }
 
+fn write_html_report(
+    out_path: &std::path::Path,
+    input: &std::path::Path,
+    rows: &[ReportRow],
+) -> Result<()> {
+    const IRX_HTML_TEMPLATE: &str = include_str!("irx.html");
+    const IRX_DASHBOARD_JS: &str = include_str!("irx.js");
+
+    let data_json = serde_json::to_string(rows)?;
+    let species_name = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("irx report");
+
+    let html = IRX_HTML_TEMPLATE
+        .replace("__TITLE__", species_name)
+        .replace("__DATA_JSON__", &data_json)
+        .replace("__DASHBOARD_JS__", IRX_DASHBOARD_JS);
+
+    std::fs::write(out_path, html)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = build_cli();
 
@@ -904,6 +969,9 @@ fn main() -> Result<()> {
     let classify_ir = args.get_flag("classify_ir");
     let immediate_bp = *args.get_one::<usize>("immediate_bp").unwrap();
     let wide_bp = *args.get_one::<usize>("wide_bp").unwrap();
+
+    // HTML output
+    let html = args.get_one::<PathBuf>("html").cloned();
 
     // Build a *local* Rayon pool if requested; otherwise, use the global/default.
     // This makes `--threads N` deterministic and avoids global-pool initialisation issues.
@@ -985,19 +1053,22 @@ fn main() -> Result<()> {
         let header = if classify_ir {
             writeln!(
                 out,
-                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\twin_start\twin_end\tkept_pts\tbin\tarm_len\tspacer\tir_class"
+                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\tcontig_len\twin_start\twin_end\tkept_pts\tbin\tarm_len\tspacer\tir_class"
             )
         } else {
             writeln!(
                 out,
-                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\twin_start\twin_end\tkept_pts\tbin"
+                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\tcontig_len\twin_start\twin_end\tkept_pts\tbin"
             )
         };
+
         match header {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
             Err(e) => return Err(e.into()),
         }
+
+        let mut report_rows: Vec<ReportRow> = Vec::new();
 
         let mut r = io::open_fasta_reader(input)?;
 
@@ -1353,10 +1424,51 @@ fn main() -> Result<()> {
                         f32::NAN
                     };
 
+                let left_arm_len = la1n.saturating_sub(la0n);
+                let right_arm_len = ra1n.saturating_sub(ra0n);
+                let arm_ratio = if left_arm_len > 0 && right_arm_len > 0 {
+                    let a = left_arm_len.max(right_arm_len) as f32;
+                    let b = left_arm_len.min(right_arm_len) as f32;
+                    a / b
+                } else {
+                    f32::NAN
+                };
+
+                report_rows.push(ReportRow {
+                    contig: id.to_string(),
+                    start: c.start,
+                    end: c.end,
+                    break_pos: c.break_pos,
+                    identity_est: c.ident,
+                    tir_ident: if tir_ident.is_finite() {
+                        Some(tir_ident)
+                    } else {
+                        None
+                    },
+                    matches: c.matches,
+                    span: c.span,
+                    la0: c.la0,
+                    la1: c.la1,
+                    ra0: c.ra0,
+                    ra1: c.ra1,
+                    contig_len: len,
+                    win_start: c.win_start,
+                    win_end: c.win_end,
+                    kept_pts: c.kept_pts,
+                    bin: c.bin,
+                    arm_len,
+                    spacer,
+                    ir_class: ir_class.to_string(),
+                    interval_len: c.end.saturating_sub(c.start),
+                    left_arm_len,
+                    right_arm_len,
+                    arm_ratio,
+                });
+
                 let row = if classify_ir {
                     writeln!(
                         out,
-                        "{id}\t{}\t{}\tIR\t{}\t.\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{id}\t{}\t{}\tIR\t{}\t.\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         c.start,
                         c.end,
                         c.score,
@@ -1369,6 +1481,7 @@ fn main() -> Result<()> {
                         c.la1,
                         c.ra0,
                         c.ra1,
+                        len,
                         c.win_start,
                         c.win_end,
                         c.kept_pts,
@@ -1380,7 +1493,7 @@ fn main() -> Result<()> {
                 } else {
                     writeln!(
                         out,
-                        "{id}\t{}\t{}\tIR\t{}\t.\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{id}\t{}\t{}\tIR\t{}\t.\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         c.start,
                         c.end,
                         c.score,
@@ -1393,6 +1506,7 @@ fn main() -> Result<()> {
                         c.la1,
                         c.ra0,
                         c.ra1,
+                        len,
                         c.win_start,
                         c.win_end,
                         c.kept_pts,
@@ -1455,6 +1569,10 @@ fn main() -> Result<()> {
                     st.stage_b_dups,
                 );
             }
+        }
+
+        if let Some(html_path) = html.as_ref() {
+            write_html_report(html_path, input, &report_rows)?;
         }
 
         Ok(())
