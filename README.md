@@ -30,7 +30,7 @@ Default outputs are the fasta file of corrected reads, and a table of all detect
 
 Current usage is:
 
-```bash
+```txt
 Remove inverted duplication chimeras from fasta files.
 
 Usage: mdax [OPTIONS] --output <output> <input>
@@ -405,14 +405,213 @@ It's a two step pipeline:
 
 ## `irx`: detecting 'natural' IR's from assemblies
 
-We provide the program `irx` which uses the core underlying logic from `mdax` to identify IR's from assembly data. It's very fast and parallelises over windows. I'll expand on this but for now...
+We provide the program `irx` which uses the core underlying logic from `mdax` to identify IR's from genome assembly data. It's very fast and parallelises over windows.
 
 ### Usage
 
 This outputs a table of putative IR's, and extracts with `-f` the repeats into a fasta file.
 
 ```bash
-irx -b ir_repeats.tsv -f ir_repeats.fa assembly.fasta.gz
+# most basic usage
+irx -b out.bed in.fasta 
+# save fasta output
+irx -b out.bed -f out.fasta in.fasta
+# save output diagnostic HTML, save bed through redirection instead
+irx --html out.html in.fa > out.bed
+```
+
+More detailed usage.
+
+```txt
+`irx` scans an assembly FASTA(.gz) for inverted-repeat (IR) candidates using mdax's foldback detector.
+
+Workflow per contig:
+- generate overlapping windows
+- in each window, find up to K candidate foldback bins (top-k anti-diagonals)
+- refine breakpoint position for each candidate
+- derive left/right arm bounds from minimizer matchpoints
+- best-first deduplicate across windows
+- emit BED-like TSV rows
+
+Output is 0-based, half-open coordinates (BED convention).
+
+TSV columns (header line begins with '#'):
+#contig	start	end	name	score	strand	break_pos	identity_est	tir_ident	matches	span	la0	la1	ra0	ra1	win_start	win_end	kept_pts	bin
+
+Column meanings:
+contig         First token of FASTA record id
+start,end      Candidate interval covering both arms (contig coords)
+name           Constant 'IR'
+score          identity_est scaled to 0..1000 (rounded)
+strand         '.' (IR is not strand-specific here)
+break_pos      Refined split position in contig coords
+identity_est   Refinement identity estimate (0..1). Computed locally around breakpoint during refinement.
+tir_ident      Estimated sequence identity of the IR arms (la0..la1 vs revcomp(ra0..ra1))
+matches        Coarse supporting minimizer matches (fb.matches)
+span           Coarse span between arms (fb.span, bp)
+la0,la1        Left arm bounds (contig coords)
+ra0,ra1        Right arm bounds (contig coords)
+contig_len     Length of the contig/chromosome (bp)
+win_start,end  Window bounds that produced this hit (contig coords)
+kept_pts       Number of matchpoints retained near refined anti-diagonal (0 if unfiltered fallback)
+bin            Anti-diagonal bin id (debug / dedup key component)
+
+
+
+Usage: irx [OPTIONS] <input>
+
+Arguments:
+  <input>
+          Input assembly in FASTA format. If the filename ends with .gz, `irx` will transparently decompress it.
+          
+          Note: `irx` will trim to the first whitespace-delimited token for output.
+
+Options:
+  -b, --bed <bed>
+          Output path for the BED-like TSV. Use '-' to write to stdout.
+          
+          The first line is a header prefixed with '#'.
+          
+          [default: -]
+
+  -f, --fasta <fasta>
+          Write the sequences corresponding to accepted inverted-repeat (IR)
+          intervals to a FASTA file.
+
+          Each emitted IR interval is extracted from the input assembly using the 
+          reported `start`–`end` coordinates and written as a FASTA record. The FASTA 
+          header contains the contig name and interval coordinates so sequences can be 
+          easily traced back to their source region.
+
+          If '-' is supplied as the filename, FASTA output is written to stdout.
+          This is useful for piping IR sequences directly into downstream tools
+          (e.g. alignment, repeat analysis, or clustering).
+
+          If this option is not provided, no FASTA sequences are written and only the
+          BED-like interval table is produced.
+
+      --fasta-wrap <fasta_wrap>
+          Set the line width used when writing FASTA sequences.
+
+          Sequences are wrapped to the specified number of characters per line in the
+          output FASTA file. This improves readability and compatibility with tools
+          that expect fixed-width FASTA formatting.
+          
+          A value of 0 disables wrapping and writes each sequence on a single line.
+          
+          The default value of 60 follows a common FASTA formatting convention.
+          
+          [default: 60]
+
+      --max-interval-bp <max_interval_bp>
+          Maximum length of an emitted IR interval (bp). Helps prevent window-scale inflation.
+          
+          [default: 250000]
+
+      --window-len <window_len>
+          Length of the sliding window used to scan contigs.
+          
+          - If 0, the entire contig is processed as a single window.
+          - Otherwise, windows are [start, start+window_len) clamped to contig length.
+          
+          Smaller windows can increase sensitivity to local IRs but may increase runtime.
+          
+          [default: 250000]
+
+      --step <step>
+          Step size between consecutive window starts.
+          
+          Smaller step => more overlap => higher sensitivity but more duplicate discoveries.
+          Deduplication is applied downstream, but runtime still increases with overlap.
+          
+          [default: 50000]
+
+      --hits-per-window <hits_per_window>
+          Maximum number of coarse foldback candidates per window.
+          
+          Internally, `mdax` bins minimizer matchpoints by quantised anti-diagonal (d = p1 + p2). `--hits-per-window` selects the top-K bins by a cheap proxy rank (count + span).
+          
+          Higher values may find multiple IRs within the same window, at increased cost.
+          
+          [default: 4]
+
+      --dedup-bp <dedup_bp>
+          Quantisation size (in bp) used in deduplication.
+          
+          We do two-stage dedup:
+          A) breakpoint/bin dedup on (break_pos/q, diag_bin)
+          B) overlap dedup on intervals quantised to (start/q, end/q)
+          
+          Larger values merge more aggressively (fewer outputs) and speed up overlap checks.
+          
+          [default: 200]
+
+      --diag-widen <diag_widen>
+          When deriving arm bounds near the refined split, we keep matchpoints where:
+          |(p1+p2) - 2*split| <= fold_diag_tol * diag_widen
+          
+          Smaller values are stricter (tighter arms, fewer cap hits).
+          Larger values are more permissive (can inflate intervals).
+          
+          [default: 4]
+
+      --trim-lo <trim_lo>
+          After filtering matchpoints near the split, we derive arm bounds using
+          trimmed quantiles rather than min/max to avoid single-point inflation.
+          
+          Example: --trim-lo 0.10 keeps the 10th percentile as the lower bound.
+          
+          [default: 0.10]
+
+      --trim-hi <trim_hi>
+          Upper quantile used for trimmed arm bounds.
+          Example: --trim-hi 0.90 uses the 90th percentile as the upper bound.
+          
+          [default: 0.90]
+
+      --classify-ir
+          Disable IR class columns (arm_len, spacer, ir_class) in TSV.
+
+      --immediate-bp <immediate_bp>
+          Max spacer (bp) to call an IR 'immediate'.
+          
+          [default: 2000]
+
+      --wide-bp <wide_bp>
+          Min spacer (bp) to call an IR 'wide'.
+          
+          [default: 100000]
+
+      --threads <threads>
+          Number of worker threads.
+          
+          - 0: use Rayon default (typically = number of logical CPUs)
+          - N>0: use exactly N threads via a *local* Rayon thread pool
+          
+          Using a local pool ensures the requested thread count is respected even if another crate initialises the Rayon global pool.
+          
+          [default: 0]
+
+      --cap-policy <cap_policy>
+          When the inferred IR interval length exceeds --max-interval-bp:
+          clamp     Clamp to the capdrop      Discard the candidate entirely
+          penalize  Clamp, but strongly reduce its rank so non-capped hits win dedup
+          
+          Recommended: penalize (prevents huge piles of exactly-cap intervals).
+          
+          [default: penalize]
+          [possible values: clamp, drop, penalize]
+
+      --html <html>
+          Write an interactive HTML dashboard containing embedded IR data and diagnostic plots.
+          
+          The report is self-contained except for any external JS libraries referenced by the template.
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 #### TSV output
@@ -430,7 +629,7 @@ Breakpoints & similarity:
 
 - break_pos: Refined split position (putative IR center)
 - identity_est: Estimated arm identity (0–1 float)
-- tir_ident: sequence identity between the inferred inverted-repeat arms (la0..la1 vs revcomp(ra0..ra1)), estimated using SIMD-accelerated alignment.
+- tir_ident: sequence identity between the inferred inverted-repeat arms (la0..la1 vs revcomp(ra0..ra1)).
 - matches: Number of supporting minimizer matches
 - span: Coarse arm span estimate from foldback geometry
 
@@ -454,12 +653,13 @@ Annotation:
 #### Fasta header format
 
 ```txt
->contig:start-end|break=BREAK|ident=I|matches=M|span=S|bin=B|class=C|spacer=SP
+>contig:start-end|break=BREAK|ident=I|tir_ident=T|matches=M|span=S|bin=B|class=C|spacer=SP
 ```
 
 - contig:start-end — contig name (first FASTA token) and emitted interval in contig coordinates, 0-based half-open.
 - break=BREAK — refined breakpoint (foldback split) position on the contig, in bp.
 - ident=I — refinement identity estimate between the two arms near the breakpoint (approximate; not a full-length alignment), formatted as 0.XXX.
+- tir_ident=T — an accurate identity between the two terminal inverted repeats, derived from `block-aligner`.
 - matches=M — number of supporting minimizer matchpoints in the coarse detector.
 - span=S — coarse span estimate between arms from the detector (bp).
 - bin=B — anti-diagonal bin id used internally for candidate discovery/dedup.

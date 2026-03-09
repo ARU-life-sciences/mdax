@@ -93,8 +93,7 @@ Workflow per contig:\n\
   - best-first deduplicate across windows\n\
   - emit BED-like TSV rows\n\n\
 Output is 0-based, half-open coordinates (BED convention).\n\n\
-TSV columns (header line begins with '#'):\n\
-  #contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\tmatches\tspan\tla0\tla1\tra0\tra1\twin_start\twin_end\tkept_pts\tbin\n\n\
+TSV columns (header line begins with '#'):\n\n\
 Column meanings:\n\
   contig         First token of FASTA record id\n\
   start,end      Candidate interval covering both arms (contig coords)\n\
@@ -141,7 +140,20 @@ The first line is a header prefixed with '#'.",
                 .arg(
             Arg::new("fasta")
                 .help("Optional FASTA output for accepted IR intervals ('-' for stdout).")
-                .long_help("...")
+                .long_help("Write the sequences corresponding to accepted inverted-repeat (IR) \
+intervals to a FASTA file.
+
+Each emitted IR interval is extracted from the input assembly using the \
+reported `start`–`end` coordinates and written as a FASTA record. The FASTA \
+header contains the contig name and interval coordinates so sequences can be \
+easily traced back to their source region.
+
+If '-' is supplied as the filename, FASTA output is written to stdout. \
+This is useful for piping IR sequences directly into downstream tools \
+(e.g. alignment, repeat analysis, or clustering).
+
+If this option is not provided, no FASTA sequences are written and only the \
+BED-like interval table is produced.")
                 .long("fasta")
                 .short('f')
                 .value_parser(value_parser!(PathBuf)),
@@ -149,7 +161,15 @@ The first line is a header prefixed with '#'.",
         .arg(
             Arg::new("fasta_wrap")
                 .help("Wrap FASTA sequence lines to this width (0 = no wrap).")
-                .long_help("...")
+                .long_help("Set the line width used when writing FASTA sequences.
+
+Sequences are wrapped to the specified number of characters per line in the \
+output FASTA file. This improves readability and compatibility with tools \
+that expect fixed-width FASTA formatting.
+
+A value of 0 disables wrapping and writes each sequence on a single line.
+
+The default value of 60 follows a common FASTA formatting convention.")
                 .long("fasta-wrap")
                 .default_value("60")
                 .value_parser(value_parser!(usize)),
