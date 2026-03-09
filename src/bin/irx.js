@@ -228,6 +228,7 @@ function renderAll() {
     width: containerWidth("plot-ident"),
     height: 260,
     marginBottom: 50,
+    marginLeft: 50,
     x: { label: "Inverted repeat % identity", grid: true, labelOffset: 40 },
     y: { label: "Count", labelOffset: 0 },
     color: { legend: true },
@@ -248,6 +249,7 @@ function renderAll() {
     width: containerWidth("plot-interval"),
     height: 260,
     marginBottom: 50,
+    marginLeft: 50,
     x: {
       label: "Interval length (bp)",
       grid: true,
