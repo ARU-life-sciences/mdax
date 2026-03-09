@@ -407,6 +407,8 @@ It's a two step pipeline:
 
 We provide the program `irx` which uses the core underlying logic from `mdax` to identify IR's from genome assembly data. It's very fast and parallelises over windows.
 
+irx is best suited to detection of moderate-to-large inverted repeats with strong minimizer support. In synthetic tests, recovery was high for kilobase-scale and larger IRs, including asymmetric, edge-positioned, and wide-spacer cases, while recovery dropped for very short (~ <500bp) and/or strongly diverged repeats (~ <75% identity). The alignment-based tir_ident metric was generally accurate for recovered calls. Reported arm lengths tend to be slightly conservative, and reported spacers slightly inflated, relative to truth. These observations are based on the defualt general parameters.
+
 ### Usage
 
 This outputs a table of putative IR's, and extracts with `-f` the repeats into a fasta file.
@@ -423,7 +425,7 @@ irx --html out.html in.fa > out.bed
 More detailed usage.
 
 ```txt
-`irx` scans an assembly FASTA(.gz) for inverted-repeat (IR) candidates using mdax's foldback detector.
+`irx` scans an assembly FASTA(.gz) for inverted-repeat (IR) candidates using the `mdax` foldback detector.
 
 Workflow per contig:
 - generate overlapping windows
