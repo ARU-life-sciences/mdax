@@ -55,6 +55,7 @@ use clap::{Arg, Command, value_parser};
 use mdax::elog;
 use mdax::utils::revcomp_into;
 use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -947,6 +948,81 @@ fn write_html_report(
     Ok(())
 }
 
+#[inline]
+const fn build_invalid_dna_table() -> [u8; 256] {
+    let mut t = [1u8; 256];
+    t[b'A' as usize] = 0;
+    t[b'C' as usize] = 0;
+    t[b'G' as usize] = 0;
+    t[b'T' as usize] = 0;
+    t[b'a' as usize] = 0;
+    t[b'c' as usize] = 0;
+    t[b'g' as usize] = 0;
+    t[b't' as usize] = 0;
+    t
+}
+
+const INVALID_DNA: [u8; 256] = build_invalid_dna_table();
+
+/// Very fast yes/no check.
+#[inline]
+fn is_valid_dna_acgt(seq: &[u8]) -> bool {
+    let mut bad = 0u8;
+    for &b in seq {
+        bad |= INVALID_DNA[b as usize];
+    }
+    bad == 0
+}
+
+#[inline]
+fn is_valid_dna_byte(b: u8) -> bool {
+    INVALID_DNA[b as usize] == 0
+}
+
+/// Return the index and byte value of the first invalid character.
+#[inline]
+fn first_invalid_dna_byte(seq: &[u8]) -> Option<(usize, u8)> {
+    for (i, &b) in seq.iter().enumerate() {
+        if INVALID_DNA[b as usize] != 0 {
+            return Some((i, b));
+        }
+    }
+    None
+}
+
+/// Return maximal half-open ACGT-only spans in `seq`.
+///
+/// If the whole contig is valid, this returns exactly one span: `(0, seq.len())`.
+fn valid_acgt_spans(seq: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    let n = seq.len();
+
+    while i < n {
+        // skip invalid run
+        while i < n && !is_valid_dna_byte(seq[i]) {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+
+        let start = i;
+
+        // extend valid run
+        while i < n && is_valid_dna_byte(seq[i]) {
+            i += 1;
+        }
+
+        let end = i;
+        if start < end {
+            spans.push((start, end));
+        }
+    }
+
+    spans
+}
+
 fn main() -> Result<()> {
     let args = build_cli();
 
@@ -1088,14 +1164,69 @@ fn main() -> Result<()> {
             let seq = rec.seq();
             let len = seq.len();
 
-            let wins: Vec<(usize, usize)> = windows(len, window_len, step).collect();
-            if wins.is_empty() {
-                continue;
-            }
-
             let q = dedup_bp.max(1);
             let mm_k = cfg.shared.minimizer.k;
             let fold_diag_tol = cfg.shared.fold_diag_tol;
+
+            // Split contig into maximal valid ACGT-only spans.
+            // If the contig has no invalid bases, this is just [(0, len)].
+            let spans = valid_acgt_spans(&seq);
+            if spans.len() > 1
+                || spans
+                    .first()
+                    .map(|&(s, e)| s != 0 || e != len)
+                    .unwrap_or(false)
+            {
+                if let Some((pos, bad)) = first_invalid_dna_byte(&seq) {
+                    elog!(
+                        "irx",
+                        "{id}: splitting contig on invalid base '{}' (ASCII {}) first seen at offset {} into {} valid spans",
+                        bad as char,
+                        bad,
+                        pos,
+                        spans.len(),
+                    );
+                }
+            }
+
+            if spans.is_empty() {
+                elog!("irx", "{id}: no valid ACGT spans; skipping contig");
+                continue;
+            }
+
+            // Since IRs currently require min_arm on each side, tiny valid fragments are not useful.
+            // This also avoids wasting time on tiny islands between Ns.
+            let min_span_len = cfg.fold.min_arm.saturating_mul(2);
+
+            // Build contig-global windows from valid spans.
+            let mut wins: Vec<(usize, usize)> = Vec::new();
+            let mut had_invalid = false;
+
+            for &(span_start, span_end) in &spans {
+                if span_start > 0 || span_end < len {
+                    had_invalid = true;
+                }
+
+                let span_len = span_end - span_start;
+                if span_len < min_span_len {
+                    continue;
+                }
+
+                for (rel_start, rel_end) in windows(span_len, window_len, step) {
+                    wins.push((span_start + rel_start, span_start + rel_end));
+                }
+            }
+
+            if wins.is_empty() {
+                if had_invalid {
+                    elog!(
+                        "irx",
+                        "{id}: contig contains invalid bases; no valid spans >= {} bp after splitting",
+                        min_span_len
+                    );
+                }
+                continue;
+            }
 
             // For each window:
             // - detect top-k coarse foldback bins
@@ -1104,13 +1235,17 @@ fn main() -> Result<()> {
             // - package into `Cand` records
             //
             // We do *no* dedup here (that happens serially per contig).
-            use rayon::prelude::*;
 
             let mut cands: Vec<Cand> = wins
                 .par_iter()
                 .flat_map_iter(|&(wstart, wend)| {
                     let sub = &seq[wstart..wend];
                     let win_len = sub.len();
+
+                    // Defensive check: in the no-invalid path this is always true;
+                    // in the split path it should also always be true because windows
+                    // are generated only from valid spans.
+                    debug_assert!(is_valid_dna_acgt(sub));
 
                     // Thread-local scratch reuse.
                     let scratch_cell = tls.get_or(|| RefCell::new(FoldScratch::new()));
