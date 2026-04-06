@@ -721,11 +721,27 @@ fn fold_breakpoint_from_pts(
         return None;
     }
 
-    // median d = p1 + p2 => split ≈ d/2
-    let mut ds: Vec<i32> = chain.iter().map(|(p1, p2)| p1 + p2).collect();
-    ds.sort_unstable();
-    let d_med = ds[ds.len() / 2];
-    let split_u = ((d_med as f64) / 2.0).round().max(0.0) as usize;
+    // Weighted mean of d = p1+p2, using inverse junction-distance as weight.
+    //
+    // For a foldback at split s, every matchpoint satisfies d ≈ 2s.  But
+    // near-junction points (p1 ≈ p2 ≈ s) accumulate fewer indel errors along
+    // the arm and give a more accurate estimate than far-from-junction points.
+    // Weighting by 1/max(|p1-p2|, k) emphasises these near-junction matches
+    // without discarding far matches entirely.
+    let k_i32 = shared.minimizer.k as i32;
+    let (weight_sum, weighted_d_sum) = chain.iter().fold(
+        (0.0f64, 0.0f64),
+        |(ws, wds), &(p1, p2)| {
+            let diff = (p1 - p2).abs().max(k_i32) as f64;
+            let w = 1.0 / diff;
+            (ws + w, wds + (p1 + p2) as f64 * w)
+        },
+    );
+    let split_u = if weight_sum > 0.0 {
+        (weighted_d_sum / weight_sum / 2.0).round().max(0.0) as usize
+    } else {
+        0
+    };
 
     if split_u < shared.end_guard || split_u + shared.end_guard > len {
         return None;

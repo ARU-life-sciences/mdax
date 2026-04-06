@@ -186,6 +186,14 @@ pub struct FoldSecondPassCfg {
 
     /// Minimum support identity estimate required to accept as a foldback candidate.
     pub min_support_ident: f64,
+
+    /// When true, reads detected with a foldback whose arm identity is below
+    /// `min_identity` are still cut at the estimated split position rather than
+    /// labelled `low_ident` and passed through.
+    ///
+    /// Useful for ONT data where the HiFi Hamming estimator used in pass1/signature
+    /// coherence systematically underestimates arm similarity on indel-rich reads.
+    pub cut_low_ident: bool,
 }
 
 impl Default for FoldSecondPassCfg {
@@ -194,6 +202,7 @@ impl Default for FoldSecondPassCfg {
             min_support: 3,
             min_identity: 0.60,
             min_support_ident: 0.0,
+            cut_low_ident: false,
         }
     }
 }

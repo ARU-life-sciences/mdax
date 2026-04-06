@@ -85,12 +85,47 @@ fn main() -> Result<()> {
     let mut forward_only = *args.get_one::<bool>("forward_only").unwrap();
 
     let mut refine_mode = *args.get_one::<RefineMode>("refine_mode").unwrap();
+
+    // For ONT mode, automatically use smaller k/w when the user hasn't
+    // overridden them explicitly.  With k=17 and ~10% ONT error, each 17-mer
+    // has only ~2% probability of surviving in both arms of the foldback
+    // (cross-match probability ≈ (0.9)^34), yielding ~2 expected matches per
+    // 2 kb arm — well below any practical min_matches threshold.
+    // k=11, w=11 raises this to ~14 expected matches (cross-match ≈ (0.9)^22),
+    // recovering most of the missed reads at negligible precision cost.
+    if refine_mode == RefineMode::ONT {
+        let k_explicit = args.value_source("k")
+            == Some(clap::parser::ValueSource::CommandLine);
+        let w_explicit = args.value_source("w")
+            == Some(clap::parser::ValueSource::CommandLine);
+        if !k_explicit {
+            k = 11;
+        }
+        if !w_explicit {
+            w = 11;
+        }
+    }
     let mut refine_window = *args.get_one::<usize>("refine_window").unwrap();
     let mut refine_arm = *args.get_one::<usize>("refine_arm").unwrap();
     let mut max_ed_rate = *args.get_one::<f32>("max_ed_rate").unwrap();
 
     let mut end_guard = *args.get_one::<usize>("end_guard").unwrap();
     let mut fold_diag_tol = *args.get_one::<i32>("fold_diag_tol").unwrap();
+
+    let ont_k_note = if refine_mode == RefineMode::ONT {
+        let k_explicit = args.value_source("k")
+            == Some(clap::parser::ValueSource::CommandLine);
+        let w_explicit = args.value_source("w")
+            == Some(clap::parser::ValueSource::CommandLine);
+        match (k_explicit, w_explicit) {
+            (false, false) => format!(" [ONT auto: k={k}, w={w}]"),
+            (false, _)     => format!(" [ONT auto: k={k}]"),
+            (_, false)     => format!(" [ONT auto: w={w}]"),
+            (true, true)   => String::new(),
+        }
+    } else {
+        String::new()
+    };
 
     let msg = [
         fmt_param("min_matches", min_matches, t.min_matches),
@@ -100,6 +135,8 @@ fn main() -> Result<()> {
         fmt_param("max_depth", max_depth, t.max_depth),
         fmt_param("sig_flank_bp", sig_flank_bp, t.sig_flank_bp),
         fmt_param("sig_take", sig_take, t.sig_take),
+        format!("k={k}  w={w}{ont_k_note}"),
+        format!("refine_mode={refine_mode:?}  refine_arm={refine_arm}  refine_window={refine_window}"),
     ]
     .join("\n  ");
 
@@ -157,6 +194,7 @@ fn main() -> Result<()> {
             min_support,
             min_identity,
             min_support_ident: 0.0,
+            cut_low_ident: *args.get_one::<bool>("cut_low_ident").unwrap_or(&false),
         },
         sig: SigCfg {
             flank_bp: sig_flank_bp,

@@ -391,6 +391,7 @@ mod tests {
                 min_support: 3,
                 min_identity: 0.60,
                 min_support_ident: 0.0,
+                cut_low_ident: false,
             },
             sig: SigCfg {
                 flank_bp: 1000,

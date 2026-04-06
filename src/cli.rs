@@ -457,6 +457,24 @@ Guidance:\n\
                 .help("Number of minimizer hashes retained for foldback fingerprint")
                 .value_parser(value_parser!(usize)),
         )
+        .arg(
+            Arg::new("cut_low_ident")
+                .long("cut-low-ident")
+                .help("Cut low-identity foldbacks instead of labelling them low_ident")
+                .long_help(
+"When set, reads whose detected foldback falls below the identity threshold \
+(--min-identity) are still cut at the estimated split position, rather than \
+labelled low_ident and passed through unchanged.\n\
+\n\
+Useful for ONT data where the HiFi Hamming estimator used internally for \
+signature coherence systematically underestimates arm similarity on indel-rich \
+reads. In that regime the identity gate fires too often, and --cut-low-ident \
+recovers the cuts that would otherwise be suppressed.\n\
+\n\
+Use with care on HiFi data: genuine low-identity hits (e.g. partial repeats) \
+will also be cut.")
+                .action(clap::ArgAction::SetTrue),
+        )
         // Hidden “developer mode” for reproducible benchmarking.
         .arg(
             Arg::new("fairness_baseline")

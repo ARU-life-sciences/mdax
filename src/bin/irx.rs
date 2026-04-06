@@ -1086,6 +1086,7 @@ fn main() -> Result<()> {
             min_support: 0,
             min_identity: 0.0,
             min_support_ident: 0.0,
+            cut_low_ident: false,
         },
         sig: SigCfg {
             flank_bp: 600,

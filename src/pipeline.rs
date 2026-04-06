@@ -535,17 +535,6 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                         dbg.bump("detected");
                     }
 
-                    // Precompute match-derived signature (only if fold exists)
-                    let sig_from_matches_pre: Option<u64> = fold.as_ref().and_then(|fb| {
-                        foldback_signature_from_local_matches(
-                            &mut fold_scratch.best_matches,
-                            fb.split_pos,
-                            cfg.sig.flank_bp,
-                            cfg.sig.take,
-                            cfg.sig.value_shift,
-                        )
-                    });
-
                     if let Some(fb) = fold {
                         num_foldbacks += 1;
 
@@ -564,7 +553,14 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                             &mut fold_scratch.refine,
                         )?;
 
-                        if let Some(rf_call) = refined_call {
+                        // When the user-mode refiner (e.g. ONT banded Levenshtein) returns
+                        // None — typically because every candidate in the window exceeds the
+                        // band — fall back to the HiFi result used for signature coherence.
+                        // Without this fallback the read is silently dropped from the TSV
+                        // and never cut, which is the dominant cause of low recall on ONT.
+                        let rf_call_opt = refined_call.or_else(|| refined_sig.clone());
+
+                        if let Some(rf_call) = rf_call_opt {
                             dbg.bump("refined");
 
                             let (sig_split, sig_ident) = if let Some(rf_sig) = refined_sig.as_ref()
@@ -574,11 +570,29 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                 (rf_call.split_pos, rf_call.identity_est)
                             };
 
-                            let (decision, support_n, support_rank_frac, support_span) = 
+                            let (decision, support_n, support_rank_frac, support_span) =
                                 if sig_ident >= cfg.fold2.min_identity {
                                     dbg.bump("ident_ok");
 
-                                    let sig = sig_from_matches_pre.or_else(|| {
+                                    // Compute the local-match signature using the *refined* split
+                                    // (sig_split), not the coarse split from detect_foldback.
+                                    // Pass 1 also uses the refined split, so this keeps the two
+                                    // passes consistent and ensures support-map lookups work for
+                                    // genuine palindromes.
+                                    //
+                                    // Note: this destructively filters fold_scratch.best_matches.
+                                    // The recursive cutter's first iteration will find an empty
+                                    // window and fall back to the flank signature, which also
+                                    // uses the refined split and therefore still matches pass 1.
+                                    let sig_from_matches = foldback_signature_from_local_matches(
+                                        &mut fold_scratch.best_matches,
+                                        sig_split,
+                                        cfg.sig.flank_bp,
+                                        cfg.sig.take,
+                                        cfg.sig.value_shift,
+                                    );
+
+                                    let sig = sig_from_matches.or_else(|| {
                                         let q = 150usize;
                                         let split_q = (sig_split / q) * q;
                                         foldback_signature(
@@ -648,6 +662,17 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                     } else {
                                         ("unknown", 0, 0.0, 0)
                                     }
+                                } else if cfg.fold2.cut_low_ident {
+                                    // Identity gate failed but the caller opted-in to
+                                    // cutting anyway (useful for ONT where HiFi Hamming
+                                    // systematically underestimates arm similarity).
+                                    annot = Some(
+                                        format!("_chopped_at_{}", rf_call.split_pos)
+                                            .into_bytes(),
+                                    );
+                                    keep = 0..rf_call.split_pos;
+                                    num_cut += 1;
+                                    ("artefact", 0, 0.0, 0)
                                 } else {
                                     ("low_ident", 0, 0.0, 0)
                                 };
