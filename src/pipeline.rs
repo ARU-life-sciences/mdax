@@ -242,6 +242,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
                             fb.split_pos,
                             &shared_fast,
                             &mut fold_scratch.refine,
+                            fb.span,
                         )?
                         else {
                             continue;
@@ -429,7 +430,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
 
         // Write TSV header once (via bytes, no formatting)
         tsv_out.write_all(
-        b"read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tsupport_n\tsupport_rank_frac\tsupport_span\tdecision\n"
+        b"read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tgap_est\tsupport_n\tsupport_rank_frac\tsupport_span\tdecision\n"
     )?;
 
         // User-space batching buffers
@@ -544,6 +545,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                             fb.split_pos,
                             &cfg.shared,
                             &mut fold_scratch.refine,
+                            fb.span,
                         )?;
 
                         let refined_sig = foldback::refine_breakpoint(
@@ -551,6 +553,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                             fb.split_pos,
                             &shared_fast,
                             &mut fold_scratch.refine,
+                            fb.span,
                         )?;
 
                         // When the user-mode refiner (e.g. ONT banded Levenshtein) returns
@@ -681,7 +684,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                             let id_str =
                                 std::str::from_utf8(&job.id).unwrap_or("<nonutf8_id>");
                             tsv_row = Some(format!(
-                                "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}\t{}\t{:.6}\t{}\t{}",
+                                "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}\t{}\t{}\t{:.6}\t{}\t{}",
                                 fb.split_pos,
                                 rf_call.split_pos,
                                 fb.matches,
@@ -689,6 +692,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                 fb.score,
                                 rf_call.score,
                                 rf_call.identity_est,
+                                rf_call.gap_est,
                                 support_n,
                                 support_rank_frac,
                                 support_span,

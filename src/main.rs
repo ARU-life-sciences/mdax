@@ -108,6 +108,7 @@ fn main() -> Result<()> {
     let mut refine_window = *args.get_one::<usize>("refine_window").unwrap();
     let mut refine_arm = *args.get_one::<usize>("refine_arm").unwrap();
     let mut max_ed_rate = *args.get_one::<f32>("max_ed_rate").unwrap();
+    let max_jump_clip = *args.get_one::<usize>("max_jump_clip").unwrap();
 
     let mut end_guard = *args.get_one::<usize>("end_guard").unwrap();
     let mut fold_diag_tol = *args.get_one::<i32>("fold_diag_tol").unwrap();
@@ -181,6 +182,7 @@ fn main() -> Result<()> {
                 arm: refine_arm,
                 mode: refine_mode,
                 max_ed_rate,
+                max_jump_clip,
             },
             fold_diag_tol,
         },

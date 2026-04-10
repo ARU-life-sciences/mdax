@@ -1075,9 +1075,10 @@ fn main() -> Result<()> {
             end_guard: 0,
             refine: RefineCfg {
                 window: 500,
-                arm: 1000,
+                arm: 1200,
                 mode: RefineMode::HiFi,
                 max_ed_rate: 0.25,
+                max_jump_clip: 1000,
             },
             fold_diag_tol: 120,
         },
@@ -1286,6 +1287,7 @@ fn main() -> Result<()> {
                             fb.split_pos,
                             &cfg.shared,
                             &mut scratch.refine,
+                            fb.span,
                         )
                         .ok()
                         .flatten() else {

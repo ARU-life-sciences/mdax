@@ -329,6 +329,7 @@ mod tests {
                 arm: 0,
                 mode: RefineMode::HiFi,
                 max_ed_rate: 0.0,
+                max_jump_clip: 0,
             },
             fold_diag_tol: 100,
         }
@@ -378,9 +379,10 @@ mod tests {
                 end_guard: 0,
                 refine: RefineCfg {
                     window: 50,
-                    arm: 300, // refinement arm; independent of fingerprint flank=1000
+                    arm: 1200,
                     mode: RefineMode::HiFi,
                     max_ed_rate: 0.25,
+                    max_jump_clip: 1000,
                 },
                 fold_diag_tol: 50,
             },

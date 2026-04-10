@@ -291,7 +291,29 @@ Guidance:\n\
 - If you see unstable identity_est or lots of borderline calls, increase this.\n\
 - If reads are short, arm too large can hit end-guard logic or reduce usable candidates.")
                 .long("refine-arm")
-                .default_value("200")
+                .default_value("1200")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("max_jump_clip")
+                .help("Maximum template-jump size to probe during identity estimation (bp)")
+                .long_help("After finding the best split position, the refiner scans offsets δ = 0..max-jump-clip\n\
+on the right arm to find the δ that maximises identity over `arm − δ` bases.\n\
+\n\
+In MDA foldback artefacts the enzyme may slip 0–N bp before beginning the reverse copy,\n\
+leaving a short uncopied region immediately right of the junction ('template jump').\n\
+Without this correction those bases inflate the apparent mismatch count and drive\n\
+identity_est down even when the arms are near-identical.\n\
+\n\
+A minimum effective arm of 100 bp is always enforced regardless of this setting,\n\
+so the actual ceiling is min(max-jump-clip, refine-arm - 100).\n\
+\n\
+Guidance:\n\
+- Increase if you observe reads with very low identity_est but clear anti-diagonal\n\
+  foldback structure in dotplots, especially if gap_est is hitting the current ceiling.\n\
+- Requires --refine-arm >= max-jump-clip + 100 to take full effect.")
+                .long("max-jump-clip")
+                .default_value("1000")
                 .value_parser(value_parser!(usize)),
         )
         .arg(

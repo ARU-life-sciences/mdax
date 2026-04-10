@@ -37,7 +37,6 @@
 //!   coordinate systems during recursion.
 
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
-use crate::elog;
 use crate::fingerprint::{
     SupportStats, foldback_signature, foldback_signature_from_local_matches, is_real_foldback,
 };
@@ -169,33 +168,49 @@ pub struct FoldBreakpoint {
 
 /// Refine a coarse foldback breakpoint into a more precise split position.
 ///
-/// This function dispatches to either a HiFi-optimised or ONT-optimised
-/// refinement strategy, based on `cfg.refine.mode`.
+/// `span_hint` is the coarse detector's estimate of the palindromic arm span
+/// (typically `fb.span`).  It is used to limit the identity comparison window
+/// so that identity reflects only the palindromic region rather than being
+/// diluted by unrelated sequence beyond the arm.  Pass `usize::MAX` to disable.
 ///
-/// Returns `None` if the refinement window would exceed sequence bounds
-/// or if no acceptable refinement is found.
+/// The configured arm is clamped to the sequence space available around `s0`
+/// (keeping `window` bp clear on each side), so reads whose split sits close
+/// to either end are still refined with a shorter arm rather than being dropped.
+/// Returns `None` only when fewer than 10 bp are available (degenerate case).
 pub fn refine_breakpoint(
     seq: &[u8],
     s0: usize,
     cfg: &SharedCfg,
     refine_scratch: &mut RefineScratch,
+    span_hint: usize,
 ) -> Result<Option<Refined>> {
     let n = seq.len();
-    if s0 < cfg.refine.arm + cfg.refine.window || s0 + cfg.refine.arm + cfg.refine.window > n {
-        elog!(
-            "REFINE BREAKPOINT",
-            "Refinement context exceeds sequence bounds: s0={}, arm={}, window={}, len={}",
-            s0,
-            cfg.refine.arm,
-            cfg.refine.window,
-            n
-        );
+    let w = cfg.refine.window;
+
+    // Maximum arm that fits while keeping `window` clear on each side.
+    let available = s0.min(n.saturating_sub(s0)).saturating_sub(w);
+    let arm = cfg.refine.arm.min(available);
+
+    if arm < 10 {
         return Ok(None);
     }
-    match cfg.refine.mode {
-        RefineMode::HiFi => Ok(refine_breakpoint_hamming(seq, s0, cfg)),
-        RefineMode::ONT => Ok(refine_breakpoint_banded_ed(seq, s0, cfg, refine_scratch)),
+
+    // Use a local cfg with the (possibly clamped) arm so the individual
+    // refiners don't need to repeat this logic.
+    if arm == cfg.refine.arm {
+        // No clamping needed — avoid the clone on the hot path.
+        return Ok(match cfg.refine.mode {
+            RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, cfg, span_hint),
+            RefineMode::ONT  => refine_breakpoint_banded_ed(seq, s0, cfg, refine_scratch, span_hint),
+        });
     }
+
+    let mut clamped = cfg.clone();
+    clamped.refine.arm = arm;
+    Ok(match cfg.refine.mode {
+        RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, &clamped, span_hint),
+        RefineMode::ONT  => refine_breakpoint_banded_ed(seq, s0, &clamped, refine_scratch, span_hint),
+    })
 }
 
 /// HiFi-optimised breakpoint refinement using symmetric arm comparison.
@@ -207,12 +222,7 @@ pub fn refine_breakpoint(
 /// Scoring is Hamming-like: +1 for match, −1 for mismatch.
 ///
 /// This assumes low indel rates and is therefore **not suitable for ONT data**.
-pub fn refine_breakpoint_hamming(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Option<Refined> {
-    let n = seq.len();
-    if s0 < cfg.refine.arm + cfg.refine.window || s0 + cfg.refine.arm + cfg.refine.window > n {
-        return None;
-    }
-
+pub fn refine_breakpoint_hamming(seq: &[u8], s0: usize, cfg: &SharedCfg, span_hint: usize) -> Option<Refined> {
     let mut best_s = s0;
     let mut best_score: i64 = i64::MIN;
 
@@ -238,13 +248,86 @@ pub fn refine_breakpoint_hamming(seq: &[u8], s0: usize, cfg: &SharedCfg) -> Opti
         }
     }
 
-    let matches = ((best_score + cfg.refine.arm as i64) / 2).max(0) as usize;
-    let identity = matches as f32 / cfg.refine.arm as f32;
+    // ── symmetric gap-aware identity ─────────────────────────────────────────
+    // `split_pos` is the anti-diagonal midpoint: for [A, L1][gap, g][RC(A'), L2]
+    // it sits at L1 + g/2, not at the true junction (L1).  Shifting both arms
+    // symmetrically by δ moves the comparison window so that:
+    //   left  arm ends   at split − δ  (approaching true end of A)
+    //   right arm starts at split + δ  (approaching true start of RC(A'))
+    // At δ = g/2 the arms are correctly aligned.  gap_est = 2*δ_best ≈ g.
+    //
+    // Effective arm length = arm − δ (shrinks as δ grows).
+    // MIN_EFF_ARM: minimum comparison length to keep the estimate stable.
+    // Two-stage scan: coarse at stride max_δ/200, then exhaustive ±stride.
+    const MIN_EFF_ARM: usize = 100;
+    let arm = cfg.refine.arm;
+    let max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(MIN_EFF_ARM));
+
+    // Evaluate Hamming identity at a symmetric half-gap offset δ.
+    // Bounds are guaranteed by the outer bounds-check: the window [split±arm]
+    // is already known to lie within the sequence.
+    let eval = |delta: usize| -> f32 {
+        let eff_arm = arm - delta;
+        let mut score = 0i64;
+        for i in 0..eff_arm {
+            let a = seq[best_s - delta - 1 - i];
+            let b = comp(seq[best_s + delta + i]);
+            if a == b { score += 1; } else { score -= 1; }
+        }
+        let m = ((score + eff_arm as i64) / 2).max(0) as usize;
+        m as f32 / eff_arm as f32
+    };
+
+    let base_ident = eval(0);
+    let mut best_delta = 0usize;
+    let mut best_ident  = base_ident;
+
+    if max_delta > 0 {
+        let stride = (max_delta / 200).max(1);
+
+        // Stage 1: coarse scan.
+        let mut coarse_best = 0usize;
+        for delta in (1..=max_delta).step_by(stride) {
+            let ident = eval(delta);
+            if ident > best_ident {
+                best_ident  = ident;
+                coarse_best = delta;
+                best_delta  = delta;
+            }
+        }
+
+        // Stage 2: exhaustive refine around the coarse best.
+        if coarse_best > 0 {
+            let lo = coarse_best.saturating_sub(stride).max(1);
+            let hi = (coarse_best + stride).min(max_delta);
+            for delta in lo..=hi {
+                let ident = eval(delta);
+                if ident > best_ident {
+                    best_ident = ident;
+                    best_delta = delta;
+                }
+            }
+        }
+    }
+
+    // ── span-limited identity ─────────────────────────────────────────────────
+    // Compare only as far as the coarse detector's arm span estimate, so identity
+    // reflects the palindromic region rather than unrelated sequence beyond it.
+    let eff_arm = arm - best_delta;
+    let id_window = eff_arm.min(span_hint).max(1);
+    let mut matches = 0i64;
+    for i in 0..id_window {
+        let a = seq[best_s - best_delta - 1 - i];
+        let b = comp(seq[best_s + best_delta + i]);
+        if a == b { matches += 1; }
+    }
+    let identity_est = matches as f32 / id_window as f32;
 
     Some(Refined {
         split_pos: best_s,
         score: best_score,
-        identity_est: identity,
+        identity_est,
+        gap_est: best_delta * 2,
     })
 }
 
@@ -262,9 +345,8 @@ pub fn refine_breakpoint_banded_ed(
     s0: usize,
     cfg: &SharedCfg,
     scratch: &mut crate::scratch::RefineScratch,
+    span_hint: usize,
 ) -> Option<Refined> {
-    // ... bounds checks ...
-
     let mut band = (cfg.refine.max_ed_rate.max(0.0) * cfg.refine.arm as f32).ceil() as usize;
     band = band.max(1).min(cfg.refine.arm);
 
@@ -302,12 +384,86 @@ pub fn refine_breakpoint_banded_ed(
     if !found {
         return None; // or identity_est=0.0
     }
-    let identity = (1.0 - (best_ed as f32 / cfg.refine.arm as f32)).clamp(0.0, 1.0);
+
+    // ── symmetric gap-aware identity (same model as Hamming refiner) ─────────
+    // See Hamming refiner comment for full rationale.  Symmetric δ-shift:
+    //   left  = seq[split − arm .. split − δ]  (length arm − δ)
+    //   right = seq[split + δ  .. split + arm]  (length arm − δ)
+    // Bounds identical to δ=0 case, already validated by outer check.
+    const MIN_EFF_ARM: usize = 100;
+    let arm = cfg.refine.arm;
+    let max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(MIN_EFF_ARM));
+
+    let mut eval_ed = |delta: usize| -> f32 {
+        let left  = &seq[best_s - arm .. best_s - delta];
+        let right = &seq[best_s + delta .. best_s + arm];
+        revcomp_into(&mut scratch.right_rc, right);
+        let ed = banded_edit_distance_scratch(
+            left, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
+        );
+        if ed > band { return 0.0; }
+        let eff_arm = arm - delta;
+        (1.0 - (ed as f32 / eff_arm as f32)).clamp(0.0, 1.0)
+    };
+
+    // δ=0 identity already known from best_ed.
+    let mut best_delta = 0usize;
+    let mut best_ident  = (1.0 - (best_ed as f32 / arm as f32)).clamp(0.0, 1.0);
+
+    if max_delta > 0 {
+        let stride = (max_delta / 200).max(1);
+
+        // Stage 1: coarse scan.
+        let mut coarse_best = 0usize;
+        for delta in (1..=max_delta).step_by(stride) {
+            let ident = eval_ed(delta);
+            if ident > best_ident {
+                best_ident  = ident;
+                coarse_best = delta;
+                best_delta  = delta;
+            }
+        }
+
+        // Stage 2: exhaustive refine around the coarse best.
+        if coarse_best > 0 {
+            let lo = coarse_best.saturating_sub(stride).max(1);
+            let hi = (coarse_best + stride).min(max_delta);
+            for delta in lo..=hi {
+                let ident = eval_ed(delta);
+                if ident > best_ident {
+                    best_ident = ident;
+                    best_delta = delta;
+                }
+            }
+        }
+    }
+
+    // ── span-limited identity ─────────────────────────────────────────────────
+    // Use banded ED over the span-limited window (same cap as Hamming refiner).
+    let eff_arm = arm - best_delta;
+    let id_window = eff_arm.min(span_hint).max(1);
+    let left_short  = &seq[best_s - best_delta - id_window .. best_s - best_delta];
+    let right_short = &seq[best_s + best_delta .. best_s + best_delta + id_window];
+    revcomp_into(&mut scratch.right_rc, right_short);
+    let final_ed = banded_edit_distance_scratch(
+        left_short, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
+    );
+    let identity_est = if final_ed <= band {
+        (1.0 - final_ed as f32 / id_window as f32).clamp(0.0, 1.0)
+    } else {
+        // Band exceeded on short window; fall back to Hamming.
+        let mut m = 0i64;
+        for i in 0..id_window {
+            if seq[best_s - best_delta - 1 - i] == comp(seq[best_s + best_delta + i]) { m += 1; }
+        }
+        m as f32 / id_window as f32
+    };
 
     Some(Refined {
         split_pos: best_s,
         score: -(best_ed as i64),
-        identity_est: identity,
+        identity_est,
+        gap_est: best_delta * 2,
     })
 }
 
@@ -824,7 +980,7 @@ pub fn recursive_foldback_cut_from_first_range(
                 rf
             }
             None => {
-                match refine_breakpoint(view, fb.split_pos, &cfg.shared, &mut scratch.refine)? {
+                match refine_breakpoint(view, fb.split_pos, &cfg.shared, &mut scratch.refine, fb.span)? {
                     Some(rf) => rf,
                     None => break,
                 }
@@ -912,6 +1068,7 @@ mod tests {
                     arm: refine_arm,
                     mode: refine_mode,
                     max_ed_rate,
+                    max_jump_clip: 1000,
                 },
                 fold_diag_tol: diag_tol,
             },
@@ -1038,7 +1195,7 @@ mod tests {
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
         let refine_scratch = &mut RefineScratch::default();
 
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch)
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span)
             .unwrap()
             .unwrap();
 
@@ -1058,7 +1215,7 @@ mod tests {
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
         let refine_scratch = &mut RefineScratch::default();
 
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch)
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span)
             .unwrap()
             .expect("should refine");
 
@@ -1091,10 +1248,10 @@ mod tests {
         let refine_scratch = &mut RefineScratch::default();
 
         shared.refine.mode = RefineMode::HiFi;
-        let hifi = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch).unwrap();
+        let hifi = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span).unwrap();
 
         shared.refine.mode = RefineMode::ONT;
-        let ont = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch)
+        let ont = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span)
             .unwrap()
             .unwrap();
 
@@ -1131,7 +1288,7 @@ mod tests {
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch)
             .expect("detect_foldback should succeed on a clean random foldback");
 
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, &mut scratch.refine)
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, &mut scratch.refine, coarse.span)
             .unwrap()
             .expect("refine should succeed");
 
@@ -1161,5 +1318,90 @@ mod tests {
 
         // Depending on exact minimizer impl, this may be None due to repetitive filtering.
         let _ = detect_foldback(&s, &shared, &fold, &mut scratch);
+    }
+
+    // ── identity_est robustness tests ─────────────────────────────────────────
+    // These tests exist specifically because identity_est was systematically
+    // wrong in earlier versions (comparisons extending far beyond the palindromic
+    // arm).  They must remain: if identity_est regresses, callers will silently
+    // filter out genuine artefacts.
+
+    /// Perfect clean foldback [A][RC(A)] — identity must be ≥ 0.99.
+    #[test]
+    fn identity_est_is_high_for_clean_palindrome() {
+        let arm = random_dna(3000, 0xCAFE_0001);
+        let mut rc = arm.clone();
+        revcomp_in_place(&mut rc);
+        let seq: Vec<u8> = [arm.as_slice(), rc.as_slice()].concat();
+
+        let (shared, fold) = test_fold_cfg(17, 21, 120, 200, 5, 200, 1200, RefineMode::HiFi, 0.25);
+        let mut scratch = scratch::FoldScratch::new();
+
+        let fb = detect_foldback(&seq, &shared, &fold, &mut scratch)
+            .expect("clean palindrome should be detected");
+        let rf = refine_breakpoint(&seq, fb.split_pos, &shared, &mut scratch.refine, fb.span)
+            .unwrap()
+            .expect("clean palindrome should refine");
+
+        assert!(
+            rf.identity_est >= 0.99,
+            "clean palindrome: expected identity ≥ 0.99, got {:.4}  \
+             (fb.span={}, split_pos={})",
+            rf.identity_est, fb.span, rf.split_pos
+        );
+    }
+
+    /// Foldback with a 300 bp template-switch gap: [A][gap][RC(A)].
+    /// Gap correction must find δ ≈ 150 and identity must still be ≥ 0.90.
+    #[test]
+    fn identity_est_is_high_for_palindrome_with_gap() {
+        let arm = random_dna(2000, 0xCAFE_0002);
+        let gap = random_dna(300, 0xDEAD_BEEF); // unrelated gap sequence
+        let mut rc = arm.clone();
+        revcomp_in_place(&mut rc);
+        let seq: Vec<u8> = [arm.as_slice(), gap.as_slice(), rc.as_slice()].concat();
+
+        let (shared, fold) = test_fold_cfg(17, 21, 120, 200, 5, 200, 1200, RefineMode::HiFi, 0.25);
+        let mut scratch = scratch::FoldScratch::new();
+
+        let fb = detect_foldback(&seq, &shared, &fold, &mut scratch)
+            .expect("gapped palindrome should be detected");
+        let rf = refine_breakpoint(&seq, fb.split_pos, &shared, &mut scratch.refine, fb.span)
+            .unwrap()
+            .expect("gapped palindrome should refine");
+
+        assert!(
+            rf.identity_est >= 0.90,
+            "gapped palindrome: expected identity ≥ 0.90, got {:.4}  \
+             (fb.span={}, split_pos={}, read_len={})",
+            rf.identity_est, fb.span, rf.split_pos, seq.len()
+        );
+    }
+
+    /// Noisy foldback with ~5% substitutions: [A][noise_RC(A)].
+    /// Simulates ONT-level error.  Identity must match the noise rate (≥ 0.90).
+    #[test]
+    fn identity_est_tracks_arm_error_rate() {
+        let arm = random_dna(3000, 0xCAFE_0003);
+        // sub_every=20 → ~5% substitution rate in the RC arm
+        let (seq, _bp) = make_noisy_foldback_from_left(&arm, b"", 20, 0, 0);
+
+        let (shared, fold) = test_fold_cfg(17, 21, 120, 200, 5, 200, 1200, RefineMode::HiFi, 0.25);
+        let mut scratch = scratch::FoldScratch::new();
+
+        let fb = detect_foldback(&seq, &shared, &fold, &mut scratch)
+            .expect("noisy palindrome should be detected");
+        let rf = refine_breakpoint(&seq, fb.split_pos, &shared, &mut scratch.refine, fb.span)
+            .unwrap()
+            .expect("noisy palindrome should refine");
+
+        // With ~5% error rate, expect identity ≥ 0.90 (leaving margin for
+        // the coarse span estimate covering slightly more than the palindromic arm).
+        assert!(
+            rf.identity_est >= 0.90,
+            "noisy palindrome (~5% sub): expected identity ≥ 0.90, got {:.4}  \
+             (fb.span={}, split_pos={})",
+            rf.identity_est, fb.span, rf.split_pos
+        );
     }
 }

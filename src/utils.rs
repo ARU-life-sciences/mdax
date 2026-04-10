@@ -20,6 +20,10 @@ pub struct Refined {
     pub split_pos: usize,
     pub score: i64,
     pub identity_est: f32,
+    /// Estimated full template-switch gap (bp): `2 × δ_best` where δ is the
+    /// symmetric half-shift that maximises arm identity.  Zero for clean
+    /// hairpin folds with no template switching.
+    pub gap_est: usize,
 }
 
 /// Refinement mode selection.

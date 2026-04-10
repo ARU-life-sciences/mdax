@@ -78,6 +78,10 @@ impl Default for MinimizerCfg {
 /// - `arm`: how much sequence from each side we compare (bp).
 /// - `mode`: selects error-profile assumptions / banding.
 /// - `max_ed_rate`: guardrail to reject extremely noisy/discordant candidates.
+/// - `max_jump_clip`: maximum template-jump to probe (bp). After finding the best
+///   split position, the refiner scans offsets δ = 0..max_jump_clip on the right arm
+///   to find the δ that maximises identity over the `arm − δ` aligned bases.
+///   A minimum effective arm of 100 bp is enforced to avoid noise at large δ.
 #[derive(Debug, Clone)]
 pub struct RefineCfg {
     /// Half-width of the local search window around the coarse split (bp).
@@ -88,15 +92,18 @@ pub struct RefineCfg {
     pub mode: RefineMode,
     /// Maximum tolerated edit-distance rate during refinement (fraction of bases).
     pub max_ed_rate: f32,
+    /// Maximum template-jump to probe during identity estimation (bp).
+    pub max_jump_clip: usize,
 }
 
 impl Default for RefineCfg {
     fn default() -> Self {
         Self {
             window: 200,
-            arm: 500,
+            arm: 1200,
             mode: RefineMode::HiFi,
             max_ed_rate: 0.25,
+            max_jump_clip: 1000,
         }
     }
 }
@@ -377,7 +384,7 @@ impl FairnessParams {
             // refinement (LOCKED)
             refine_mode: RefineMode::HiFi,
             refine_window: 200,
-            refine_arm: 500,
+            refine_arm: 1200,
             max_ed_rate: 0.25,
 
             // guards (LOCKED)
