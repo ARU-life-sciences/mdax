@@ -216,7 +216,7 @@ pub fn refine_breakpoint(
     if arm == cfg.refine.arm {
         // No clamping needed — avoid the clone on the hot path.
         return Ok(match cfg.refine.mode {
-            RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, cfg, span_hint, arm_end, arm_start_right),
+            RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, cfg, refine_scratch, span_hint, arm_end, arm_start_right),
             RefineMode::ONT  => refine_breakpoint_banded_ed(seq, s0, cfg, refine_scratch, span_hint),
         });
     }
@@ -224,7 +224,7 @@ pub fn refine_breakpoint(
     let mut clamped = cfg.clone();
     clamped.refine.arm = arm;
     Ok(match cfg.refine.mode {
-        RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, &clamped, span_hint, arm_end, arm_start_right),
+        RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, &clamped, refine_scratch, span_hint, arm_end, arm_start_right),
         RefineMode::ONT  => refine_breakpoint_banded_ed(seq, s0, &clamped, refine_scratch, span_hint),
     })
 }
@@ -242,6 +242,7 @@ pub fn refine_breakpoint_hamming(
     seq: &[u8],
     s0: usize,
     cfg: &SharedCfg,
+    scratch: &mut RefineScratch,
     span_hint: usize,
     arm_end: usize,
     arm_start_right: usize,
@@ -281,84 +282,38 @@ pub fn refine_breakpoint_hamming(
     //
     // Effective arm length = arm − δ (shrinks as δ grows).
     // MIN_EFF_ARM: minimum comparison length to keep the estimate stable.
-    // Two-stage scan: coarse at stride max_δ/200, then exhaustive ±stride.
-    const MIN_EFF_ARM: usize = 100;
-    let arm = cfg.refine.arm;
-    let max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(MIN_EFF_ARM));
-
-    // Evaluate Hamming identity at a symmetric half-gap offset δ.
-    // Bounds are guaranteed by the outer bounds-check: the window [split±arm]
-    // is already known to lie within the sequence.
-    let eval = |delta: usize| -> f32 {
-        let eff_arm = arm - delta;
-        let mut score = 0i64;
-        for i in 0..eff_arm {
-            let a = seq[best_s - delta - 1 - i];
-            let b = comp(seq[best_s + delta + i]);
-            if a == b { score += 1; } else { score -= 1; }
-        }
-        let m = ((score + eff_arm as i64) / 2).max(0) as usize;
-        m as f32 / eff_arm as f32
-    };
-
-    let base_ident = eval(0);
-    let mut best_delta = 0usize;
-    let mut best_ident  = base_ident;
-
-    if max_delta > 0 {
-        let stride = (max_delta / 200).max(1);
-
-        // Stage 1: coarse scan.
-        let mut coarse_best = 0usize;
-        for delta in (1..=max_delta).step_by(stride) {
-            let ident = eval(delta);
-            if ident > best_ident {
-                best_ident  = ident;
-                coarse_best = delta;
-                best_delta  = delta;
-            }
-        }
-
-        // Stage 2: exhaustive refine around the coarse best.
-        if coarse_best > 0 {
-            let lo = coarse_best.saturating_sub(stride).max(1);
-            let hi = (coarse_best + stride).min(max_delta);
-            for delta in lo..=hi {
-                let ident = eval(delta);
-                if ident > best_ident {
-                    best_ident = ident;
-                    best_delta = delta;
-                }
-            }
-        }
-    }
-
-    // ── identity via arm hint (direct placement) or banded ED (δ-shifted) ──────
+    // ── identity via arm hint (direct placement) or δ-scan (symmetric shift) ──
     //
     // When the minimizer chain provides valid arm boundaries and the gap
     // (arm_start_right - arm_end) exceeds the δ-scan ceiling, the δ-scan
     // cannot reach the true arm position and would measure identity inside the
-    // gap region instead.  In that case, place the comparison windows directly
-    // at the arm boundaries derived from the chain endpoints.
+    // gap region instead.  In that case, skip the δ-scan entirely and place
+    // the comparison windows directly at the arm boundaries from the chain.
     //
-    // For small/zero gaps (or when the hint is unavailable), the symmetric
-    // δ-shift approach is used unchanged.
+    // For small/zero gaps (or when the hint is unavailable), run the δ-scan.
+    const MIN_EFF_ARM: usize = 100;
+    let arm = cfg.refine.arm;
+    let max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(MIN_EFF_ARM));
+
     let gap_from_hint = arm_start_right.saturating_sub(arm_end);
-    // Use the same max_delta formula as the δ-scan so we know when the scan
-    // cannot reach the true arm position.
-    let actual_max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(100));
     let use_hint = arm_end > 0
         && arm_start_right > arm_end
-        && gap_from_hint > actual_max_delta * 2
+        && gap_from_hint > max_delta * 2
         && arm_end <= seq.len()
         && arm_start_right < seq.len();
+
+    // Cap the identity comparison window: 500 bp is more than sufficient for
+    // a statistically robust identity estimate (even at min_identity=0.6 we
+    // have ~300 informative positions, ≫ what's needed to distinguish classes).
+    // Capping reduces the banded-ED cost from O(arm²·rate) to O(cap²·rate).
+    const ID_WINDOW_CAP: usize = 500;
 
     let (id_left, id_right, final_gap_est) = if use_hint {
         // Direct arm placement: compare the innermost `id_window` bp of each arm.
         // Clamp to available sequence so neither window overruns the slice.
-        let id_window = arm.min(span_hint).max(1);
-        let avail_left  = arm_end.min(id_window);                          // left  window: seq[arm_end-avail_left .. arm_end]
-        let avail_right = seq.len().saturating_sub(arm_start_right).min(id_window); // right window: seq[arm_start_right .. arm_start_right+avail_right]
+        let id_window = arm.min(span_hint).min(ID_WINDOW_CAP).max(1);
+        let avail_left  = arm_end.min(id_window);
+        let avail_right = seq.len().saturating_sub(arm_start_right).min(id_window);
         let actual = avail_left.min(avail_right).max(1);
         (
             &seq[arm_end - actual .. arm_end],
@@ -366,9 +321,61 @@ pub fn refine_breakpoint_hamming(
             gap_from_hint,
         )
     } else {
-        // Symmetric δ-shift (existing behaviour).
+        // Symmetric δ-shift: scan for best gap estimate then compare arms.
+        //
+        // Two-stage scan: coarse at stride max_δ/200, then exhaustive ±stride.
+        // Evaluate Hamming identity at a symmetric half-gap offset δ.
+        // Bounds are guaranteed: the window [split±arm] lies within the sequence.
+        // Cap comparison to ID_WINDOW_CAP so the scan doesn't compare more bases
+        // than the final identity step needs; all delta values use the same cap
+        // so relative identities stay comparable across the scan.
+        let eval = |delta: usize| -> f32 {
+            let eff_arm = (arm - delta).min(ID_WINDOW_CAP);
+            let mut score = 0i64;
+            for i in 0..eff_arm {
+                let a = seq[best_s - delta - 1 - i];
+                let b = comp(seq[best_s + delta + i]);
+                if a == b { score += 1; } else { score -= 1; }
+            }
+            let m = ((score + eff_arm as i64) / 2).max(0) as usize;
+            m as f32 / eff_arm as f32
+        };
+
+        let base_ident = eval(0);
+        let mut best_delta = 0usize;
+        let mut best_ident  = base_ident;
+
+        if max_delta > 0 {
+            let stride = (max_delta / 200).max(1);
+
+            // Stage 1: coarse scan.
+            let mut coarse_best = 0usize;
+            for delta in (1..=max_delta).step_by(stride) {
+                let ident = eval(delta);
+                if ident > best_ident {
+                    best_ident  = ident;
+                    coarse_best = delta;
+                    best_delta  = delta;
+                }
+            }
+
+            // Stage 2: exhaustive refine around the coarse best.
+            if coarse_best > 0 {
+                let lo = coarse_best.saturating_sub(stride).max(1);
+                let hi = (coarse_best + stride).min(max_delta);
+                for delta in lo..=hi {
+                    let ident = eval(delta);
+                    if ident > best_ident {
+                        best_ident = ident;
+                        best_delta = delta;
+                    }
+                }
+            }
+        }
+        let _ = best_ident; // used only to drive the scan above
+
         let eff_arm = arm - best_delta;
-        let id_window = eff_arm.min(span_hint).max(1);
+        let id_window = eff_arm.min(span_hint).min(ID_WINDOW_CAP).max(1);
         (
             &seq[best_s - best_delta - id_window .. best_s - best_delta],
             &seq[best_s + best_delta .. best_s + best_delta + id_window],
@@ -376,12 +383,10 @@ pub fn refine_breakpoint_hamming(
         )
     };
 
-    let mut right_rc = Vec::with_capacity(id_right.len());
-    revcomp_into(&mut right_rc, id_right);
+    scratch.right_rc.clear();
+    revcomp_into(&mut scratch.right_rc, id_right);
     let band = ((cfg.refine.max_ed_rate * id_left.len() as f32).ceil() as usize).max(1);
-    let mut prev = Vec::new();
-    let mut curr = Vec::new();
-    let ed = banded_edit_distance_scratch(id_left, &right_rc, band, &mut prev, &mut curr);
+    let ed = banded_edit_distance_scratch(id_left, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr);
     let identity_est = if ed <= band {
         (1.0 - ed as f32 / id_left.len() as f32).clamp(0.0, 1.0)
     } else {

@@ -541,7 +541,9 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                     if let Some(fb) = fold {
                         num_foldbacks += 1;
 
-                        // Refine once for main call, optionally once more for stable sig coordinates
+                        // Refine once for main call, optionally once more for stable sig coordinates.
+                        // When mode is already HiFi, shared_fast == cfg.shared so we skip the
+                        // second call and reuse the first result directly.
                         let refined_call = foldback::refine_breakpoint(
                             &job.seq,
                             fb.split_pos,
@@ -552,15 +554,19 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                             fb.arm_start_right,
                         )?;
 
-                        let refined_sig = foldback::refine_breakpoint(
-                            &job.seq,
-                            fb.split_pos,
-                            &shared_fast,
-                            &mut fold_scratch.refine,
-                            fb.span,
-                            fb.arm_end,
-                            fb.arm_start_right,
-                        )?;
+                        let refined_sig = if cfg.shared.refine.mode == RefineMode::HiFi {
+                            refined_call.clone()
+                        } else {
+                            foldback::refine_breakpoint(
+                                &job.seq,
+                                fb.split_pos,
+                                &shared_fast,
+                                &mut fold_scratch.refine,
+                                fb.span,
+                                fb.arm_end,
+                                fb.arm_start_right,
+                            )?
+                        };
 
                         // When the user-mode refiner (e.g. ONT banded Levenshtein) returns
                         // None — typically because every candidate in the window exceeds the
