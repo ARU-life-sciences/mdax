@@ -1288,6 +1288,8 @@ fn main() -> Result<()> {
                             &cfg.shared,
                             &mut scratch.refine,
                             fb.span,
+                            fb.arm_end,
+                            fb.arm_start_right,
                         )
                         .ok()
                         .flatten() else {

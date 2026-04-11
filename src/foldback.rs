@@ -164,6 +164,14 @@ pub struct FoldBreakpoint {
     pub matches: usize,
     /// Span of forward positions supporting the foldback (proxy for arm length).
     pub span: usize,
+    /// Estimated end of the left arm (exclusive) in read coordinates.
+    /// Derived from the rightmost forward minimizer position + k.
+    /// Zero if unavailable.
+    pub arm_end: usize,
+    /// Estimated start of the right arm (inclusive) in read coordinates.
+    /// Derived from the leftmost right-arm minimizer position.
+    /// Zero if unavailable.
+    pub arm_start_right: usize,
 }
 
 /// Refine a coarse foldback breakpoint into a more precise split position.
@@ -172,6 +180,12 @@ pub struct FoldBreakpoint {
 /// (typically `fb.span`).  It is used to limit the identity comparison window
 /// so that identity reflects only the palindromic region rather than being
 /// diluted by unrelated sequence beyond the arm.  Pass `usize::MAX` to disable.
+///
+/// `arm_end` and `arm_start_right` are the minimizer-chain arm boundary estimates
+/// from the coarse detector (`fb.arm_end`, `fb.arm_start_right`).  When the gap
+/// between them exceeds the δ-scan ceiling, the identity comparison is placed
+/// directly at the arm boundaries rather than using the symmetric δ-shift.
+/// Pass `0, 0` to disable (falls back to δ-shift behaviour).
 ///
 /// The configured arm is clamped to the sequence space available around `s0`
 /// (keeping `window` bp clear on each side), so reads whose split sits close
@@ -183,6 +197,8 @@ pub fn refine_breakpoint(
     cfg: &SharedCfg,
     refine_scratch: &mut RefineScratch,
     span_hint: usize,
+    arm_end: usize,
+    arm_start_right: usize,
 ) -> Result<Option<Refined>> {
     let n = seq.len();
     let w = cfg.refine.window;
@@ -200,7 +216,7 @@ pub fn refine_breakpoint(
     if arm == cfg.refine.arm {
         // No clamping needed — avoid the clone on the hot path.
         return Ok(match cfg.refine.mode {
-            RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, cfg, span_hint),
+            RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, cfg, span_hint, arm_end, arm_start_right),
             RefineMode::ONT  => refine_breakpoint_banded_ed(seq, s0, cfg, refine_scratch, span_hint),
         });
     }
@@ -208,7 +224,7 @@ pub fn refine_breakpoint(
     let mut clamped = cfg.clone();
     clamped.refine.arm = arm;
     Ok(match cfg.refine.mode {
-        RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, &clamped, span_hint),
+        RefineMode::HiFi => refine_breakpoint_hamming(seq, s0, &clamped, span_hint, arm_end, arm_start_right),
         RefineMode::ONT  => refine_breakpoint_banded_ed(seq, s0, &clamped, refine_scratch, span_hint),
     })
 }
@@ -222,7 +238,14 @@ pub fn refine_breakpoint(
 /// Scoring is Hamming-like: +1 for match, −1 for mismatch.
 ///
 /// This assumes low indel rates and is therefore **not suitable for ONT data**.
-pub fn refine_breakpoint_hamming(seq: &[u8], s0: usize, cfg: &SharedCfg, span_hint: usize) -> Option<Refined> {
+pub fn refine_breakpoint_hamming(
+    seq: &[u8],
+    s0: usize,
+    cfg: &SharedCfg,
+    span_hint: usize,
+    arm_end: usize,
+    arm_start_right: usize,
+) -> Option<Refined> {
     let mut best_s = s0;
     let mut best_score: i64 = i64::MIN;
 
@@ -310,24 +333,72 @@ pub fn refine_breakpoint_hamming(seq: &[u8], s0: usize, cfg: &SharedCfg, span_hi
         }
     }
 
-    // ── span-limited identity ─────────────────────────────────────────────────
-    // Compare only as far as the coarse detector's arm span estimate, so identity
-    // reflects the palindromic region rather than unrelated sequence beyond it.
-    let eff_arm = arm - best_delta;
-    let id_window = eff_arm.min(span_hint).max(1);
-    let mut matches = 0i64;
-    for i in 0..id_window {
-        let a = seq[best_s - best_delta - 1 - i];
-        let b = comp(seq[best_s + best_delta + i]);
-        if a == b { matches += 1; }
-    }
-    let identity_est = matches as f32 / id_window as f32;
+    // ── identity via arm hint (direct placement) or banded ED (δ-shifted) ──────
+    //
+    // When the minimizer chain provides valid arm boundaries and the gap
+    // (arm_start_right - arm_end) exceeds the δ-scan ceiling, the δ-scan
+    // cannot reach the true arm position and would measure identity inside the
+    // gap region instead.  In that case, place the comparison windows directly
+    // at the arm boundaries derived from the chain endpoints.
+    //
+    // For small/zero gaps (or when the hint is unavailable), the symmetric
+    // δ-shift approach is used unchanged.
+    let gap_from_hint = arm_start_right.saturating_sub(arm_end);
+    // Use the same max_delta formula as the δ-scan so we know when the scan
+    // cannot reach the true arm position.
+    let actual_max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(100));
+    let use_hint = arm_end > 0
+        && arm_start_right > arm_end
+        && gap_from_hint > actual_max_delta * 2
+        && arm_end <= seq.len()
+        && arm_start_right < seq.len();
+
+    let (id_left, id_right, final_gap_est) = if use_hint {
+        // Direct arm placement: compare the innermost `id_window` bp of each arm.
+        // Clamp to available sequence so neither window overruns the slice.
+        let id_window = arm.min(span_hint).max(1);
+        let avail_left  = arm_end.min(id_window);                          // left  window: seq[arm_end-avail_left .. arm_end]
+        let avail_right = seq.len().saturating_sub(arm_start_right).min(id_window); // right window: seq[arm_start_right .. arm_start_right+avail_right]
+        let actual = avail_left.min(avail_right).max(1);
+        (
+            &seq[arm_end - actual .. arm_end],
+            &seq[arm_start_right .. arm_start_right + actual],
+            gap_from_hint,
+        )
+    } else {
+        // Symmetric δ-shift (existing behaviour).
+        let eff_arm = arm - best_delta;
+        let id_window = eff_arm.min(span_hint).max(1);
+        (
+            &seq[best_s - best_delta - id_window .. best_s - best_delta],
+            &seq[best_s + best_delta .. best_s + best_delta + id_window],
+            best_delta * 2,
+        )
+    };
+
+    let mut right_rc = Vec::with_capacity(id_right.len());
+    revcomp_into(&mut right_rc, id_right);
+    let band = ((cfg.refine.max_ed_rate * id_left.len() as f32).ceil() as usize).max(1);
+    let mut prev = Vec::new();
+    let mut curr = Vec::new();
+    let ed = banded_edit_distance_scratch(id_left, &right_rc, band, &mut prev, &mut curr);
+    let identity_est = if ed <= band {
+        (1.0 - ed as f32 / id_left.len() as f32).clamp(0.0, 1.0)
+    } else {
+        // Band exceeded; Hamming lower bound.
+        let n = id_left.len();
+        let mut matches = 0i64;
+        for i in 0..n {
+            if id_left[n - 1 - i] == comp(id_right[i]) { matches += 1; }
+        }
+        matches as f32 / n as f32
+    };
 
     Some(Refined {
         split_pos: best_s,
         score: best_score,
         identity_est,
-        gap_est: best_delta * 2,
+        gap_est: final_gap_est,
     })
 }
 
@@ -870,6 +941,7 @@ fn fold_breakpoint_from_pts(
         return None;
     }
 
+    let k_i32 = shared.minimizer.k as i32;
     let p1_min = chain.first().unwrap().0 as i64;
     let p1_max = chain.last().unwrap().0 as i64;
     let span = (p1_max - p1_min).max(0) as usize;
@@ -884,7 +956,6 @@ fn fold_breakpoint_from_pts(
     // the arm and give a more accurate estimate than far-from-junction points.
     // Weighting by 1/max(|p1-p2|, k) emphasises these near-junction matches
     // without discarding far matches entirely.
-    let k_i32 = shared.minimizer.k as i32;
     let (weight_sum, weighted_d_sum) = chain.iter().fold(
         (0.0f64, 0.0f64),
         |(ws, wds), &(p1, p2)| {
@@ -903,12 +974,49 @@ fn fold_breakpoint_from_pts(
         return None;
     }
 
+    // Arm boundary estimates from junction-proximal (type-1) chain entries.
+    //
+    // The chain can contain two types of matchpoints on the same anti-diagonal:
+    //   Type-1: p1 in left arm (< split), p2 in right arm (> split) — the real matches
+    //   Type-2: p1 in right arm (> split), p2 in left arm (< split) — cross-matches
+    //
+    // For a read with a large gap, type-2 cross-matches will have p1 near the right
+    // arm END and p2 near the left arm START, making chain.last() a type-2 entry.
+    // Using chain.last() would give arm_end ≈ read_end and arm_start_right ≈ read_start,
+    // collapsing to gap_from_hint = 0.
+    //
+    // Instead, filter to type-1 entries (p1 < split, p2 > split) and take the
+    // maximum p1 (closest to junction from left) and minimum p2 (closest from right).
+    let split_i32 = split_u as i32;
+    let mut p1_max_t1 = -1i32;
+    let mut p2_min_t1 = i32::MAX;
+    for &(p1, p2) in &chain {
+        if p1 < split_i32 && p2 > split_i32 {
+            if p1 > p1_max_t1 { p1_max_t1 = p1; }
+            if p2 < p2_min_t1 { p2_min_t1 = p2; }
+        }
+    }
+    // If no type-1 entries exist (very short arm or degenerate chain), fall back
+    // to type-2 chain.last() interpretation (arm_end=0 sentinel disables hint).
+    let arm_end = if p1_max_t1 >= 0 {
+        (p1_max_t1 as i64 + k_i32 as i64).max(0) as usize
+    } else {
+        0
+    };
+    let arm_start_right = if p2_min_t1 < i32::MAX {
+        p2_min_t1.max(0) as usize
+    } else {
+        0
+    };
+
     let score = span as i64 + (chain.len() as i64 * 10);
     Some(FoldBreakpoint {
         split_pos: split_u,
         score,
         matches: chain.len(),
         span,
+        arm_end,
+        arm_start_right,
     })
 }
 
@@ -953,14 +1061,16 @@ pub fn recursive_foldback_cut_from_first_range(
         // --- 1) detect foldback (skip for first iteration) ---
         let fb = match fb_opt.take() {
             Some(mut fb) => {
-                // Convert full-coord split into view-local coord if needed.
-                // (If keep.start==0, this is a no-op.)
+                // Convert full-coord positions into view-local coords.
+                // (If keep.start==0, these are no-ops.)
                 if fb.split_pos >= keep.start {
                     fb.split_pos -= keep.start;
                 } else {
                     // If inconsistent, bail rather than panic.
                     break;
                 }
+                fb.arm_end = fb.arm_end.saturating_sub(keep.start);
+                fb.arm_start_right = fb.arm_start_right.saturating_sub(keep.start);
                 fb
             }
             None => match detect_foldback(view, &cfg.shared, &cfg.fold, scratch) {
@@ -980,7 +1090,15 @@ pub fn recursive_foldback_cut_from_first_range(
                 rf
             }
             None => {
-                match refine_breakpoint(view, fb.split_pos, &cfg.shared, &mut scratch.refine, fb.span)? {
+                match refine_breakpoint(
+                    view,
+                    fb.split_pos,
+                    &cfg.shared,
+                    &mut scratch.refine,
+                    fb.span,
+                    fb.arm_end,
+                    fb.arm_start_right,
+                )? {
                     Some(rf) => rf,
                     None => break,
                 }
@@ -1195,7 +1313,7 @@ mod tests {
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
         let refine_scratch = &mut RefineScratch::default();
 
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span)
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span, coarse.arm_end, coarse.arm_start_right)
             .unwrap()
             .unwrap();
 
@@ -1215,7 +1333,7 @@ mod tests {
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch).unwrap();
         let refine_scratch = &mut RefineScratch::default();
 
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span)
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span, coarse.arm_end, coarse.arm_start_right)
             .unwrap()
             .expect("should refine");
 
@@ -1248,10 +1366,10 @@ mod tests {
         let refine_scratch = &mut RefineScratch::default();
 
         shared.refine.mode = RefineMode::HiFi;
-        let hifi = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span).unwrap();
+        let hifi = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span, coarse.arm_end, coarse.arm_start_right).unwrap();
 
         shared.refine.mode = RefineMode::ONT;
-        let ont = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span)
+        let ont = refine_breakpoint(&s, coarse.split_pos, &shared, refine_scratch, coarse.span, coarse.arm_end, coarse.arm_start_right)
             .unwrap()
             .unwrap();
 
@@ -1288,7 +1406,7 @@ mod tests {
         let coarse = detect_foldback(&s, &shared, &fold, &mut scratch)
             .expect("detect_foldback should succeed on a clean random foldback");
 
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, &mut scratch.refine, coarse.span)
+        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, &mut scratch.refine, coarse.span, coarse.arm_end, coarse.arm_start_right)
             .unwrap()
             .expect("refine should succeed");
 
@@ -1339,7 +1457,7 @@ mod tests {
 
         let fb = detect_foldback(&seq, &shared, &fold, &mut scratch)
             .expect("clean palindrome should be detected");
-        let rf = refine_breakpoint(&seq, fb.split_pos, &shared, &mut scratch.refine, fb.span)
+        let rf = refine_breakpoint(&seq, fb.split_pos, &shared, &mut scratch.refine, fb.span, fb.arm_end, fb.arm_start_right)
             .unwrap()
             .expect("clean palindrome should refine");
 
@@ -1366,7 +1484,7 @@ mod tests {
 
         let fb = detect_foldback(&seq, &shared, &fold, &mut scratch)
             .expect("gapped palindrome should be detected");
-        let rf = refine_breakpoint(&seq, fb.split_pos, &shared, &mut scratch.refine, fb.span)
+        let rf = refine_breakpoint(&seq, fb.split_pos, &shared, &mut scratch.refine, fb.span, fb.arm_end, fb.arm_start_right)
             .unwrap()
             .expect("gapped palindrome should refine");
 
@@ -1391,7 +1509,7 @@ mod tests {
 
         let fb = detect_foldback(&seq, &shared, &fold, &mut scratch)
             .expect("noisy palindrome should be detected");
-        let rf = refine_breakpoint(&seq, fb.split_pos, &shared, &mut scratch.refine, fb.span)
+        let rf = refine_breakpoint(&seq, fb.split_pos, &shared, &mut scratch.refine, fb.span, fb.arm_end, fb.arm_start_right)
             .unwrap()
             .expect("noisy palindrome should refine");
 

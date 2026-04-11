@@ -243,6 +243,8 @@ pub fn pass1_build_support<P: AsRef<Path>>(
                             &shared_fast,
                             &mut fold_scratch.refine,
                             fb.span,
+                            fb.arm_end,
+                            fb.arm_start_right,
                         )?
                         else {
                             continue;
@@ -546,6 +548,8 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                             &cfg.shared,
                             &mut fold_scratch.refine,
                             fb.span,
+                            fb.arm_end,
+                            fb.arm_start_right,
                         )?;
 
                         let refined_sig = foldback::refine_breakpoint(
@@ -554,6 +558,8 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                             &shared_fast,
                             &mut fold_scratch.refine,
                             fb.span,
+                            fb.arm_end,
+                            fb.arm_start_right,
                         )?;
 
                         // When the user-mode refiner (e.g. ONT banded Levenshtein) returns
