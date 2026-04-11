@@ -1142,8 +1142,13 @@ pub fn recursive_foldback_cut_from_first_range(
             break;
         }
 
-        // artefact -> cut left (i.e., keep prefix of current view)
-        let split = rf.split_pos.min(view.len());
+        // artefact -> cut left (i.e., keep prefix of current view).
+        //
+        // `rf.split_pos` is the anti-diagonal midpoint (≈ true_junction + gap/2).
+        // The gap is part of the original molecule, so we advance past it to cut
+        // at the start of the RC duplicate: split_pos + gap_est/2 ≈ arm_start_right.
+        // For clean hairpins gap_est ≈ 0 so behaviour is unchanged.
+        let split = (rf.split_pos + rf.gap_est / 2).min(view.len());
         keep.end = keep.start + split;
 
         // next iteration will detect/refine on the shortened view

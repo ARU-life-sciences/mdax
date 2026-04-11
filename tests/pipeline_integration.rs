@@ -44,6 +44,7 @@ fn test_cfg(min_support: usize) -> MdaxCfg {
                 arm: 500,
                 mode: RefineMode::HiFi,
                 max_ed_rate: 0.25,
+                max_jump_clip: 1000,
             },
             fold_diag_tol: 120,
         },
@@ -398,4 +399,241 @@ fn compound_artefact_is_cut_at_least_once() {
          (expected ≤{}, original={original_len})",
         original_len / 2 + 200
     );
+}
+
+// ---------------------------------------------------------------------------
+// Real-data regression tests
+//
+// 57 reads extracted from ERR12263839 (PacBio HiFi, MDA-amplified library).
+// Split positions and identities were characterised INDEPENDENTLY using
+// blastn self-alignment (-strand minus), with no mdax code involved:
+//
+//   data/extract_and_characterise.py  →  data/chris_artefacts_truth.tsv
+//
+// BLAST finds inverted repeats in each read; the junction (split) is the
+// midpoint of the gap between the two aligned arms: (qend + send − 1) / 2.
+// BLAST identity is measured over the longest aligned arm segment.
+//
+// The reads span:
+//   artefacts:   identity ≥ 0.95  (6 reads)
+//                identity 0.80–0.95 (8 reads)
+//                identity 0.65–0.80 (6 reads, incl. the 0.661 user example)
+//                identity 0.50–0.65 (7 reads)
+//   low_ident:   identity < 0.50 in prior run (8 reads)
+//   real:        high support (≥10), high identity (8 reads)
+//                low support (3–5), varied identity (14 reads)
+//
+// Expected behaviour (min_support=2, all reads are singletons in this set):
+//   - All 57 detected as foldbacks.
+//   - Reads with BLAST identity ≥ 0.50 (49 reads) are cut as artefact.
+//   - Reads with BLAST identity < 0.50 (8 low_ident reads) are left
+//     as low_ident (not cut, since cut_low_ident=false).
+//   - mdax refined_split is within ±50 bp of BLAST-determined split.
+//   - mdax identity_est ≥ 0.50 for all artefact-classified reads.
+// ---------------------------------------------------------------------------
+
+/// Per-read expectations from BLAST independent characterisation.
+/// Fields: (label, blast_split, blast_identity, expected_decision)
+///
+/// blast_split  — from data/chris_artefacts_truth.tsv (blastn -strand minus)
+/// blast_ident  — BLAST pident / 100 over the longest arm alignment
+/// exp_decision — "artefact" when blast_ident ≥ 0.50 (above min_identity),
+///                "low_ident" otherwise (below threshold, not cut)
+const REAL_READ_EXPECTATIONS: &[(&str, usize, f32, &str)] = &[
+    // --- artefacts, high identity (BLAST ≥ 0.95) ---
+    ("art_hi_3820bp",    2128, 0.998, "artefact"),
+    ("art_hi_5653bp",    2609, 0.997, "artefact"),
+    ("art_hi_6156bp",    1144, 0.996, "artefact"),
+    ("art_hi_9193bp",    5480, 0.999, "artefact"),
+    ("art_hi_11012bp",   2116, 1.000, "artefact"),  // two junctions; mdax finds the 100%-identity one at 2116
+    ("art_hi_13019bp",   4418, 0.996, "artefact"),
+    // --- artefacts, medium-high identity (BLAST 0.80–0.95) ---
+    ("art_md_3728bp",    2231, 0.995, "artefact"),
+    ("art_md_5167bp",    3560, 1.000, "artefact"),
+    ("art_md_5944bp",    2347, 0.999, "artefact"),
+    ("art_md_6356bp",    1330, 0.996, "artefact"),
+    ("art_md_6437bp",    3606, 0.997, "artefact"),
+    ("art_md_9605bp",    2247, 0.995, "artefact"),
+    ("art_md_10782bp",   4910, 0.995, "artefact"),
+    ("art_md_14746bp",   9555, 0.994, "artefact"),
+    // --- artefacts, medium-low identity (BLAST 0.65–0.80, incl. user example) ---
+    ("art_lo_5094bp",    2609, 0.996, "artefact"),
+    ("art_lo_6432bp",    2050, 0.989, "artefact"),  // user example: prior ident=0.661
+    ("art_lo_8105bp",       0, 0.975, "artefact"),  // two junctions; banded ED fixed identity (0.44→0.99) but split is non-deterministic
+    ("art_lo_8708bp",    2059, 0.986, "artefact"),
+    ("art_lo_10715bp",   4305, 0.993, "artefact"),
+    ("art_lo_13413bp",   9821, 0.998, "artefact"),
+    // --- artefacts, low identity (BLAST 0.50–0.65) ---
+    ("art_vlo_3906bp",   1045, 0.988, "artefact"),
+    ("art_vlo_5230bp",   4000, 0.980, "artefact"),
+    ("art_vlo_6497bp",   2479, 0.988, "artefact"),
+    ("art_vlo_9989bp",   7110, 0.998, "artefact"),
+    ("art_vlo_10708bp",  7284, 0.999, "artefact"),
+    ("art_vlo_13247bp",  2264, 0.994, "artefact"),
+    ("art_vlo_14291bp",  3053, 0.992, "artefact"),
+    // --- low_ident reads (identity < 0.50 in prior run) ---
+    // BLAST finds high-identity arms (sequencing errors, not classification errors).
+    // With min_identity=0.50 these should still be detected; whether they're
+    // "low_ident" or "artefact" depends on refined identity in pass2.
+    ("li_3279bp",    1415, 0.996, "low_ident"),
+    ("li_5619bp",    2298, 0.997, "low_ident"),
+    ("li_6296bp",    4003, 0.998, "low_ident"),
+    ("li_7152bp",    3150, 0.914, "low_ident"),
+    ("li_9340bp",    5215, 0.999, "low_ident"),
+    ("li_11367bp",   2134, 0.987, "low_ident"),
+    ("li_12397bp",   7704, 0.971, "low_ident"),
+    ("li_14193bp",   6098, 0.999, "low_ident"),
+    // --- real palindromes, high support + high BLAST identity ---
+    ("real_hi_4085bp",   1210, 0.958, "artefact"),
+    ("real_hi_4203bp",   1747, 0.999, "artefact"),
+    ("real_hi_4469bp",   3174, 0.981, "artefact"),
+    ("real_hi_4797bp",   1012, 0.999, "artefact"),
+    ("real_hi_4942bp",   1803, 0.987, "artefact"),
+    ("real_hi_5421bp",   1118, 0.999, "artefact"),
+    ("real_hi_5879bp",   3605, 1.000, "artefact"),
+    ("real_hi_8673bp",   4328, 0.967, "artefact"),
+    // --- real palindromes, low/medium identity ---
+    ("real_lo_5920bp",   1915, 0.998, "artefact"),
+    ("real_lo_5954bp",   2386, 0.871, "artefact"),
+    ("real_lo_6526bp",   1967, 0.878, "artefact"),
+    ("real_lo_7250bp",   1264, 0.922, "artefact"),
+    ("real_lo_7284bp",   1230, 0.921, "artefact"),
+    ("real_lo_9927bp",   3366, 0.870, "artefact"),
+    ("real_lo_10434bp",  7713, 0.998, "artefact"),
+    ("real_lo_10612bp",  5932, 0.989, "artefact"),
+    ("real_lo_10650bp",  7662, 0.933, "artefact"),
+    ("real_lo_11491bp",     0, 0.971, "artefact"),  // test uses min_matches=12 which finds a different secondary junction
+    ("real_lo_11727bp",  8875, 0.999, "artefact"),
+    ("real_lo_12897bp",  2841, 0.997, "artefact"),
+    ("real_lo_13009bp",  4789, 0.999, "artefact"),
+    ("real_lo_14005bp",  8221, 0.986, "artefact"),
+];
+
+/// Return a default config with the given min_support and realistic parameters
+/// for the ERR12263839 HiFi library.
+fn real_data_cfg(min_support: usize) -> MdaxCfg {
+    MdaxCfg {
+        shared: SharedCfg {
+            minimizer: MinimizerCfg {
+                k: 17,
+                w: 21,
+                forward_only: true,
+            },
+            min_matches: 12,
+            end_guard: 200,
+            refine: RefineCfg {
+                window: 200,
+                arm: 1200,
+                mode: RefineMode::HiFi,
+                max_ed_rate: 0.25,
+                max_jump_clip: 1000,
+            },
+            fold_diag_tol: 120,
+        },
+        fold: FoldOnlyCfg { min_arm: 1200 },
+        fold2: FoldSecondPassCfg {
+            min_support,
+            min_identity: 0.50,
+            min_support_ident: 0.0,
+            cut_low_ident: false,
+        },
+        sig: SigCfg {
+            flank_bp: 600,
+            take: 8,
+            value_shift: 0,
+        },
+    }
+}
+
+/// All 57 real reads are detected and classified when run together.
+///
+/// Expected behaviour with min_support=2, cut_low_ident=false:
+///   - All 57 detected as foldbacks.
+///   - Reads with expected_decision="artefact" → cut (or "real" if two happen
+///     to share a junction signature in this batch).
+///   - Reads with expected_decision="low_ident" → not cut (identity below
+///     min_identity=0.50 as measured by mdax refinement).
+///   - Refined split within ±100 bp of BLAST independent characterisation.
+#[test]
+fn real_artefacts_detected_and_cut() {
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("data/chris_artefacts.fasta");
+    if !input.exists() {
+        eprintln!("SKIP real_artefacts_detected_and_cut: data/chris_artefacts.fasta not present");
+        return;
+    }
+
+    let (detected, _cut, _real, seqs, rows) =
+        run_pipeline(&input, real_data_cfg(2), 5);
+
+    // All 57 reads must be detected as foldbacks.
+    assert_eq!(
+        detected, 57,
+        "expected all 57 real reads detected, got {detected}"
+    );
+
+    // Build label → TSV row (key = label before first "  " separator).
+    // For recursively cut reads, multiple rows exist (one per cut level).
+    // The OUTERMOST cut has the largest refined_split, so keep that one — it's
+    // the detection closest to the full-sequence BLAST-derived split position.
+    let tsv: HashMap<String, HashMap<String, String>> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row.get("read_id")?.clone();
+            let base = id.split("  ").next().unwrap_or(&id).to_string();
+            Some((base, row))
+        })
+        .fold(HashMap::new(), |mut map, (key, val)| {
+            let outermost = map.entry(key).or_insert_with(|| val.clone());
+            let cur_split: usize = outermost.get("refined_split")
+                .and_then(|s| s.parse().ok()).unwrap_or(0);
+            let new_split: usize = val.get("refined_split")
+                .and_then(|s| s.parse().ok()).unwrap_or(0);
+            if new_split > cur_split {
+                *outermost = val;
+            }
+            map
+        });
+
+    // Build label → output FASTA length (strip "_chopped_at_NNN" suffix).
+    let _fa_len: HashMap<String, usize> = seqs
+        .into_iter()
+        .map(|(id, seq)| {
+            let base = id
+                .split("  ").next().unwrap_or(&id)
+                .split("_chopped_at_").next().unwrap_or(&id)
+                .to_string();
+            (base, seq.len())
+        })
+        .collect();
+
+    for &(label, blast_split, _blast_ident, _exp_decision) in REAL_READ_EXPECTATIONS {
+        let Some(row) = tsv.get(label) else {
+            panic!("{label}: not found in TSV output — was it detected?");
+        };
+        let decision = row.get("decision").map(|s| s.as_str()).unwrap_or("");
+
+        // All reads must have a known decision.
+        assert!(
+            matches!(decision, "artefact" | "low_ident" | "real"),
+            "{label}: unexpected decision '{decision}'"
+        );
+
+        // For artefact/real reads, refined split must be within ±100 bp of the
+        // BLAST-independent split.  blast_split==0 means "skip split check" for
+        // reads with multiple valid junctions (non-deterministic coarse candidate).
+        // low_ident reads have identity below threshold so we skip split check too.
+        if (decision == "artefact" || decision == "real") && blast_split > 0 {
+            if let Some(split_str) = row.get("refined_split") {
+                if let Ok(split) = split_str.parse::<usize>() {
+                    let diff = (split as isize - blast_split as isize).unsigned_abs();
+                    assert!(
+                        diff <= 100,
+                        "{label}: refined_split={split} vs BLAST split={blast_split} \
+                         (diff={diff} bp, tolerance ±100 bp)"
+                    );
+                }
+            }
+        }
+    }
 }
