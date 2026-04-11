@@ -1054,9 +1054,17 @@ pub fn recursive_foldback_cut_from_first_range(
     let mut fb_opt = Some(first_fb);
     let mut rf_opt = Some(first_rf);
 
+    // `detect_end` is the upper bound passed to the recursive detector.
+    // It tracks the end of the true left arm (arm_end), which may be shorter
+    // than `keep.end` when a gap is present.  Keeping detection within the arm
+    // prevents the gap region — which can look reverse-complement similar to the
+    // arm — from triggering spurious secondary detections.
+    let mut detect_end = keep.end;
+
     for _ in 0..max_depth {
-        // View of the sequence we are currently considering
-        let view = &seq[keep.clone()];
+        // View of the sequence we are currently considering.
+        // Use `detect_end` (≤ keep.end) so recursive passes don't see the gap.
+        let view = &seq[keep.start..detect_end];
 
         // --- 1) detect foldback (skip for first iteration) ---
         let fb = match fb_opt.take() {
@@ -1144,12 +1152,16 @@ pub fn recursive_foldback_cut_from_first_range(
 
         // artefact -> cut left (i.e., keep prefix of current view).
         //
-        // `rf.split_pos` is the anti-diagonal midpoint (≈ true_junction + gap/2).
-        // The gap is part of the original molecule, so we advance past it to cut
-        // at the start of the RC duplicate: split_pos + gap_est/2 ≈ arm_start_right.
-        // For clean hairpins gap_est ≈ 0 so behaviour is unchanged.
-        let split = (rf.split_pos + rf.gap_est / 2).min(view.len());
-        keep.end = keep.start + split;
+        // `rf.split_pos` is the anti-diagonal midpoint (≈ arm_end + gap/2).
+        // Output boundary: advance past the gap to arm_start_right so the gap
+        // bases are retained in the kept read.
+        // Detection boundary: stop at arm_end so the gap region does not confuse
+        // the recursive detector on the next pass.
+        // For clean hairpins gap_est ≈ 0, so both boundaries equal split_pos.
+        let arm_end_view   = rf.split_pos.saturating_sub(rf.gap_est / 2);
+        let arm_start_view = (rf.split_pos + rf.gap_est / 2).min(view.len());
+        keep.end   = keep.start + arm_start_view;
+        detect_end = keep.start + arm_end_view;
 
         // next iteration will detect/refine on the shortened view
     }
