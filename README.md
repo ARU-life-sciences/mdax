@@ -423,42 +423,65 @@ Options:
 
 `--cut-low-ident` ensures reads detected as foldbacks are trimmed even when arm identity falls below the internal threshold (common in both MDA data types). For ONT, `--refine-mode ont` automatically uses smaller k-mers (k=11, w=11) for better sensitivity on error-prone reads — this is shown in the parameter summary at runtime.
 
-## Benchmarks
+## Tests and benchmarks
 
-Benchmarks are in `test_pal/` (ONT, ground-truth comparison) and `test_celegans/` (PacBio CCS, two real single-worm MDA samples).
+| Directory | Tool | Type | Data | README |
+|---|---|---|---|---|
+| `tests/` | `mdax` | Rust integration tests | 57 real HiFi reads + synthetic | [tests/README.md](tests/README.md) |
+| `test_pal/` | `mdax` | ONT comparison vs Strobl 2023 Perl baseline | 20k ONT reads (SRR24201687) | [test_pal/README.md](test_pal/README.md) |
+| `test_celegans/` | `mdax` | Real HiFi benchmark, two MDA samples | 200k reads × 2 *C. elegans* samples | [test_celegans/README.md](test_celegans/README.md) |
+| `irx_tests/` | `irx` | Synthetic ground-truth evaluation | ~120 planted IRs, seed 42 | [irx_tests/README.md](irx_tests/README.md) |
+| `data/` | both | Test data and generators | — | [data/README.md](data/README.md) |
 
-### test_pal — ONT reads, ground truth from Strobl et al. 2023 Perl baseline
+Test data for `test_pal/` and `test_celegans/` is not tracked in git (large files). See the per-directory READMEs for data accessions and how to reproduce runs.
 
-20k ONT reads (SRR24201687), 5203 baseline-positive reads.
+### Rust integration tests (`tests/`)
 
-| Configuration | Precision | Recall | F1 | Detected | Missed |
-|---|---|---|---|---|---|
-| `balanced --refine-mode hifi` (old default) | 1.000 | 0.009 | 0.018 | 3,374 | 1,835 |
-| `permissive --refine-mode ont --cut-low-ident` | **0.995** | **0.803** | **0.889** | **4,202** | 1,024 |
-
-Run with:
 ```bash
-cd test_pal && ./sweep.sh          # full parameter sweep (cached)
-cd test_pal && ./test_pal.sh       # single run with default flags
+cargo test
 ```
 
-### test_celegans — PacBio CCS, two single-worm MDA samples (200k reads each)
+Tests the full two-pass pipeline on synthetic and 57 real HiFi reads with BLAST-derived ground truth. All tests are deterministic and run in ~1 second.
 
-No ground truth; compares artefact rates between samples. Flags: `--cut-low-ident` (default in `benchmark.sh`).
+### ONT baseline comparison (`test_pal/`)
+
+20,000 ONT reads from SRR24201687; ground truth from Strobl et al. 2023.
+
+Metrics are generous (artefact + low_ident both counted as true positive).
+
+| Configuration | Precision | Recall | F1 |
+|---|---|---|---|
+| `balanced --refine-mode hifi` (default) | 0.998 | 0.647 | 0.785 |
+| `permissive --refine-mode ont --cut-low-ident` | **0.995** | **0.803** | **0.889** |
+
+```bash
+cd test_pal && ./test_pal.sh       # single run
+cd test_pal && ./sweep.sh          # parameter sweep (cached)
+```
+
+### *C. elegans* MDA benchmark (`test_celegans/`)
+
+Two real PacBio CCS single-worm MDA samples with contrasting BUSCO scores. No external ground truth; primary metric is artefact detection rate.
 
 | | nrCaeEleg92 (82.3% BUSCO) | nrCaeEleg95 (64.5% BUSCO) |
 |---|---|---|
 | Foldback detected | 85,508 (42.8%) | 77,249 (38.6%) |
-| → artefact cut | 85,456 (42.7%) | 77,205 (38.6%) |
-| → real palindrome | 52 | 44 |
-| Bases removed | 424 Gb | 398 Gb |
-| ~50% of each artefact read retained | 49.7% | 49.9% |
+| → artefact cut | 85,137 (42.6%) | 76,714 (38.4%) |
+| → real palindrome | 371 (0.2%) | 535 (0.3%) |
+| Bases removed | ~422 Mb | ~396 Mb |
+| Fraction of artefact read retained | ~49.8% | ~50.0% |
 
-Run with:
 ```bash
-cd test_celegans && ./benchmark.sh        # runs mdax + comparison report
-THREADS=16 ./benchmark.sh                 # with more threads
-MAX_READS=0 ./benchmark.sh                # process all reads (slow)
+cd test_celegans && ./benchmark.sh           # 200k reads per sample
+MAX_READS=0 THREADS=16 ./benchmark.sh       # all reads, 16 threads
+```
+
+### `irx` synthetic evaluation (`irx_tests/`)
+
+~120 synthetic IRs planted across scenario groups (asymmetric arms, diverged, edge cases, GC bias, etc.). Recovery is high for typical cases; drops for very short or highly-diverged IRs.
+
+```bash
+cd irx_tests && bash test_suite.bash
 ```
 
 ## Performance

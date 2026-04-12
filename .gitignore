@@ -1,7 +1,22 @@
 /target
 /old
 /CADECT
-/test_pal
-/test_celegans
-/irx_tests/beds
 /memory
+/chris_data
+/data/__pycache__/
+
+# test_pal: ignore raw full-run data and large outputs; track scripts, sweep cache, derived TSVs
+/test_pal/data/
+/test_pal/out/subsample/
+/test_pal/out/baseline/SRR24201687_first20k/*.fq.gz
+/test_pal/mdax.out.fa
+/test_pal/test
+
+# test_celegans: ignore large raw data and large benchmark outputs; track scripts, dotplots, summary
+/test_celegans/data/
+/test_celegans/out/*.fasta
+/test_celegans/out/*.out.fasta
+
+# irx_tests: ignore large synthetic FASTA (regenerable via make_test_suite.py)
+/irx_tests/beds/
+/irx_tests/irx_truth.fa
