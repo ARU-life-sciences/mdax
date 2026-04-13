@@ -152,11 +152,10 @@ pub fn banded_edit_distance_scratch(
 /// `b` (text, length m), returning the distance clamped to `band + 1`.
 ///
 /// Runs in O(⌈n/64⌉ · m) word operations — roughly 64× fewer inner-loop
-/// iterations than the scalar banded DP for typical HiFi windows (n = m ≤ 500).
+/// iterations than the scalar banded DP for typical n = m windows.
 ///
-/// For sequences longer than 512 bp this function falls back to
-/// `banded_edit_distance_scratch` via the caller; the fixed 8-word bitvector
-/// supports n ≤ 512.
+/// Works for any pattern length; the bitvector state is heap-allocated and
+/// grows with n.
 ///
 /// # Equations (per text character b[j])
 /// ```text
@@ -176,17 +175,14 @@ pub fn edit_distance_myers(a: &[u8], b: &[u8], band: usize) -> usize {
     if n == 0 { return m.min(band + 1); }
     if m == 0 { return n.min(band + 1); }
 
-    // Words needed: fixed at 8 (supports n ≤ 512).
-    // Callers must ensure n ≤ 512; use banded_edit_distance_scratch for larger n.
-    const W: usize = 8;
     let words = (n + 63) / 64;
-    debug_assert!(words <= W, "edit_distance_myers: n={n} exceeds 512-bit limit");
 
-    // Precompute PM[c][k] = word k of the match bitvector for pattern char c.
-    // 256 * 8 * 8 = 16 KB — allocated once per call.
-    let mut pm = vec![[0u64; W]; 256];
+    // Precompute PM: flat Vec indexed as pm[c * words + k] = word k of the
+    // match bitvector for pattern char c.  Only the 256 ASCII byte values
+    // are needed; DNA uses 5 of them.
+    let mut pm = vec![0u64; 256 * words];
     for (i, &c) in a.iter().enumerate() {
-        pm[c as usize][i >> 6] |= 1u64 << (i & 63);
+        pm[c as usize * words + (i >> 6)] |= 1u64 << (i & 63);
     }
 
     // Mask for the last word: zero out bits above position n-1.
@@ -197,16 +193,14 @@ pub fn edit_distance_myers(a: &[u8], b: &[u8], band: usize) -> usize {
 
     // DP state: Pv[k]/Mv[k] = positive/negative vertical difference bitvectors.
     // Initial state: all vertical deltas = +1 (column 0 values = 0,1,…,n).
-    let mut pv = [!0u64; W];
-    let mut mv = [0u64; W];
+    let mut pv = vec![!0u64; words];
+    let mut mv = vec![0u64; words];
     pv[hi_w] = last_mask;
-    // Zero out words beyond hi_w (they are not part of the pattern).
-    for k in words..W { pv[k] = 0; }
 
     let mut score = n;
 
     for (j, &bc) in b.iter().enumerate() {
-        let eq = &pm[bc as usize];
+        let eq = &pm[bc as usize * words .. bc as usize * words + words];
 
         // Single left-to-right pass per text character.
         // Carries thread state between words:
@@ -589,7 +583,7 @@ mod tests {
         assert_eq!(myers, banded, "multiword: myers={myers} banded={banded}");
     }
 
-    /// Longer sequence, exercises all 8 words (n = 500 bp).
+    /// Longer sequence (n = 500 bp).
     #[test]
     fn myers_500bp_matches_banded_ed() {
         let a: Vec<u8> = (0..500usize).map(|i| b"ACGT"[i % 4]).collect();
@@ -603,5 +597,21 @@ mod tests {
         let banded = banded_edit_distance_scratch(&a, &b, band, &mut prev, &mut curr);
         let myers  = edit_distance_myers(&a, &b, band);
         assert_eq!(myers, banded, "500bp: myers={myers} banded={banded}");
+    }
+
+    /// n > 512: exercises the heap-allocated multi-word path beyond the old fixed limit.
+    #[test]
+    fn myers_large_n_matches_banded_ed() {
+        let a: Vec<u8> = (0..1200usize).map(|i| b"ACGT"[i % 4]).collect();
+        let mut b = a.clone();
+        for &pos in &[10usize, 100, 300, 600, 900, 1100] {
+            b[pos] = if b[pos] == b'A' { b'T' } else { b'A' };
+        }
+        let band = 50;
+        let mut prev = Vec::new();
+        let mut curr = Vec::new();
+        let banded = banded_edit_distance_scratch(&a, &b, band, &mut prev, &mut curr);
+        let myers  = edit_distance_myers(&a, &b, band);
+        assert_eq!(myers, banded, "1200bp: myers={myers} banded={banded}");
     }
 }
