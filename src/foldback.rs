@@ -249,20 +249,49 @@ pub fn refine_breakpoint_hamming(
 ) -> Option<Refined> {
     let mut best_s = s0;
     let mut best_score: i64 = i64::MIN;
+    let arm = cfg.refine.arm;
 
-    for s in (s0 - cfg.refine.window)..=(s0 + cfg.refine.window) {
-        let l = &seq[s - cfg.refine.arm..s];
+    // Reformulate the inner loop to use forward-only indexing so the compiler
+    // can autovectorise it.
+    //
+    // Original: score += (l[arm-1-i] == comp(seq[s+i]))
+    //         = (comp(l[arm-1-i]) == seq[s+i])   (comp is self-inverse)
+    //         = (revcomp(l)[i]     == seq[s+i])
+    //
+    // We maintain revcomp(seq[s-arm..s]) in `scratch.left_rc`.  As s advances
+    // by 1 the new entry is comp(seq[s]) prepended; the last entry falls off:
+    //   left_rc[0..arm-1] = old left_rc[1..arm]
+    //   left_rc[arm-1]    = comp(seq[s])
+    // Implemented as a left-rotate of 1 + overwrite of the last element.
+    let s_start = s0 - cfg.refine.window;
+    revcomp_into(&mut scratch.left_rc, &seq[s_start - arm..s_start]);
+
+    for s in s_start..=(s0 + cfg.refine.window) {
+        // Update left_rc for this s: shift left by 1, append comp(seq[s-1]).
+        // (At s_start the buffer is already correct from the init above.)
+        if s > s_start {
+            // Shift right by 1: left_rc[1..arm] ← left_rc[0..arm-1].
+            // Prepend comp(seq[s-1]) at [0].
+            // After update: left_rc[i] = comp(seq[s-1-i])  ✓
+            scratch.left_rc.copy_within(0..arm - 1, 1);
+            scratch.left_rc[0] = comp(seq[s - 1]);
+        }
+
+        let right = &seq[s..s + arm];
+        let left_rc = &scratch.left_rc;
 
         let mut score: i64 = 0;
-        for i in 0..cfg.refine.arm {
-            // walk outward from junction on the left
-            let a = l[cfg.refine.arm - 1 - i];
-            // right arm: forward from junction, but we want RC, so just complement here
-            let b = comp(seq[s + i]);
-            if a == b {
+        for i in 0..arm {
+            // Forward-indexed comparison; both slices advance monotonically.
+            if left_rc[i] == right[i] {
                 score += 1;
             } else {
                 score -= 1;
+            }
+            // Early exit: remaining bases cannot beat best_score even if all match.
+            if score + (arm - 1 - i) as i64 <= best_score {
+                score = i64::MIN / 2; // mark as dead
+                break;
             }
         }
 
@@ -292,7 +321,7 @@ pub fn refine_breakpoint_hamming(
     //
     // For small/zero gaps (or when the hint is unavailable), run the δ-scan.
     const MIN_EFF_ARM: usize = 100;
-    let arm = cfg.refine.arm;
+    // `arm` was bound earlier for the split scan.
     let max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(MIN_EFF_ARM));
 
     let gap_from_hint = arm_start_right.saturating_sub(arm_end);
@@ -360,7 +389,8 @@ pub fn refine_breakpoint_hamming(
             }
 
             // Stage 2: exhaustive refine around the coarse best.
-            if coarse_best > 0 {
+            // Skip when stride==1: the coarse scan was already exhaustive.
+            if coarse_best > 0 && stride > 1 {
                 let lo = coarse_best.saturating_sub(stride).max(1);
                 let hi = (coarse_best + stride).min(max_delta);
                 for delta in lo..=hi {
@@ -470,15 +500,16 @@ pub fn refine_breakpoint_banded_ed(
     let arm = cfg.refine.arm;
     let max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(MIN_EFF_ARM));
 
-    let mut eval_ed = |delta: usize| -> f32 {
-        let left  = &seq[best_s - arm .. best_s - delta];
-        let right = &seq[best_s + delta .. best_s + arm];
-        revcomp_into(&mut scratch.right_rc, right);
-        let ed = banded_edit_distance_scratch(
-            left, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
-        );
-        if ed > band { return 0.0; }
+    // Pre-compute revcomp of the full right arm once.
+    // revcomp(seq[best_s+delta..best_s+arm]) is the prefix [0..arm-delta] of this.
+    revcomp_into(&mut scratch.right_rc, &seq[best_s..best_s + arm]);
+
+    let eval_ed = |delta: usize, right_rc: &[u8], prev: &mut Vec<usize>, curr: &mut Vec<usize>| -> f32 {
         let eff_arm = arm - delta;
+        let left     = &seq[best_s - arm .. best_s - delta];
+        let right_rc = &right_rc[..eff_arm];
+        let ed = banded_edit_distance_scratch(left, right_rc, band, prev, curr);
+        if ed > band { return 0.0; }
         (1.0 - (ed as f32 / eff_arm as f32)).clamp(0.0, 1.0)
     };
 
@@ -492,7 +523,7 @@ pub fn refine_breakpoint_banded_ed(
         // Stage 1: coarse scan.
         let mut coarse_best = 0usize;
         for delta in (1..=max_delta).step_by(stride) {
-            let ident = eval_ed(delta);
+            let ident = eval_ed(delta, &scratch.right_rc, &mut scratch.prev, &mut scratch.curr);
             if ident > best_ident {
                 best_ident  = ident;
                 coarse_best = delta;
@@ -501,11 +532,12 @@ pub fn refine_breakpoint_banded_ed(
         }
 
         // Stage 2: exhaustive refine around the coarse best.
-        if coarse_best > 0 {
+        // Skip when stride==1: the coarse scan was already exhaustive.
+        if coarse_best > 0 && stride > 1 {
             let lo = coarse_best.saturating_sub(stride).max(1);
             let hi = (coarse_best + stride).min(max_delta);
             for delta in lo..=hi {
-                let ident = eval_ed(delta);
+                let ident = eval_ed(delta, &scratch.right_rc, &mut scratch.prev, &mut scratch.curr);
                 if ident > best_ident {
                     best_ident = ident;
                     best_delta = delta;
@@ -519,10 +551,11 @@ pub fn refine_breakpoint_banded_ed(
     let eff_arm = arm - best_delta;
     let id_window = eff_arm.min(span_hint).max(1);
     let left_short  = &seq[best_s - best_delta - id_window .. best_s - best_delta];
-    let right_short = &seq[best_s + best_delta .. best_s + best_delta + id_window];
-    revcomp_into(&mut scratch.right_rc, right_short);
+    // revcomp(seq[best_s+best_delta..best_s+best_delta+id_window]) is
+    // scratch.right_rc[arm-best_delta-id_window..arm-best_delta], already computed.
+    let right_rc_short = &scratch.right_rc[arm - best_delta - id_window .. arm - best_delta];
     let final_ed = banded_edit_distance_scratch(
-        left_short, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
+        left_short, right_rc_short, band, &mut scratch.prev, &mut scratch.curr,
     );
     let identity_est = if final_ed <= band {
         (1.0 - final_ed as f32 / id_window as f32).clamp(0.0, 1.0)
