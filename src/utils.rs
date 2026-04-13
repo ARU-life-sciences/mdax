@@ -83,7 +83,7 @@ pub fn banded_edit_distance_scratch(
     let m = b.len();
     let inf = band + 1;
 
-    // Ensure scratch rows are the right length and default-filled.
+    // Ensure scratch rows are the right length.
     prev.resize(m + 1, inf);
     curr.resize(m + 1, inf);
 
@@ -94,52 +94,55 @@ pub fn banded_edit_distance_scratch(
         prev[j] = if j <= band { j } else { inf };
     }
 
+    // Fill curr once before the loop.  Inside the loop we maintain the invariant
+    // with a single O(1) guard write per row instead of a full O(m) reset.
+    //
+    // Invariant: every cell of `curr` that could be read as `curr[j-1]` at the
+    // start of the inner loop (i.e. `curr[j_min - 1]`) is either:
+    //   (a) `curr[0]`, which is always set explicitly before the inner loop, or
+    //   (b) `curr[j_min - 1]` for j_min > 1, which is set to `inf` by the guard.
+    // All other cells in [j_min..j_max] are written before they are read because
+    // the loop advances left-to-right and `curr[j]` is written at step j before
+    // `curr[j]` is read as `curr[j-1]` at step j+1.
+    curr.fill(inf);
+
     for i in 1..=n {
-        // reset curr row to inf
-        for v in curr.iter_mut() {
-            *v = inf;
+        // Band limits: only cells j where |i - j| <= band are in scope.
+        let j_min = i.saturating_sub(band).max(1);
+        let j_max = (i + band).min(m);
+
+        // Guard: the insertion path at j = j_min reads curr[j_min - 1].  When
+        // j_min > 1 that cell is stale (written two rows ago); reset it to inf.
+        // curr[0] is always set explicitly below.
+        if j_min > 1 {
+            curr[j_min - 1] = inf;
         }
         curr[0] = if i <= band { i } else { inf };
 
-        // Compute the band limits for this row:
-        // only j where |i - j| <= band.
-        let i_is = i as isize;
-        let band_is = band as isize;
-        let j_min = (1isize.max(i_is - band_is)) as usize;
-        let j_max = (m as isize).min(i_is + band_is) as usize;
-
-        // Track the best value in the row so we can early-exit if the whole row exceeds `band`.
+        // Hoist the row-constant character lookup.
+        let ai = a[i - 1];
         let mut row_best = inf;
 
         for j in j_min..=j_max {
-            // Levenshtein cost: substitution is 0 if equal else 1.
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-
-            // Standard DP transitions:
-            // - deletion: drop a[i-1]
-            // - insertion: insert b[j-1]
-            // - substitution/match: align a[i-1] with b[j-1]
-            //
-            // Use saturating_add because values may be `inf` and we want to avoid overflow.
-
-            let del = prev[j].saturating_add(1);
-            let ins = curr[j - 1].saturating_add(1);
-            let sub = prev[j - 1].saturating_add(cost);
-
+            // Values are bounded by band + n (≤ ~625 for our 500 bp window),
+            // nowhere near usize overflow, so plain addition is safe.
+            let cost = usize::from(ai != b[j - 1]);
+            let del = prev[j] + 1;
+            let ins = curr[j - 1] + 1;
+            let sub = prev[j - 1] + cost;
             let v = del.min(ins).min(sub);
             curr[j] = v;
             row_best = row_best.min(v);
         }
 
-        // Early exit: if the best cell in this row is already > band, true distance must be > band.
+        // Early exit: if the best cell in this row already exceeds the band,
+        // the true edit distance must be > band.
         if row_best > band {
             return band + 1;
         }
 
-        // Roll the DP rows.
         std::mem::swap(prev, curr);
     }
-    // Return final distance, clamped at band+1.
     prev[m].min(band + 1)
 }
 
