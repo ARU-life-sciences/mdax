@@ -346,19 +346,27 @@ pub fn refine_breakpoint_hamming(
         let actual = avail_left.min(avail_right).max(1);
         let id_left  = &seq[arm_end - actual .. arm_end];
         let id_right = &seq[arm_start_right .. arm_start_right + actual];
-        // Hamming: id_left[i] vs revcomp(id_right)[i] = comp(id_right[actual-1-i])
+        scratch.right_rc.clear();
         revcomp_into(&mut scratch.right_rc, id_right);
-        let matches = id_left.iter().zip(scratch.right_rc.iter()).filter(|(a, b)| a == b).count();
-        (matches as f32 / actual as f32, gap_from_hint)
+        let band = ((cfg.refine.max_ed_rate * actual as f32).ceil() as usize).max(1);
+        let ed = banded_edit_distance_scratch(
+            id_left, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
+        );
+        let ident = if ed <= band {
+            (1.0 - ed as f32 / actual as f32).clamp(0.0, 1.0)
+        } else {
+            id_left.iter().zip(scratch.right_rc.iter()).filter(|(a, b)| a == b).count() as f32
+                / actual as f32
+        };
+        (ident, gap_from_hint)
     } else {
         // Recompute left_rc for best_s (the split scan left it for s_start+window).
         // left_rc[i] = comp(seq[best_s - 1 - i])  for i in 0..arm.
         // Enables forward-indexed comparison: left_rc[δ+i] == seq[best_s+δ+i].
         revcomp_into(&mut scratch.left_rc, &seq[best_s - arm .. best_s]);
 
-        // Symmetric δ-shift: scan for best gap estimate.
-        // eval(δ) = fraction of matches in left_rc[δ..δ+eff_arm] vs seq[best_s+δ..].
-        // Both slices advance monotonically — forward-indexed, autovectorisable.
+        // Symmetric δ-shift: scan for best gap estimate (Hamming, forward-indexed,
+        // autovectorisable). Only used to rank deltas, not for the final identity.
         let eval = |delta: usize, lrc: &[u8]| -> f32 {
             let eff_arm = (arm - delta).min(ID_WINDOW_CAP);
             let left_slice  = &lrc[delta .. delta + eff_arm];
@@ -401,13 +409,28 @@ pub fn refine_breakpoint_hamming(
         }
         let _ = best_ident; // used only to drive the scan above
 
-        // Final Hamming identity at best_delta with span_hint cap.
+        // Final identity: banded ED on capped window (≤ID_WINDOW_CAP bp).
+        // This is the key improvement over the original: previously banded ED
+        // ran on arm−δ bp (up to several kb); now it is always ≤500 bp.
         let eff_arm = arm - best_delta;
         let id_window = eff_arm.min(span_hint).min(ID_WINDOW_CAP).max(1);
-        let left_slice  = &scratch.left_rc[best_delta .. best_delta + id_window];
-        let right_slice = &seq[best_s + best_delta .. best_s + best_delta + id_window];
-        let matches = left_slice.iter().zip(right_slice).filter(|(a, b)| a == b).count();
-        (matches as f32 / id_window as f32, best_delta * 2)
+        let id_left  = &seq[best_s - best_delta - id_window .. best_s - best_delta];
+        let id_right = &seq[best_s + best_delta .. best_s + best_delta + id_window];
+        scratch.right_rc.clear();
+        revcomp_into(&mut scratch.right_rc, id_right);
+        let band = ((cfg.refine.max_ed_rate * id_window as f32).ceil() as usize).max(1);
+        let ed = banded_edit_distance_scratch(
+            id_left, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
+        );
+        let ident = if ed <= band {
+            (1.0 - ed as f32 / id_window as f32).clamp(0.0, 1.0)
+        } else {
+            // Band exceeded: Hamming lower bound using pre-computed left_rc.
+            let left_slice  = &scratch.left_rc[best_delta .. best_delta + id_window];
+            left_slice.iter().zip(id_right.iter()).filter(|(a, b)| a == b).count() as f32
+                / id_window as f32
+        };
+        (ident, best_delta * 2)
     };
 
     Some(Refined {
