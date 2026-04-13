@@ -43,7 +43,8 @@ use crate::fingerprint::{
 use crate::minimizer::sampled_minimizers_into;
 use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
 use crate::utils::{
-    RefineMode, Refined, banded_edit_distance_scratch, comp, div_floor, revcomp_into,
+    RefineMode, Refined, banded_edit_distance_scratch, comp, div_floor, edit_distance_myers,
+    revcomp_into,
 };
 use anyhow::Result;
 use gxhash::HashMap;
@@ -349,9 +350,7 @@ pub fn refine_breakpoint_hamming(
         scratch.right_rc.clear();
         revcomp_into(&mut scratch.right_rc, id_right);
         let band = ((cfg.refine.max_ed_rate * actual as f32).ceil() as usize).max(1);
-        let ed = banded_edit_distance_scratch(
-            id_left, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
-        );
+        let ed = edit_distance_myers(id_left, &scratch.right_rc, band);
         let ident = if ed <= band {
             (1.0 - ed as f32 / actual as f32).clamp(0.0, 1.0)
         } else {
@@ -409,9 +408,8 @@ pub fn refine_breakpoint_hamming(
         }
         let _ = best_ident; // used only to drive the scan above
 
-        // Final identity: banded ED on capped window (≤ID_WINDOW_CAP bp).
-        // This is the key improvement over the original: previously banded ED
-        // ran on arm−δ bp (up to several kb); now it is always ≤500 bp.
+        // Final identity: Myers' bit-parallel ED on capped window (≤ID_WINDOW_CAP bp).
+        // Window is always ≤512 bp, within the 8-word bitvector limit.
         let eff_arm = arm - best_delta;
         let id_window = eff_arm.min(span_hint).min(ID_WINDOW_CAP).max(1);
         let id_left  = &seq[best_s - best_delta - id_window .. best_s - best_delta];
@@ -419,9 +417,7 @@ pub fn refine_breakpoint_hamming(
         scratch.right_rc.clear();
         revcomp_into(&mut scratch.right_rc, id_right);
         let band = ((cfg.refine.max_ed_rate * id_window as f32).ceil() as usize).max(1);
-        let ed = banded_edit_distance_scratch(
-            id_left, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
-        );
+        let ed = edit_distance_myers(id_left, &scratch.right_rc, band);
         let ident = if ed <= band {
             (1.0 - ed as f32 / id_window as f32).clamp(0.0, 1.0)
         } else {
