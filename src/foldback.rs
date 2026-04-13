@@ -624,6 +624,11 @@ pub fn detect_foldback(
         &mut scratch.val_f,
     );
 
+    // Early exit before the more expensive RC minimizer computation.
+    if scratch.pos_f.len() < shared.min_matches {
+        return None;
+    }
+
     revcomp_into(&mut scratch.rc, seq);
 
     sampled_minimizers_into(
@@ -638,7 +643,7 @@ pub fn detect_foldback(
     let pos_rc = &scratch.pos_rc;
     let val_rc = &scratch.val_rc;
 
-    if pos_f.len() < shared.min_matches || pos_rc.len() < shared.min_matches {
+    if pos_rc.len() < shared.min_matches {
         return None;
     }
 
