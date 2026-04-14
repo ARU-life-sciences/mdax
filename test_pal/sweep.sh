@@ -147,11 +147,9 @@ GROUP="${1:-all}"
 
 SUMMARY_TSV="$SCRIPT_DIR/sweep_summary.tsv"
 
-# Write/overwrite header when running a full sweep or being called fresh
-if [[ "$GROUP" == "all" ]]; then
-    printf "tag\tstrict_P\tstrict_R\tstrict_F1\tstrict_J\tgenerous_P\tgenerous_R\tgenerous_F1\tgenerous_J\tdetected\tartefact\tlow_ident\treal\tmissed\n" \
-        > "$SUMMARY_TSV"
-fi
+# Always write/overwrite header so sweep_summary.tsv is always valid
+printf "tag\tstrict_P\tstrict_R\tstrict_F1\tstrict_J\tgenerous_P\tgenerous_R\tgenerous_F1\tgenerous_J\tdetected\tartefact\tlow_ident\treal\tmissed\n" \
+    > "$SUMMARY_TSV"
 
 _print_header() {
     printf "%-40s  %5s %5s %5s %5s  |  %5s %5s %5s %5s  | %6s %6s %6s %6s  %6s\n" \

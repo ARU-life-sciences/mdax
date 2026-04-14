@@ -251,7 +251,7 @@ Options:
       --max-ed-rate <max_ed_rate>
           Maximum tolerated edit-distance rate during ONT refinement.
 
-          In ONT mode, refinement uses a banded edit distance. The band width is derived from the arm length
+          In ONT mode, refinement uses Myers' bit-parallel edit distance. The band width is derived from the arm length
           and this max-ed-rate (e.g. band ≈ arm * max_ed_rate).
 
           How it affects refinement:
@@ -317,8 +317,8 @@ Options:
 
           - hifi: fast comparison (Hamming-like) assuming low error rates.
           Produces stable split positions and identity estimates when reads are accurate.
-          - ont: banded Levenshtein-style refinement tolerant to indels/substitutions.
-          Slower but necessary for noisier reads.
+          - ont: Myers' bit-parallel edit distance, tolerant to indels/substitutions.
+          Fast and necessary for noisier reads.
 
           How it affects calling/cutting:
           - ONT mode can rescue true foldbacks that would look low-identity under HiFi assumptions.
@@ -330,7 +330,7 @@ Options:
 
           Possible values:
           - hifi: Refine breakpoints for HiFi reads (Hamming; fast)
-          - ont:  Refine breakpoints for ONT reads (Levenshtein, slower)
+          - ont:  Refine breakpoints for ONT reads (Myers' bit-parallel edit distance)
 
           [default: hifi]
 
@@ -486,7 +486,7 @@ cd irx_tests && bash test_suite.bash
 
 ## Performance
 
-It's reasonably fast, processing ~100Gb fasta data in ~2 minutes in `hifi` mode on a Mac with 8 threads, slightly longer in `ont` mode.
+It's fast, processing ~100 Gb of FASTA data in ~2 minutes in `hifi` mode on a Mac with 8 threads. `ont` mode uses Myers' bit-parallel edit distance for refinement and is comparable in speed.
 
 ## Algorithm overview
 
