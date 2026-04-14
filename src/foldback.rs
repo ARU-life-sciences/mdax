@@ -43,7 +43,7 @@ use crate::fingerprint::{
 use crate::minimizer::sampled_minimizers_into;
 use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
 use crate::utils::{
-    RefineMode, Refined, banded_edit_distance_scratch, comp, div_floor, edit_distance_myers,
+    RefineMode, Refined, comp, div_floor, edit_distance_myers,
     revcomp_into,
 };
 use anyhow::Result;
@@ -468,13 +468,7 @@ pub fn refine_breakpoint_banded_ed(
         // Fill scratch.right_rc with revcomp(right)
         revcomp_into(&mut scratch.right_rc, right);
 
-        let ed = banded_edit_distance_scratch(
-            left,
-            &scratch.right_rc,
-            band,
-            &mut scratch.prev,
-            &mut scratch.curr,
-        );
+        let ed = edit_distance_myers(left, &scratch.right_rc, band);
 
         if ed > band {
             continue;
@@ -504,11 +498,11 @@ pub fn refine_breakpoint_banded_ed(
     // revcomp(seq[best_s+delta..best_s+arm]) is the prefix [0..arm-delta] of this.
     revcomp_into(&mut scratch.right_rc, &seq[best_s..best_s + arm]);
 
-    let eval_ed = |delta: usize, right_rc: &[u8], prev: &mut Vec<usize>, curr: &mut Vec<usize>| -> f32 {
+    let eval_ed = |delta: usize| -> f32 {
         let eff_arm = arm - delta;
         let left     = &seq[best_s - arm .. best_s - delta];
-        let right_rc = &right_rc[..eff_arm];
-        let ed = banded_edit_distance_scratch(left, right_rc, band, prev, curr);
+        let right_rc = &scratch.right_rc[..eff_arm];
+        let ed = edit_distance_myers(left, right_rc, band);
         if ed > band { return 0.0; }
         (1.0 - (ed as f32 / eff_arm as f32)).clamp(0.0, 1.0)
     };
@@ -523,7 +517,7 @@ pub fn refine_breakpoint_banded_ed(
         // Stage 1: coarse scan.
         let mut coarse_best = 0usize;
         for delta in (1..=max_delta).step_by(stride) {
-            let ident = eval_ed(delta, &scratch.right_rc, &mut scratch.prev, &mut scratch.curr);
+            let ident = eval_ed(delta);
             if ident > best_ident {
                 best_ident  = ident;
                 coarse_best = delta;
@@ -537,7 +531,7 @@ pub fn refine_breakpoint_banded_ed(
             let lo = coarse_best.saturating_sub(stride).max(1);
             let hi = (coarse_best + stride).min(max_delta);
             for delta in lo..=hi {
-                let ident = eval_ed(delta, &scratch.right_rc, &mut scratch.prev, &mut scratch.curr);
+                let ident = eval_ed(delta);
                 if ident > best_ident {
                     best_ident = ident;
                     best_delta = delta;
@@ -546,17 +540,14 @@ pub fn refine_breakpoint_banded_ed(
         }
     }
 
-    // ── span-limited identity ─────────────────────────────────────────────────
-    // Use banded ED over the span-limited window (same cap as Hamming refiner).
+    // ── span-limited final identity ───────────────────────────────────────────
     let eff_arm = arm - best_delta;
     let id_window = eff_arm.min(span_hint).max(1);
-    let left_short  = &seq[best_s - best_delta - id_window .. best_s - best_delta];
+    let left_short     = &seq[best_s - best_delta - id_window .. best_s - best_delta];
     // revcomp(seq[best_s+best_delta..best_s+best_delta+id_window]) is
     // scratch.right_rc[arm-best_delta-id_window..arm-best_delta], already computed.
     let right_rc_short = &scratch.right_rc[arm - best_delta - id_window .. arm - best_delta];
-    let final_ed = banded_edit_distance_scratch(
-        left_short, right_rc_short, band, &mut scratch.prev, &mut scratch.curr,
-    );
+    let final_ed = edit_distance_myers(left_short, right_rc_short, band);
     let identity_est = if final_ed <= band {
         (1.0 - final_ed as f32 / id_window as f32).clamp(0.0, 1.0)
     } else {
