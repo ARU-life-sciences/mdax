@@ -43,7 +43,8 @@ use crate::fingerprint::{
 use crate::minimizer::sampled_minimizers_into;
 use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
 use crate::utils::{
-    RefineMode, Refined, banded_edit_distance_scratch, comp, div_floor, revcomp_into,
+    RefineMode, Refined, comp, div_floor, edit_distance_myers,
+    revcomp_into,
 };
 use anyhow::Result;
 use gxhash::HashMap;
@@ -249,20 +250,49 @@ pub fn refine_breakpoint_hamming(
 ) -> Option<Refined> {
     let mut best_s = s0;
     let mut best_score: i64 = i64::MIN;
+    let arm = cfg.refine.arm;
 
-    for s in (s0 - cfg.refine.window)..=(s0 + cfg.refine.window) {
-        let l = &seq[s - cfg.refine.arm..s];
+    // Reformulate the inner loop to use forward-only indexing so the compiler
+    // can autovectorise it.
+    //
+    // Original: score += (l[arm-1-i] == comp(seq[s+i]))
+    //         = (comp(l[arm-1-i]) == seq[s+i])   (comp is self-inverse)
+    //         = (revcomp(l)[i]     == seq[s+i])
+    //
+    // We maintain revcomp(seq[s-arm..s]) in `scratch.left_rc`.  As s advances
+    // by 1 the new entry is comp(seq[s]) prepended; the last entry falls off:
+    //   left_rc[0..arm-1] = old left_rc[1..arm]
+    //   left_rc[arm-1]    = comp(seq[s])
+    // Implemented as a left-rotate of 1 + overwrite of the last element.
+    let s_start = s0 - cfg.refine.window;
+    revcomp_into(&mut scratch.left_rc, &seq[s_start - arm..s_start]);
+
+    for s in s_start..=(s0 + cfg.refine.window) {
+        // Update left_rc for this s: shift left by 1, append comp(seq[s-1]).
+        // (At s_start the buffer is already correct from the init above.)
+        if s > s_start {
+            // Shift right by 1: left_rc[1..arm] ← left_rc[0..arm-1].
+            // Prepend comp(seq[s-1]) at [0].
+            // After update: left_rc[i] = comp(seq[s-1-i])  ✓
+            scratch.left_rc.copy_within(0..arm - 1, 1);
+            scratch.left_rc[0] = comp(seq[s - 1]);
+        }
+
+        let right = &seq[s..s + arm];
+        let left_rc = &scratch.left_rc;
 
         let mut score: i64 = 0;
-        for i in 0..cfg.refine.arm {
-            // walk outward from junction on the left
-            let a = l[cfg.refine.arm - 1 - i];
-            // right arm: forward from junction, but we want RC, so just complement here
-            let b = comp(seq[s + i]);
-            if a == b {
+        for i in 0..arm {
+            // Forward-indexed comparison; both slices advance monotonically.
+            if left_rc[i] == right[i] {
                 score += 1;
             } else {
                 score -= 1;
+            }
+            // Early exit: remaining bases cannot beat best_score even if all match.
+            if score + (arm - 1 - i) as i64 <= best_score {
+                score = i64::MIN / 2; // mark as dead
+                break;
             }
         }
 
@@ -280,8 +310,11 @@ pub fn refine_breakpoint_hamming(
     //   right arm starts at split + δ  (approaching true start of RC(A'))
     // At δ = g/2 the arms are correctly aligned.  gap_est = 2*δ_best ≈ g.
     //
-    // Effective arm length = arm − δ (shrinks as δ grows).
-    // MIN_EFF_ARM: minimum comparison length to keep the estimate stable.
+    // HiFi identity is estimated with Hamming (no banded ED): for CCS reads
+    // the indel rate is <0.1%, so over a 500 bp window at most 1–2 indels are
+    // expected.  Hamming gives identity accurate to ±0.2%, well within the
+    // margin of any classification threshold.
+    //
     // ── identity via arm hint (direct placement) or δ-scan (symmetric shift) ──
     //
     // When the minimizer chain provides valid arm boundaries and the gap
@@ -292,7 +325,7 @@ pub fn refine_breakpoint_hamming(
     //
     // For small/zero gaps (or when the hint is unavailable), run the δ-scan.
     const MIN_EFF_ARM: usize = 100;
-    let arm = cfg.refine.arm;
+    // `arm` was bound earlier for the split scan.
     let max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(MIN_EFF_ARM));
 
     let gap_from_hint = arm_start_right.saturating_sub(arm_end);
@@ -302,46 +335,46 @@ pub fn refine_breakpoint_hamming(
         && arm_end <= seq.len()
         && arm_start_right < seq.len();
 
-    // Cap the identity comparison window: 500 bp is more than sufficient for
-    // a statistically robust identity estimate (even at min_identity=0.6 we
-    // have ~300 informative positions, ≫ what's needed to distinguish classes).
-    // Capping reduces the banded-ED cost from O(arm²·rate) to O(cap²·rate).
+    // Cap the identity comparison window.
     const ID_WINDOW_CAP: usize = 500;
 
-    let (id_left, id_right, final_gap_est) = if use_hint {
+    let (identity_est, final_gap_est) = if use_hint {
         // Direct arm placement: compare the innermost `id_window` bp of each arm.
         // Clamp to available sequence so neither window overruns the slice.
         let id_window = arm.min(span_hint).min(ID_WINDOW_CAP).max(1);
         let avail_left  = arm_end.min(id_window);
         let avail_right = seq.len().saturating_sub(arm_start_right).min(id_window);
         let actual = avail_left.min(avail_right).max(1);
-        (
-            &seq[arm_end - actual .. arm_end],
-            &seq[arm_start_right .. arm_start_right + actual],
-            gap_from_hint,
-        )
+        let id_left  = &seq[arm_end - actual .. arm_end];
+        let id_right = &seq[arm_start_right .. arm_start_right + actual];
+        scratch.right_rc.clear();
+        revcomp_into(&mut scratch.right_rc, id_right);
+        let band = ((cfg.refine.max_ed_rate * actual as f32).ceil() as usize).max(1);
+        let ed = edit_distance_myers(id_left, &scratch.right_rc, band);
+        let ident = if ed <= band {
+            (1.0 - ed as f32 / actual as f32).clamp(0.0, 1.0)
+        } else {
+            id_left.iter().zip(scratch.right_rc.iter()).filter(|(a, b)| a == b).count() as f32
+                / actual as f32
+        };
+        (ident, gap_from_hint)
     } else {
-        // Symmetric δ-shift: scan for best gap estimate then compare arms.
-        //
-        // Two-stage scan: coarse at stride max_δ/200, then exhaustive ±stride.
-        // Evaluate Hamming identity at a symmetric half-gap offset δ.
-        // Bounds are guaranteed: the window [split±arm] lies within the sequence.
-        // Cap comparison to ID_WINDOW_CAP so the scan doesn't compare more bases
-        // than the final identity step needs; all delta values use the same cap
-        // so relative identities stay comparable across the scan.
-        let eval = |delta: usize| -> f32 {
+        // Recompute left_rc for best_s (the split scan left it for s_start+window).
+        // left_rc[i] = comp(seq[best_s - 1 - i])  for i in 0..arm.
+        // Enables forward-indexed comparison: left_rc[δ+i] == seq[best_s+δ+i].
+        revcomp_into(&mut scratch.left_rc, &seq[best_s - arm .. best_s]);
+
+        // Symmetric δ-shift: scan for best gap estimate (Hamming, forward-indexed,
+        // autovectorisable). Only used to rank deltas, not for the final identity.
+        let eval = |delta: usize, lrc: &[u8]| -> f32 {
             let eff_arm = (arm - delta).min(ID_WINDOW_CAP);
-            let mut score = 0i64;
-            for i in 0..eff_arm {
-                let a = seq[best_s - delta - 1 - i];
-                let b = comp(seq[best_s + delta + i]);
-                if a == b { score += 1; } else { score -= 1; }
-            }
-            let m = ((score + eff_arm as i64) / 2).max(0) as usize;
-            m as f32 / eff_arm as f32
+            let left_slice  = &lrc[delta .. delta + eff_arm];
+            let right_slice = &seq[best_s + delta .. best_s + delta + eff_arm];
+            let matches = left_slice.iter().zip(right_slice).filter(|(a, b)| a == b).count();
+            matches as f32 / eff_arm as f32
         };
 
-        let base_ident = eval(0);
+        let base_ident = eval(0, &scratch.left_rc);
         let mut best_delta = 0usize;
         let mut best_ident  = base_ident;
 
@@ -351,7 +384,7 @@ pub fn refine_breakpoint_hamming(
             // Stage 1: coarse scan.
             let mut coarse_best = 0usize;
             for delta in (1..=max_delta).step_by(stride) {
-                let ident = eval(delta);
+                let ident = eval(delta, &scratch.left_rc);
                 if ident > best_ident {
                     best_ident  = ident;
                     coarse_best = delta;
@@ -360,11 +393,12 @@ pub fn refine_breakpoint_hamming(
             }
 
             // Stage 2: exhaustive refine around the coarse best.
-            if coarse_best > 0 {
+            // Skip when stride==1: the coarse scan was already exhaustive.
+            if coarse_best > 0 && stride > 1 {
                 let lo = coarse_best.saturating_sub(stride).max(1);
                 let hi = (coarse_best + stride).min(max_delta);
                 for delta in lo..=hi {
-                    let ident = eval(delta);
+                    let ident = eval(delta, &scratch.left_rc);
                     if ident > best_ident {
                         best_ident = ident;
                         best_delta = delta;
@@ -374,29 +408,25 @@ pub fn refine_breakpoint_hamming(
         }
         let _ = best_ident; // used only to drive the scan above
 
+        // Final identity: Myers' bit-parallel ED on capped window (≤ID_WINDOW_CAP bp).
+        // Window is always ≤512 bp, within the 8-word bitvector limit.
         let eff_arm = arm - best_delta;
         let id_window = eff_arm.min(span_hint).min(ID_WINDOW_CAP).max(1);
-        (
-            &seq[best_s - best_delta - id_window .. best_s - best_delta],
-            &seq[best_s + best_delta .. best_s + best_delta + id_window],
-            best_delta * 2,
-        )
-    };
-
-    scratch.right_rc.clear();
-    revcomp_into(&mut scratch.right_rc, id_right);
-    let band = ((cfg.refine.max_ed_rate * id_left.len() as f32).ceil() as usize).max(1);
-    let ed = banded_edit_distance_scratch(id_left, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr);
-    let identity_est = if ed <= band {
-        (1.0 - ed as f32 / id_left.len() as f32).clamp(0.0, 1.0)
-    } else {
-        // Band exceeded; Hamming lower bound.
-        let n = id_left.len();
-        let mut matches = 0i64;
-        for i in 0..n {
-            if id_left[n - 1 - i] == comp(id_right[i]) { matches += 1; }
-        }
-        matches as f32 / n as f32
+        let id_left  = &seq[best_s - best_delta - id_window .. best_s - best_delta];
+        let id_right = &seq[best_s + best_delta .. best_s + best_delta + id_window];
+        scratch.right_rc.clear();
+        revcomp_into(&mut scratch.right_rc, id_right);
+        let band = ((cfg.refine.max_ed_rate * id_window as f32).ceil() as usize).max(1);
+        let ed = edit_distance_myers(id_left, &scratch.right_rc, band);
+        let ident = if ed <= band {
+            (1.0 - ed as f32 / id_window as f32).clamp(0.0, 1.0)
+        } else {
+            // Band exceeded: Hamming lower bound using pre-computed left_rc.
+            let left_slice  = &scratch.left_rc[best_delta .. best_delta + id_window];
+            left_slice.iter().zip(id_right.iter()).filter(|(a, b)| a == b).count() as f32
+                / id_window as f32
+        };
+        (ident, best_delta * 2)
     };
 
     Some(Refined {
@@ -438,13 +468,7 @@ pub fn refine_breakpoint_banded_ed(
         // Fill scratch.right_rc with revcomp(right)
         revcomp_into(&mut scratch.right_rc, right);
 
-        let ed = banded_edit_distance_scratch(
-            left,
-            &scratch.right_rc,
-            band,
-            &mut scratch.prev,
-            &mut scratch.curr,
-        );
+        let ed = edit_distance_myers(left, &scratch.right_rc, band);
 
         if ed > band {
             continue;
@@ -470,15 +494,16 @@ pub fn refine_breakpoint_banded_ed(
     let arm = cfg.refine.arm;
     let max_delta = (cfg.refine.max_jump_clip / 2).min(arm.saturating_sub(MIN_EFF_ARM));
 
-    let mut eval_ed = |delta: usize| -> f32 {
-        let left  = &seq[best_s - arm .. best_s - delta];
-        let right = &seq[best_s + delta .. best_s + arm];
-        revcomp_into(&mut scratch.right_rc, right);
-        let ed = banded_edit_distance_scratch(
-            left, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
-        );
-        if ed > band { return 0.0; }
+    // Pre-compute revcomp of the full right arm once.
+    // revcomp(seq[best_s+delta..best_s+arm]) is the prefix [0..arm-delta] of this.
+    revcomp_into(&mut scratch.right_rc, &seq[best_s..best_s + arm]);
+
+    let eval_ed = |delta: usize| -> f32 {
         let eff_arm = arm - delta;
+        let left     = &seq[best_s - arm .. best_s - delta];
+        let right_rc = &scratch.right_rc[..eff_arm];
+        let ed = edit_distance_myers(left, right_rc, band);
+        if ed > band { return 0.0; }
         (1.0 - (ed as f32 / eff_arm as f32)).clamp(0.0, 1.0)
     };
 
@@ -501,7 +526,8 @@ pub fn refine_breakpoint_banded_ed(
         }
 
         // Stage 2: exhaustive refine around the coarse best.
-        if coarse_best > 0 {
+        // Skip when stride==1: the coarse scan was already exhaustive.
+        if coarse_best > 0 && stride > 1 {
             let lo = coarse_best.saturating_sub(stride).max(1);
             let hi = (coarse_best + stride).min(max_delta);
             for delta in lo..=hi {
@@ -514,16 +540,14 @@ pub fn refine_breakpoint_banded_ed(
         }
     }
 
-    // ── span-limited identity ─────────────────────────────────────────────────
-    // Use banded ED over the span-limited window (same cap as Hamming refiner).
+    // ── span-limited final identity ───────────────────────────────────────────
     let eff_arm = arm - best_delta;
     let id_window = eff_arm.min(span_hint).max(1);
-    let left_short  = &seq[best_s - best_delta - id_window .. best_s - best_delta];
-    let right_short = &seq[best_s + best_delta .. best_s + best_delta + id_window];
-    revcomp_into(&mut scratch.right_rc, right_short);
-    let final_ed = banded_edit_distance_scratch(
-        left_short, &scratch.right_rc, band, &mut scratch.prev, &mut scratch.curr,
-    );
+    let left_short     = &seq[best_s - best_delta - id_window .. best_s - best_delta];
+    // revcomp(seq[best_s+best_delta..best_s+best_delta+id_window]) is
+    // scratch.right_rc[arm-best_delta-id_window..arm-best_delta], already computed.
+    let right_rc_short = &scratch.right_rc[arm - best_delta - id_window .. arm - best_delta];
+    let final_ed = edit_distance_myers(left_short, right_rc_short, band);
     let identity_est = if final_ed <= band {
         (1.0 - final_ed as f32 / id_window as f32).clamp(0.0, 1.0)
     } else {
@@ -591,6 +615,11 @@ pub fn detect_foldback(
         &mut scratch.val_f,
     );
 
+    // Early exit before the more expensive RC minimizer computation.
+    if scratch.pos_f.len() < shared.min_matches {
+        return None;
+    }
+
     revcomp_into(&mut scratch.rc, seq);
 
     sampled_minimizers_into(
@@ -605,7 +634,7 @@ pub fn detect_foldback(
     let pos_rc = &scratch.pos_rc;
     let val_rc = &scratch.val_rc;
 
-    if pos_f.len() < shared.min_matches || pos_rc.len() < shared.min_matches {
+    if pos_rc.len() < shared.min_matches {
         return None;
     }
 

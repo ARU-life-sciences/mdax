@@ -146,12 +146,11 @@ pub struct SigScratch {
 ///
 /// Holds:
 /// - `right_rc`: reverse complement of the right arm
-/// - `prev`/`curr`: dynamic programming rows for banded edit distance
-///
-/// The DP buffers are sized to the refinement arm length and reused per call.
+/// - `left_rc`: reverse complement of the left arm, maintained incrementally
+///   across the split-position scan in the Hamming refiner so the inner
+///   comparison loop uses forward indexing (compiler-autovectorisable).
 #[derive(Debug, Default)]
 pub struct RefineScratch {
     pub right_rc: Vec<u8>,
-    pub prev: Vec<usize>,
-    pub curr: Vec<usize>,
+    pub left_rc: Vec<u8>,
 }

@@ -83,7 +83,7 @@ pub fn banded_edit_distance_scratch(
     let m = b.len();
     let inf = band + 1;
 
-    // Ensure scratch rows are the right length and default-filled.
+    // Ensure scratch rows are the right length.
     prev.resize(m + 1, inf);
     curr.resize(m + 1, inf);
 
@@ -94,53 +94,163 @@ pub fn banded_edit_distance_scratch(
         prev[j] = if j <= band { j } else { inf };
     }
 
+    // Fill curr once before the loop.  Inside the loop we maintain the invariant
+    // with a single O(1) guard write per row instead of a full O(m) reset.
+    //
+    // Invariant: every cell of `curr` that could be read as `curr[j-1]` at the
+    // start of the inner loop (i.e. `curr[j_min - 1]`) is either:
+    //   (a) `curr[0]`, which is always set explicitly before the inner loop, or
+    //   (b) `curr[j_min - 1]` for j_min > 1, which is set to `inf` by the guard.
+    // All other cells in [j_min..j_max] are written before they are read because
+    // the loop advances left-to-right and `curr[j]` is written at step j before
+    // `curr[j]` is read as `curr[j-1]` at step j+1.
+    curr.fill(inf);
+
     for i in 1..=n {
-        // reset curr row to inf
-        for v in curr.iter_mut() {
-            *v = inf;
+        // Band limits: only cells j where |i - j| <= band are in scope.
+        let j_min = i.saturating_sub(band).max(1);
+        let j_max = (i + band).min(m);
+
+        // Guard: the insertion path at j = j_min reads curr[j_min - 1].  When
+        // j_min > 1 that cell is stale (written two rows ago); reset it to inf.
+        // curr[0] is always set explicitly below.
+        if j_min > 1 {
+            curr[j_min - 1] = inf;
         }
         curr[0] = if i <= band { i } else { inf };
 
-        // Compute the band limits for this row:
-        // only j where |i - j| <= band.
-        let i_is = i as isize;
-        let band_is = band as isize;
-        let j_min = (1isize.max(i_is - band_is)) as usize;
-        let j_max = (m as isize).min(i_is + band_is) as usize;
-
-        // Track the best value in the row so we can early-exit if the whole row exceeds `band`.
+        // Hoist the row-constant character lookup.
+        let ai = a[i - 1];
         let mut row_best = inf;
 
         for j in j_min..=j_max {
-            // Levenshtein cost: substitution is 0 if equal else 1.
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-
-            // Standard DP transitions:
-            // - deletion: drop a[i-1]
-            // - insertion: insert b[j-1]
-            // - substitution/match: align a[i-1] with b[j-1]
-            //
-            // Use saturating_add because values may be `inf` and we want to avoid overflow.
-
-            let del = prev[j].saturating_add(1);
-            let ins = curr[j - 1].saturating_add(1);
-            let sub = prev[j - 1].saturating_add(cost);
-
+            // Values are bounded by band + n (≤ ~625 for our 500 bp window),
+            // nowhere near usize overflow, so plain addition is safe.
+            let cost = usize::from(ai != b[j - 1]);
+            let del = prev[j] + 1;
+            let ins = curr[j - 1] + 1;
+            let sub = prev[j - 1] + cost;
             let v = del.min(ins).min(sub);
             curr[j] = v;
             row_best = row_best.min(v);
         }
 
-        // Early exit: if the best cell in this row is already > band, true distance must be > band.
+        // Early exit: if the best cell in this row already exceeds the band,
+        // the true edit distance must be > band.
         if row_best > band {
             return band + 1;
         }
 
-        // Roll the DP rows.
         std::mem::swap(prev, curr);
     }
-    // Return final distance, clamped at band+1.
     prev[m].min(band + 1)
+}
+
+/// Myers' bit-parallel edit distance (Hyyrö 2001 formulation).
+///
+/// Computes the Levenshtein edit distance between `a` (pattern, length n) and
+/// `b` (text, length m), returning the distance clamped to `band + 1`.
+///
+/// Runs in O(⌈n/64⌉ · m) word operations — roughly 64× fewer inner-loop
+/// iterations than the scalar banded DP for typical n = m windows.
+///
+/// Works for any pattern length; the bitvector state is heap-allocated and
+/// grows with n.
+///
+/// # Equations (per text character b[j])
+/// ```text
+/// Xv = Eq | Mv
+/// X  = Xv & Pv
+/// D0 = ((X + Pv) ^ Pv) | Xv    ← + is multi-word carry-propagating addition
+/// Ph = Mv | ~(D0 | Pv)
+/// Mh = Pv & D0
+/// score += bit(n−1, Ph);  score -= bit(n−1, Mh)
+/// Ph = (Ph << 1) | 1;  Mh <<= 1   ← left-shift with cross-word carry
+/// Pv = Mh | ~(Xv | Ph)
+/// Mv = Ph & Xv
+/// ```
+pub fn edit_distance_myers(a: &[u8], b: &[u8], band: usize) -> usize {
+    let n = a.len();
+    let m = b.len();
+    if n == 0 { return m.min(band + 1); }
+    if m == 0 { return n.min(band + 1); }
+
+    let words = (n + 63) / 64;
+
+    // Precompute PM: flat Vec indexed as pm[c * words + k] = word k of the
+    // match bitvector for pattern char c.  Only the 256 ASCII byte values
+    // are needed; DNA uses 5 of them.
+    let mut pm = vec![0u64; 256 * words];
+    for (i, &c) in a.iter().enumerate() {
+        pm[c as usize * words + (i >> 6)] |= 1u64 << (i & 63);
+    }
+
+    // Mask for the last word: zero out bits above position n-1.
+    let last_bits = n & 63;
+    let last_mask: u64 = if last_bits == 0 { !0 } else { (1u64 << last_bits) - 1 };
+    let hi_w = words - 1;       // index of the last active word
+    let hi_b = (n - 1) & 63;   // bit index of pattern position n-1 within hi_w
+
+    // DP state: Pv[k]/Mv[k] = positive/negative vertical difference bitvectors.
+    // Initial state: all vertical deltas = +1 (column 0 values = 0,1,…,n).
+    let mut pv = vec![!0u64; words];
+    let mut mv = vec![0u64; words];
+    pv[hi_w] = last_mask;
+
+    let mut score = n;
+
+    for (j, &bc) in b.iter().enumerate() {
+        let eq = &pm[bc as usize * words .. bc as usize * words + words];
+
+        // Single left-to-right pass per text character.
+        // Carries thread state between words:
+        //   `add_carry` — carry out of the multi-word addition X + Pv
+        //   `ph_carry`  — bit shifted in at word boundary when left-shifting Ph
+        //   `mh_carry`  — same for Mh
+        let mut add_carry = 0u64;
+        let mut ph_carry  = 1u64; // boundary: d[0][j] = j, so horizontal delta at row 0 = +1
+        let mut mh_carry  = 0u64;
+
+        for k in 0..words {
+            let pv_k = pv[k];
+            let mv_k = mv[k];
+
+            // D0: zero-difference positions.
+            let xv = eq[k] | mv_k;
+            let x  = xv & pv_k;
+            let (s1, c1) = x.overflowing_add(pv_k);
+            let (s2, c2) = s1.overflowing_add(add_carry);
+            let d0 = (s2 ^ pv_k) | xv;
+            add_carry = (c1 as u64) | (c2 as u64);
+
+            // Horizontal differences for this word.
+            let ph_k = mv_k | !(d0 | pv_k);
+            let mh_k = pv_k & d0;
+
+            // Score update from the last pattern bit (only in the final word).
+            if k == hi_w {
+                score += ((ph_k >> hi_b) & 1) as usize;
+                score  = score.saturating_sub(((mh_k >> hi_b) & 1) as usize);
+            }
+
+            // Left-shift Ph and Mh by 1 with cross-word carry, then update Pv/Mv.
+            let nph = (ph_k << 1) | ph_carry;  ph_carry = ph_k >> 63;
+            let nmh = (mh_k << 1) | mh_carry;  mh_carry = mh_k >> 63;
+            pv[k] = nmh | !(xv | nph);
+            mv[k] = nph & xv;
+        }
+
+        // Mask stray bits in the last word (produced by ~).
+        pv[hi_w] &= last_mask;
+        mv[hi_w] &= last_mask;
+
+        // Early exit: score = d[n][j+1].  Even if score decreases by 1 every
+        // remaining column, it cannot drop below score - (m - j - 1).
+        // If that floor already exceeds band, the true distance must be > band.
+        if score > band + (m - 1 - j) { return band + 1; }
+    }
+
+    score.min(band + 1)
 }
 
 /// Reverse-complement lookup table for ASCII bases.
@@ -400,5 +510,108 @@ mod tests {
 
         assert_eq!(ed_ab, true_ed);
         assert_eq!(ed_ba, true_ed);
+    }
+
+    // ── Myers' bit-parallel edit distance ────────────────────────────────────
+
+    /// Exhaustively compare Myers' against the reference Levenshtein for all
+    /// pairs of short DNA strings.
+    #[test]
+    fn myers_matches_levenshtein_exhaustive_short() {
+        let alphabet = b"ACGT";
+        let seqs: Vec<Vec<u8>> = (0..=8).flat_map(|len| {
+            // All strings over ACGT of each length (4^len, capped at len ≤ 4 for speed)
+            // For len > 4 just use a few hand-picked strings.
+            if len <= 4 {
+                let count = 4usize.pow(len as u32);
+                (0..count).map(|mut idx| {
+                    (0..len).map(|_| { let c = alphabet[idx % 4]; idx /= 4; c }).collect()
+                }).collect()
+            } else {
+                vec![
+                    b"ACGTACGT"[..len].to_vec(),
+                    b"TTTTTTTT"[..len].to_vec(),
+                    b"AAAAAAAA"[..len].to_vec(),
+                ]
+            }
+        }).collect();
+
+        for a in &seqs {
+            for b in &seqs {
+                let band = a.len().max(b.len());
+                let expected = levenshtein(a, b);
+                let got = edit_distance_myers(a, b, band);
+                assert_eq!(
+                    got, expected,
+                    "Myers mismatch: a={:?} b={:?} expected={expected} got={got}",
+                    std::str::from_utf8(a).unwrap(),
+                    std::str::from_utf8(b).unwrap(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn myers_band_exceeded_returns_band_plus_one() {
+        let a = b"AAAAAAAAAAAAAAAA";
+        let b = b"TTTTTTTTTTTTTTTT";
+        let band = 3;
+        assert_eq!(edit_distance_myers(a, b, band), band + 1);
+    }
+
+    #[test]
+    fn myers_exact_match() {
+        let s = b"ACGTACGTACGTACGT";
+        assert_eq!(edit_distance_myers(s, s, s.len()), 0);
+    }
+
+    /// Multi-word path: n > 64. Compare Myers' against banded ED on a 200 bp window.
+    #[test]
+    fn myers_multiword_matches_banded_ed() {
+        // Build a ~97% identity pair, 200 bp each.
+        let a: Vec<u8> = (0..200usize).map(|i| b"ACGT"[i % 4]).collect();
+        let mut b = a.clone();
+        // Introduce 6 substitutions spread through the sequence.
+        for &pos in &[10usize, 40, 70, 100, 140, 180] {
+            b[pos] = if b[pos] == b'A' { b'T' } else { b'A' };
+        }
+        let band = 20;
+        let mut prev = Vec::new();
+        let mut curr = Vec::new();
+        let banded = banded_edit_distance_scratch(&a, &b, band, &mut prev, &mut curr);
+        let myers  = edit_distance_myers(&a, &b, band);
+        assert_eq!(myers, banded, "multiword: myers={myers} banded={banded}");
+    }
+
+    /// Longer sequence (n = 500 bp).
+    #[test]
+    fn myers_500bp_matches_banded_ed() {
+        let a: Vec<u8> = (0..500usize).map(|i| b"ACGT"[i % 4]).collect();
+        let mut b = a.clone();
+        for &pos in &[5usize, 50, 100, 200, 300, 400, 490] {
+            b[pos] = if b[pos] == b'A' { b'T' } else { b'A' };
+        }
+        let band = 50;
+        let mut prev = Vec::new();
+        let mut curr = Vec::new();
+        let banded = banded_edit_distance_scratch(&a, &b, band, &mut prev, &mut curr);
+        let myers  = edit_distance_myers(&a, &b, band);
+        assert_eq!(myers, banded, "500bp: myers={myers} banded={banded}");
+    }
+
+    /// n > 512: exercises the heap-allocated multi-word path beyond the old fixed limit.
+    #[test]
+    fn myers_large_n_matches_banded_ed() {
+        let a: Vec<u8> = (0..1200usize).map(|i| b"ACGT"[i % 4]).collect();
+        let mut b = a.clone();
+        for &pos in &[10usize, 100, 300, 600, 900, 1100] {
+            b[pos] = if b[pos] == b'A' { b'T' } else { b'A' };
+        }
+        let band = 50;
+        let mut prev = Vec::new();
+        let mut curr = Vec::new();
+        let banded = banded_edit_distance_scratch(&a, &b, band, &mut prev, &mut curr);
+        let myers  = edit_distance_myers(&a, &b, band);
+        assert_eq!(myers, banded, "1200bp: myers={myers} banded={banded}");
     }
 }
