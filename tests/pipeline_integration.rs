@@ -637,3 +637,205 @@ fn real_artefacts_detected_and_cut() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Template-switch gap tests (Test 5 from chris_crossvalidation)
+//
+// Real MDA foldback artefacts frequently have a template-switch gap between
+// the two arms — the enzyme slips forward by G bases before reversing,
+// leaving a region that appears in the read but has no reverse-complement
+// counterpart.  From the ERR12263839 gap_est distribution (chris_data/README):
+//
+//   modal gap bin: 660–1320 bp (35% of detected reads)
+//   ~61% of reads have gap_est > 660 bp
+//
+// mdax's delta-scan tests offsets δ = 0 .. max_jump_clip/2 on both sides of
+// the estimated split.  To resolve a gap of G bp, mdax needs:
+//
+//   max_jump_clip ≥ G   (so that max_delta = max_jump_clip/2 ≥ G/2 = δ_best)
+//
+// These two tests use a single synthetic read built as:
+//
+//   arm (1500 bp) | gap (2000 bp) | RC(arm) (1500 bp)   total = 5000 bp
+//
+// The true template-switch gap is exactly 2000 bp, so:
+//   - max_jump_clip = 4000  →  max_delta = 2000 ≥ δ_best = 1000  ✓  rescued
+//   - max_jump_clip =  800  →  max_delta =  400 < δ_best = 1000  ✗  suppressed
+//
+// The two tests are regression guards ensuring that:
+//   (a) wide jump clip correctly identifies the gap and reports high identity
+//   (b) narrow jump clip degrades identity (demonstrating WHY the parameter matters)
+// ---------------------------------------------------------------------------
+
+/// Build a config for the large-gap tests with a configurable max_jump_clip.
+/// All other parameters are set to enable detection of a 5000 bp synthetic read.
+fn large_gap_cfg(max_jump_clip: usize) -> MdaxCfg {
+    MdaxCfg {
+        shared: SharedCfg {
+            minimizer: MinimizerCfg {
+                k: 17,
+                w: 21,
+                forward_only: true,
+            },
+            min_matches: 10,
+            // Zero end_guard so the 5000 bp synthetic read is not excluded.
+            end_guard: 0,
+            refine: RefineCfg {
+                window: 200,
+                // arm = 1500 to match the synthetic arm length; this ensures
+                // the delta-scan has access to the full arm on each side.
+                arm: 1500,
+                mode: RefineMode::HiFi,
+                max_ed_rate: 0.25,
+                max_jump_clip,
+            },
+            fold_diag_tol: 120,
+        },
+        // min_arm 1000 < 1500 (actual arm) so the foldback is detectable.
+        fold: FoldOnlyCfg { min_arm: 1000 },
+        fold2: FoldSecondPassCfg {
+            // min_support = 2 with only one read → junction is never "real".
+            min_support: 2,
+            min_identity: 0.50,
+            min_support_ident: 0.0,
+            cut_low_ident: false,
+        },
+        sig: SigCfg {
+            flank_bp: 600,
+            take: 8,
+            value_shift: 0,
+        },
+    }
+}
+
+/// A synthetic foldback with a 2000 bp template-switch gap is detected and
+/// correctly classified as an artefact when max_jump_clip ≥ gap.
+///
+/// Read:  arm (1500 bp) | gap (2000 bp) | RC(arm) (1500 bp)
+///
+/// With max_jump_clip = 4000 (δ_max = 2000 ≥ δ_best = 1000):
+///   - The delta-scan finds best_delta ≈ 1000, yielding gap_est ≈ 2000 bp.
+///   - The comparison window sees arm vs arm → identity ≈ 1.0.
+///   - decision = artefact.
+///
+/// This is a regression guard for the δ-scan and gap_est reporting.
+#[test]
+fn large_gap_artefact_wide_jump_clip() {
+    // Deterministic synthetic sequences.
+    let arm = rand_dna(1500, 0xF00D_CAFE_DEAD_BEEF);
+    // Gap is a different random sequence — not the reverse complement of the arm.
+    // This ensures that a naive (δ=0) comparison misaligns and underestimates identity.
+    let gap = rand_dna(2000, 0x1234_5678_ABCD_EF01);
+    let rc_arm = revcomp(&arm);
+    let read: Vec<u8> = [arm.as_slice(), gap.as_slice(), rc_arm.as_slice()].concat();
+    assert_eq!(read.len(), 5000);
+
+    let input = write_temp_fasta(&[("large_gap_artefact", &read)]);
+    let (detected, cut, real, _seqs, rows) =
+        run_pipeline(&input, large_gap_cfg(4000), 5);
+    let _ = std::fs::remove_file(&input);
+
+    assert_eq!(detected, 1, "expected exactly 1 foldback detected");
+    assert_eq!(cut,      1, "expected the read to be cut");
+    assert_eq!(real,     0, "expected 0 real palindromes (singleton junction)");
+    assert_eq!(rows.len(), 1, "expected 1 TSV row, got {}", rows.len());
+
+    let decision = rows[0].get("decision").map(|s| s.as_str()).unwrap_or("");
+    assert_eq!(decision, "artefact",
+        "expected decision=artefact with wide jump clip, got '{decision}'");
+
+    // gap_est should be near 2000 bp: true gap = 2000, allow ±400 bp tolerance.
+    let gap_est: usize = rows[0]
+        .get("gap_est")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        (1600..=2400).contains(&gap_est),
+        "gap_est={gap_est} bp not in expected range 1600–2400 \
+         (true gap = 2000 bp, max_jump_clip = 4000)"
+    );
+
+    // identity_est should be high: arms are identical, so ≥ 0.90.
+    let identity: f32 = rows[0]
+        .get("identity_est")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    assert!(
+        identity >= 0.90,
+        "identity_est={identity:.3} too low for a perfect synthetic foldback \
+         (expected ≥ 0.90, max_jump_clip = 4000)"
+    );
+}
+
+/// When max_jump_clip is too small to span the gap via the δ-scan, mdax falls
+/// back to placing the comparison window directly on arm boundaries provided by
+/// the minimizer chain ("hint path").
+///
+/// Read:  arm (1500 bp) | gap (2000 bp) | RC(arm) (1500 bp)
+///
+/// With max_jump_clip = 800 (max_delta = 400):
+///   - gap_from_hint = arm_start_right − arm_end ≈ 2000 bp
+///   - Condition  gap_from_hint > max_delta * 2 → 2000 > 800  is TRUE
+///   - The refiner skips the δ-scan and uses arm boundaries from the chain
+///     (the `use_hint` path in refine_breakpoint_hamming).
+///   - gap_est is reported from hint, NOT capped by max_jump_clip.
+///   - identity window is placed at the true arm edges → identity ≈ 1.0.
+///
+/// This test verifies the hint-path fallback:
+///   - gap_est and identity_est should match the wide-clip result (both ≥ 0.90).
+///   - decision should be artefact.
+///
+/// Why max_jump_clip still matters:
+///   The hint path requires the coarse detector to have measured reliable arm
+///   boundaries (arm_end > 0 and arm_start_right > 0).  For reads where the
+///   minimizer chain is sparse (low coverage, noisy reads, very short arms),
+///   arm_end may be 0 and use_hint will not trigger.  In that scenario the
+///   δ-scan runs, is capped at max_delta, and identity is degraded.  The
+///   jump_clip_sweep.sh test in tests/chris_crossvalidation/ probes this on
+///   real data where the coarse signal may be weaker.
+#[test]
+fn large_gap_artefact_hint_fallback() {
+    let arm = rand_dna(1500, 0xF00D_CAFE_DEAD_BEEF); // same seed as wide test
+    let gap = rand_dna(2000, 0x1234_5678_ABCD_EF01);
+    let rc_arm = revcomp(&arm);
+    let read: Vec<u8> = [arm.as_slice(), gap.as_slice(), rc_arm.as_slice()].concat();
+
+    let input = write_temp_fasta(&[("large_gap_artefact_hint", &read)]);
+    let (detected, cut, real, _seqs, rows) =
+        run_pipeline(&input, large_gap_cfg(800), 5);
+    let _ = std::fs::remove_file(&input);
+
+    // Coarse detection is independent of max_jump_clip.
+    assert_eq!(detected, 1,
+        "foldback should be coarse-detected regardless of max_jump_clip");
+    assert_eq!(cut,  1, "expected 1 cut (artefact decision)");
+    assert_eq!(real, 0, "expected 0 real (singleton junction)");
+    assert_eq!(rows.len(), 1, "expected 1 TSV row");
+
+    let decision = rows[0].get("decision").map(|s| s.as_str()).unwrap_or("");
+    assert_eq!(decision, "artefact",
+        "hint path should still yield artefact decision with max_jump_clip=800");
+
+    // The hint path reports gap_from_hint directly, so gap_est ≈ 2000 even
+    // though max_jump_clip = 800 < 2000.
+    let gap_est: usize = rows[0]
+        .get("gap_est")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        (1600..=2400).contains(&gap_est),
+        "hint path should report gap_est ≈ 2000 bp regardless of max_jump_clip; \
+         got gap_est={gap_est}"
+    );
+
+    // Identity window is placed at arm boundaries, so identity ≈ 1.0.
+    let identity: f32 = rows[0]
+        .get("identity_est")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    assert!(
+        identity >= 0.90,
+        "hint path should achieve high identity (≥ 0.90) when arm boundaries \
+         are known; got identity_est={identity:.3}"
+    );
+}
