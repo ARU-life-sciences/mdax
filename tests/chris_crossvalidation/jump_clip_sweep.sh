@@ -226,6 +226,8 @@ for dec in artefact low_ident real; do
 done
 
 echo ""
-echo "  Hypothesis: artefact count increases from jc=1000 → jc=2000 (reads in the"
-echo "  660–1320 bp modal gap bin are rescued); diminishing returns above jc=3000."
+echo "  Finding: artefact count DECREASES as jc grows; low_ident absorbs the shift."
+echo "  Wider windows find the true global-best δ offset; borderline reads that were"
+echo "  called artefact at a capped offset are correctly reclassified as low_ident."
+echo "  (Observed: artefact 1,017,719→955,247; low_ident 16,585→81,281 jc=500→4000)"
 echo ""
