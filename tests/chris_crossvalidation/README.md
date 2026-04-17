@@ -14,6 +14,17 @@ the modal template-switch gap is 660–1320 bp, with ~61% of reads having gap > 
 
 ---
 
+## Results summary
+
+| Test | Finding |
+|---|---|
+| **1+3** crossmatch.py | 95.8% of `intrachromosomal_chimera` and 95.9% of `tandem_rc_concatemer` reads → mdax `artefact`. All sanity checks pass. |
+| **2** jump_clip_sweep.sh | Wider `--max-jump-clip` *reduces* artefact calls (1.02M→955K) and *increases* low_ident (32K→81K). Wider windows find the true global-best δ; borderline reads called artefact at a capped scan are correctly reclassified. Clean foldbacks stable (use_hint fires independently of jc). |
+| **4** gap_scatter.py | Pearson r=0.48; mdax median gap 1000 bp vs Chris median 439 bp — expected systematic offset between read-coordinate and reference-coordinate gap measurement. |
+| **5** pipeline_integration.rs | Both `large_gap_artefact_wide_jump_clip` and `large_gap_artefact_hint_fallback` pass. |
+
+---
+
 ## Tests in this directory
 
 | Script | Test # | What it checks |
