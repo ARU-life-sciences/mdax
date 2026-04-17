@@ -49,8 +49,9 @@ from collections import Counter, defaultdict
 # Paths
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.path.join(SCRIPT_DIR, "..", "..", "chris_data")
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = os.path.join(SCRIPT_DIR, "..", "..", "chris_data")
+OUTPUT_DIR  = os.path.join(SCRIPT_DIR, "output")
 
 MDAX_TSV    = os.path.join(DATA_DIR, "ERR12263839.tsv")
 CHRIS_TSV   = os.path.join(DATA_DIR, "artifact_classifications_head.tsv")
@@ -61,11 +62,13 @@ CHRIS_TSV   = os.path.join(DATA_DIR, "artifact_classifications_head.tsv")
 
 ap = argparse.ArgumentParser(description=__doc__,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument("--out",     default=None, metavar="PATH",
-                help="Write joined TSV to this path (default: no file output)")
+ap.add_argument("--out",     default=os.path.join(OUTPUT_DIR, "joined.tsv"),
+                metavar="PATH",
+                help="Write joined TSV (default: output/joined.tsv)")
 ap.add_argument("--verbose", action="store_true",
                 help="Print per-read rows for classes with ≤20 overlapping reads")
 args = ap.parse_args()
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Guard: check data files exist

@@ -20,3 +20,6 @@
 # irx_tests: ignore large synthetic FASTA (regenerable via make_test_suite.py)
 /irx_tests/beds/
 /irx_tests/irx_truth.fa
+
+# chris_crossvalidation: ignore generated output artefacts (plots, joined tables)
+/tests/chris_crossvalidation/output/

@@ -37,8 +37,8 @@ Test 5 (Rust regression test for large-gap detection) lives in
 `../pipeline_integration.rs` as `large_gap_artefact_wide_jump_clip` and
 `large_gap_artefact_hint_fallback`.
 
-All tests run to stdout.  No output files are written by default; use
-`--out` / `--plot` flags where available (see per-test sections below).
+Output files are written to `output/` (gitignored).  Running any script bare
+produces default outputs there; use `--out` / `--plot` to override the path.
 
 ---
 
@@ -117,9 +117,9 @@ The script emits `[INFO]` rather than `[FAIL]` when n < 10.
 **Run:**
 
 ```bash
-python3 crossmatch.py
-python3 crossmatch.py --verbose             # show per-read detail for small classes
-python3 crossmatch.py --out joined.tsv      # save joined table
+python3 crossmatch.py                       # joined table → output/joined.tsv
+python3 crossmatch.py --verbose             # also print per-read detail for small classes
+python3 crossmatch.py --out other.tsv       # override output path
 ```
 
 ---
@@ -257,9 +257,9 @@ the molecule-internal gap is large.
 **Run:**
 
 ```bash
-python3 gap_scatter.py
-python3 gap_scatter.py --plot gap_scatter.png      # save a scatter plot
-python3 gap_scatter.py --plot gap_scatter.png --max-gap 5000
+python3 gap_scatter.py                             # scatter plot → output/gap_scatter.png
+python3 gap_scatter.py --max-gap 5000              # restrict axis range
+python3 gap_scatter.py --plot other.png            # override output path
 ```
 
 ---

@@ -47,8 +47,9 @@ from collections import defaultdict
 # Paths
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.path.join(SCRIPT_DIR, "..", "..", "chris_data")
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = os.path.join(SCRIPT_DIR, "..", "..", "chris_data")
+OUTPUT_DIR  = os.path.join(SCRIPT_DIR, "output")
 
 MDAX_TSV  = os.path.join(DATA_DIR, "ERR12263839.tsv")
 SUPP_TSV  = os.path.join(DATA_DIR, "supplementary_patterns_head.tsv")
@@ -59,11 +60,13 @@ SUPP_TSV  = os.path.join(DATA_DIR, "supplementary_patterns_head.tsv")
 
 ap = argparse.ArgumentParser(description=__doc__,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument("--plot",    default=None, metavar="PATH.png",
-                help="Save scatter plot to this PNG path (requires matplotlib)")
+ap.add_argument("--plot",    default=os.path.join(OUTPUT_DIR, "gap_scatter.png"),
+                metavar="PATH.png",
+                help="Save scatter plot (default: output/gap_scatter.png; requires matplotlib)")
 ap.add_argument("--max-gap", type=int, default=10000, metavar="BP",
                 help="Exclude pairs where either gap measure exceeds this (default: 10000)")
 args = ap.parse_args()
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Guard: check data files exist
