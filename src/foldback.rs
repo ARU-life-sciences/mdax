@@ -702,7 +702,15 @@ pub fn detect_foldback(
             continue;
         }
         let sc = st.score_proxy();
-        if sc > best_score {
+        // Deterministic tie-break: `scratch.stats` is a HashMap, whose
+        // iteration order varies run-to-run (random per-process hash seed).
+        // Without a tie-break, an exact score tie between two bins would
+        // non-deterministically pick whichever happened to be visited first,
+        // making detection results (and anything downstream: split position,
+        // signature, cut decision) irreproducible across runs on identical
+        // input. Prefer the smaller bin id on ties -- arbitrary but stable.
+        let better = sc > best_score || (sc == best_score && Some(bin) < best_bin);
+        if better {
             best_score = sc;
             best_bin = Some(bin);
             best_count = st.count;
@@ -1089,31 +1097,30 @@ pub fn recursive_foldback_cut_from_first_range(
     let mut fb_opt = Some(first_fb);
     let mut rf_opt = Some(first_rf);
 
-    // `detect_end` is the upper bound passed to the recursive detector.
-    // It tracks the end of the true left arm (arm_end), which may be shorter
-    // than `keep.end` when a gap is present.  Keeping detection within the arm
-    // prevents the gap region — which can look reverse-complement similar to the
-    // arm — from triggering spurious secondary detections.
-    let mut detect_end = keep.end;
+    // Bound passed to the recursive detector on *both* sides. It tracks the
+    // true arm boundary (excluding any gap) on whichever side was last cut,
+    // since the gap region can look reverse-complement similar to the arm
+    // and would otherwise confuse detection on the next pass. On the first
+    // iteration this equals `keep` exactly.
+    let mut detect: Range<usize> = keep.clone();
 
     for _ in 0..max_depth {
         // View of the sequence we are currently considering.
-        // Use `detect_end` (≤ keep.end) so recursive passes don't see the gap.
-        let view = &seq[keep.start..detect_end];
+        let view = &seq[detect.start..detect.end];
 
         // --- 1) detect foldback (skip for first iteration) ---
         let fb = match fb_opt.take() {
             Some(mut fb) => {
                 // Convert full-coord positions into view-local coords.
-                // (If keep.start==0, these are no-ops.)
-                if fb.split_pos >= keep.start {
-                    fb.split_pos -= keep.start;
+                // (If detect.start==0, these are no-ops.)
+                if fb.split_pos >= detect.start {
+                    fb.split_pos -= detect.start;
                 } else {
                     // If inconsistent, bail rather than panic.
                     break;
                 }
-                fb.arm_end = fb.arm_end.saturating_sub(keep.start);
-                fb.arm_start_right = fb.arm_start_right.saturating_sub(keep.start);
+                fb.arm_end = fb.arm_end.saturating_sub(detect.start);
+                fb.arm_start_right = fb.arm_start_right.saturating_sub(detect.start);
                 fb
             }
             None => match detect_foldback(view, &cfg.shared, &cfg.fold, scratch) {
@@ -1125,8 +1132,8 @@ pub fn recursive_foldback_cut_from_first_range(
         // --- 2) refine breakpoint (skip for first iteration) ---
         let rf = match rf_opt.take() {
             Some(mut rf) => {
-                if rf.split_pos >= keep.start {
-                    rf.split_pos -= keep.start;
+                if rf.split_pos >= detect.start {
+                    rf.split_pos -= detect.start;
                 } else {
                     break;
                 }
@@ -1187,18 +1194,38 @@ pub fn recursive_foldback_cut_from_first_range(
             }
         }
 
-        // artefact -> cut left (i.e., keep prefix of current view).
+        // artefact -> cut. Keep whichever side of the split is longer, rather
+        // than always keeping the left arm.
         //
-        // `rf.split_pos` is the anti-diagonal midpoint (≈ arm_end + gap/2).
-        // Output boundary: advance past the gap to arm_start_right so the gap
-        // bases are retained in the kept read.
-        // Detection boundary: stop at arm_end so the gap region does not confuse
-        // the recursive detector on the next pass.
-        // For clean hairpins gap_est ≈ 0, so both boundaries equal split_pos.
-        let arm_end_view   = rf.split_pos.saturating_sub(rf.gap_est / 2);
-        let arm_start_view = (rf.split_pos + rf.gap_est / 2).min(view.len());
-        keep.end   = keep.start + arm_start_view;
-        detect_end = keep.start + arm_end_view;
+        // `rf.split_pos` is the anti-diagonal midpoint (≈ arm_end + gap/2),
+        // in `view`-local coordinates. Convert the two candidate boundaries
+        // to full-sequence coordinates so they can be compared directly
+        // against `keep`, which may already have been narrowed by an
+        // earlier (nested) cut.
+        let abs_arm_end   = detect.start + rf.split_pos.saturating_sub(rf.gap_est / 2);
+        let abs_arm_start = detect.start + (rf.split_pos + rf.gap_est / 2).min(view.len());
+
+        // A foldback near the *start* of a long read means "keep the left
+        // arm" throws away almost the entire read, even though everything
+        // from the right arm onward (which may include a perfectly good
+        // trailing tail beyond the palindrome, not just the artefactual
+        // reverse-complement duplicate itself) is ordinary, assemblable
+        // sequence -- the RC(A) arm is exactly as valid DNA content as A is,
+        // just mirrored, so keeping *a* single non-self-overlapping copy is
+        // what matters, not specifically the left one. Compare both
+        // candidate lengths against the current `keep` bounds and keep the
+        // longer side, then keep recursing into *that* side on the next
+        // iteration (nested/compound artefacts can occur on either side).
+        let left_len = abs_arm_start.saturating_sub(keep.start);
+        let right_len = keep.end.saturating_sub(abs_arm_end);
+
+        if right_len > left_len {
+            keep.start = abs_arm_end;
+            detect = keep.start..keep.end;
+        } else {
+            keep.end = abs_arm_start;
+            detect = detect.start..abs_arm_end;
+        }
 
         // next iteration will detect/refine on the shortened view
     }
@@ -1212,9 +1239,10 @@ mod tests {
     use crate::fingerprint::foldback_signature_from_local_matches;
     use crate::utils::revcomp_in_place;
     use crate::{
-        cfg::{FoldOnlyCfg, MinimizerCfg, RefineCfg, SharedCfg},
+        cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg},
         scratch,
     };
+    use gxhash::HashMapExt;
 
     fn test_fold_cfg(
         k: usize,
@@ -1575,6 +1603,190 @@ mod tests {
             "noisy palindrome (~5% sub): expected identity ≥ 0.90, got {:.4}  \
              (fb.span={}, split_pos={})",
             rf.identity_est, fb.span, rf.split_pos
+        );
+    }
+
+    // ── keep-longer-side cut policy ─────────────────────────────────────────
+
+    fn cfg_for_cut_policy(sig_flank_bp: usize, sig_take: usize) -> MdaxCfg {
+        MdaxCfg {
+            shared: SharedCfg {
+                minimizer: MinimizerCfg { k: 17, w: 21, forward_only: true },
+                min_matches: 10,
+                end_guard: 100,
+                refine: RefineCfg {
+                    window: 100,
+                    arm: 900,
+                    mode: RefineMode::HiFi,
+                    max_ed_rate: 0.25,
+                    max_jump_clip: 1000,
+                },
+                fold_diag_tol: 120,
+            },
+            fold: FoldOnlyCfg { min_arm: 200 },
+            fold2: FoldSecondPassCfg {
+                min_support: 3,
+                min_identity: 0.6,
+                min_support_ident: 0.0,
+                cut_low_ident: false,
+            },
+            sig: SigCfg { flank_bp: sig_flank_bp, take: sig_take, value_shift: 0 },
+        }
+    }
+
+    /// An artefact foldback sitting near the *start* of a long read must keep
+    /// the much longer right-hand remainder, not the tiny left arm -- this is
+    /// the core behaviour change from "always keep left".
+    #[test]
+    fn artefact_near_read_start_keeps_longer_right_side() {
+        let lead = random_dna(500, 0xA11CE);
+        let arm = random_dna(1000, 0xB0B01);
+        let mut rc_arm = arm.clone();
+        revcomp_in_place(&mut rc_arm);
+        let trail = random_dna(8000, 0xC0DE1);
+
+        let mut seq = Vec::new();
+        seq.extend_from_slice(&lead);
+        seq.extend_from_slice(&arm);
+        seq.extend_from_slice(&rc_arm);
+        seq.extend_from_slice(&trail);
+
+        let cfg = cfg_for_cut_policy(300, 8);
+        let mut scratch = scratch::FoldScratch::new();
+
+        let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch)
+            .expect("should detect foldback near read start");
+        let mut refine_scratch = RefineScratch::default();
+        let rf = refine_breakpoint(
+            &seq, fb.split_pos, &cfg.shared, &mut refine_scratch, fb.span, fb.arm_end, fb.arm_start_right,
+        )
+        .unwrap()
+        .expect("should refine");
+
+        // Empty support map: nothing is "real", so this is treated as an artefact.
+        let support: HashMap<u64, SupportStats> = HashMap::new();
+        let mut sig_scratch = SigScratch::default();
+
+        let keep = recursive_foldback_cut_from_first_range(
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+        )
+        .unwrap();
+
+        let kept_len = keep.end - keep.start;
+        assert!(
+            kept_len > seq.len() / 2,
+            "expected the longer right-hand side (~9000bp) to be kept over \
+             the short left arm (~1500bp), got kept_len={kept_len} of {} \
+             (keep={:?})",
+            seq.len(), keep,
+        );
+        assert_eq!(
+            keep.end, seq.len(),
+            "expected the kept range to extend to the end of the read (right-keep), got {keep:?}"
+        );
+    }
+
+    /// The symmetric case: a foldback near the *end* of a long read must keep
+    /// the longer left-hand side, matching the pre-existing "keep left" policy.
+    #[test]
+    fn artefact_near_read_end_keeps_longer_left_side() {
+        let lead = random_dna(8000, 0xD00D1);
+        let arm = random_dna(1000, 0xE22E2);
+        let mut rc_arm = arm.clone();
+        revcomp_in_place(&mut rc_arm);
+        let trail = random_dna(500, 0xF44F3);
+
+        let mut seq = Vec::new();
+        seq.extend_from_slice(&lead);
+        seq.extend_from_slice(&arm);
+        seq.extend_from_slice(&rc_arm);
+        seq.extend_from_slice(&trail);
+
+        let cfg = cfg_for_cut_policy(300, 8);
+        let mut scratch = scratch::FoldScratch::new();
+
+        let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch)
+            .expect("should detect foldback near read end");
+        let mut refine_scratch = RefineScratch::default();
+        let rf = refine_breakpoint(
+            &seq, fb.split_pos, &cfg.shared, &mut refine_scratch, fb.span, fb.arm_end, fb.arm_start_right,
+        )
+        .unwrap()
+        .expect("should refine");
+
+        let support: HashMap<u64, SupportStats> = HashMap::new();
+        let mut sig_scratch = SigScratch::default();
+
+        let keep = recursive_foldback_cut_from_first_range(
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+        )
+        .unwrap();
+
+        let kept_len = keep.end - keep.start;
+        assert!(
+            kept_len > seq.len() / 2,
+            "expected the longer left-hand side (~9000bp) to be kept, got kept_len={kept_len} of {} (keep={:?})",
+            seq.len(), keep,
+        );
+        assert_eq!(
+            keep.start, 0,
+            "expected the kept range to start at the beginning of the read (left-keep), got {keep:?}"
+        );
+    }
+
+    /// A compound (nested) artefact must still be fully corrected regardless
+    /// of which side of the *outer* split happens to be longer: cutting the
+    /// outer junction must not terminate recursion, so any inner nested
+    /// junction within the kept side is also removed.
+    #[test]
+    fn nested_artefact_within_kept_longer_side_is_also_cut() {
+        // outer_lead is short, so the first (outer) cut keeps the right side --
+        // which itself still contains a second, inner foldback that must also
+        // be cleaned up rather than left in the output untouched.
+        let outer_lead = random_dna(300, 0x1234);
+        let outer_arm = random_dna(2000, 0x5678);
+        let mut outer_rc = outer_arm.clone();
+        revcomp_in_place(&mut outer_rc);
+
+        let inner_arm = random_dna(1500, 0x9abc);
+        let mut inner_rc = inner_arm.clone();
+        revcomp_in_place(&mut inner_rc);
+
+        let mut seq = Vec::new();
+        seq.extend_from_slice(&outer_lead);
+        seq.extend_from_slice(&outer_arm);
+        seq.extend_from_slice(&outer_rc);
+        seq.extend_from_slice(&inner_arm);
+        seq.extend_from_slice(&inner_rc);
+
+        let cfg = cfg_for_cut_policy(300, 8);
+        let mut scratch = scratch::FoldScratch::new();
+
+        let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch)
+            .expect("should detect at least the outer foldback");
+        let mut refine_scratch = RefineScratch::default();
+        let rf = refine_breakpoint(
+            &seq, fb.split_pos, &cfg.shared, &mut refine_scratch, fb.span, fb.arm_end, fb.arm_start_right,
+        )
+        .unwrap()
+        .expect("should refine");
+
+        let support: HashMap<u64, SupportStats> = HashMap::new();
+        let mut sig_scratch = SigScratch::default();
+
+        let keep = recursive_foldback_cut_from_first_range(
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+        )
+        .unwrap();
+
+        let kept_len = keep.end - keep.start;
+        // Whichever side got kept first, the surviving inner foldback must
+        // also have been trimmed: nothing containing a full second arm+RC(arm)
+        // pair (3000bp) should remain uncut.
+        assert!(
+            kept_len < seq.len() - 1000,
+            "expected the nested artefact to also be cut, kept_len={kept_len} of {} (keep={:?})",
+            seq.len(), keep,
         );
     }
 }

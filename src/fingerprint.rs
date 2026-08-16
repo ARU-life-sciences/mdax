@@ -148,7 +148,7 @@ fn hash_bands(vals: &[u64]) -> Vec<u64> {
         vals.hash(&mut h);
         return vec![h.finish()];
     }
-    (0..vals.len())
+    let mut bands: Vec<u64> = (0..vals.len())
         .map(|skip| {
             let mut h = gxhash::GxHasher::default();
             for (i, v) in vals.iter().enumerate() {
@@ -158,7 +158,17 @@ fn hash_bands(vals: &[u64]) -> Vec<u64> {
             }
             h.finish()
         })
-        .collect()
+        .collect();
+    // `vals` can contain duplicate values (two distinct minimizer positions
+    // hashing to the same value -- plausible in low-complexity or repetitive
+    // sequence, which is exactly where real inverted repeats can occur).
+    // Leaving out either copy of a duplicate produces the *same* remaining
+    // multiset and therefore the same band hash, so without deduping here a
+    // single read could insert into that one band twice, silently inflating
+    // its support count.
+    bands.sort_unstable();
+    bands.dedup();
+    bands
 }
 
 /// Compute a reproducible fingerprint for a foldback junction at `split` using sequence flanks.

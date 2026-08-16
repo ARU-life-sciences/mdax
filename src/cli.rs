@@ -88,7 +88,6 @@ Use '-' to write to stdout\n\
                 .default_value("-"),
         )
         // Output FASTA file path.
-        // TODO: by default we split the read taking the first 'half' of each read
         .arg(
             Arg::new("output")
                 .help("Output FASTA file path")
@@ -97,6 +96,12 @@ Use '-' to write to stdout\n\
 For each input read, mdax writes one output record containing the sequence you decided to keep:\n\
 - If no foldback is called, the read is written unchanged.\n\
 - If a foldback is called and judged an artefact, mdax cuts/chops the read (possibly recursively) and writes the kept portion.\n\
+  The kept portion is whichever side of the split is longer (left arm, or\n\
+  everything from the right arm onward), not always the left arm -- a\n\
+  foldback near the start of a long read would otherwise discard almost the\n\
+  whole read even though the tail past it is ordinary, assemblable sequence.\n\
+  Nested/compound artefacts are still fully corrected regardless of which\n\
+  side was kept first.\n\
 - If a foldback is judged 'real' (supported across reads), mdax keeps it intact by default.\n\
 ")
                 .short('o')
@@ -203,16 +208,33 @@ Practical guidance:\n\
 \n\
 Interpretation:\n\
 - Pass1 builds a support map keyed by a fingerprint/signature of the junction.\n\
-- In pass2, if a signature is observed in >= min-support reads (and split clustering is tight enough),\n\
-  `mdax` treats that junction as genome-templated and does NOT cut it by default.\n\
+- In pass2, if a signature is observed in >= min-support reads, `mdax` treats\n\
+  that junction as genome-templated and does NOT cut it by default.\n\
 \n\
 How it affects cutting:\n\
 - Increasing min-support means harder to be considered real. More foldbacks treated as artefacts therefore more cutting.\n\
 - Decreasing min-support means easier to be considered real. Fewer cuts, but risk of keeping recurrent artefacts.\n\
 \n\
+Coverage dependence and auto-calibration:\n\
+- min-support is a fixed absolute recurrence count. MDA coverage is often\n\
+  uneven, so a real inverted repeat sitting in a low-coverage patch of the\n\
+  library can be spanned by fewer reads than a hardcoded threshold purely by\n\
+  chance -- in which case it gets cut in every read that covers it.\n\
+- Unless you pass this flag explicitly, `mdax` self-calibrates: after pass1\n\
+  it computes this dataset's own typical recurrence among loci that recur at\n\
+  all, and lowers the effective min-support to that (never below 2, never\n\
+  above the mode/default value). This only ever makes the default *more*\n\
+  lenient for datasets with genuinely lower achieved recurrence -- it never\n\
+  raises the threshold, and passing --min-support explicitly disables it.\n\
+  Check stderr for a `SUPPORT CALIBRATION` line showing whether it fired.\n\
+\n\
 Guidance:\n\
-- For deep coverage datasets, you can raise this to be more conservative about calling 'real'.\n\
-- For shallow coverage, keep it low, otherwise almost nothing will qualify as real.")
+- For deep coverage datasets, auto-calibration will typically leave this\n\
+  alone; raise it explicitly only if you want to be more conservative than\n\
+  the mode default about calling 'real'.\n\
+- For shallow/uneven coverage, prefer leaving this unset (let auto-\n\
+  calibration adapt) over lowering it manually -- a manual override applies\n\
+  uniformly regardless of what this dataset actually achieved.")
               .value_parser(value_parser!(usize)),
         )
         .arg(

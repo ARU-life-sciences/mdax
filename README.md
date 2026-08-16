@@ -80,6 +80,12 @@ Options:
           For each input read, mdax writes one output record containing the sequence you decided to keep:
           - If no foldback is called, the read is written unchanged.
           - If a foldback is called and judged an artefact, mdax cuts/chops the read (possibly recursively) and writes the kept portion.
+          The kept portion is whichever side of the split is longer (left arm, or
+          everything from the right arm onward), not always the left arm -- a
+          foldback near the start of a long read would otherwise discard almost the
+          whole read even though the tail past it is ordinary, assemblable sequence.
+          Nested/compound artefacts are still fully corrected regardless of which
+          side was kept first.
           - If a foldback is judged 'real' (supported across reads), mdax keeps it intact by default.
 
 
@@ -153,16 +159,33 @@ Options:
 
           Interpretation:
           - Pass1 builds a support map keyed by a fingerprint/signature of the junction.
-          - In pass2, if a signature is observed in >= min-support reads (and split clustering is tight enough),
-          `mdax` treats that junction as genome-templated and does NOT cut it by default.
+          - In pass2, if a signature is observed in >= min-support reads, `mdax` treats
+          that junction as genome-templated and does NOT cut it by default.
 
           How it affects cutting:
           - Increasing min-support means harder to be considered real. More foldbacks treated as artefacts therefore more cutting.
           - Decreasing min-support means easier to be considered real. Fewer cuts, but risk of keeping recurrent artefacts.
 
+          Coverage dependence and auto-calibration:
+          - min-support is a fixed absolute recurrence count. MDA coverage is often
+          uneven, so a real inverted repeat sitting in a low-coverage patch of the
+          library can be spanned by fewer reads than a hardcoded threshold purely by
+          chance -- in which case it gets cut in every read that covers it.
+          - Unless you pass this flag explicitly, `mdax` self-calibrates: after pass1
+          it computes this dataset's own typical recurrence among loci that recur at
+          all, and lowers the effective min-support to that (never below 2, never
+          above the mode/default value). This only ever makes the default *more*
+          lenient for datasets with genuinely lower achieved recurrence -- it never
+          raises the threshold, and passing --min-support explicitly disables it.
+          Check stderr for a `SUPPORT CALIBRATION` line showing whether it fired.
+
           Guidance:
-          - For deep coverage datasets, you can raise this to be more conservative about calling 'real'.
-          - For shallow coverage, keep it low, otherwise almost nothing will qualify as real.
+          - For deep coverage datasets, auto-calibration will typically leave this
+          alone; raise it explicitly only if you want to be more conservative than
+          the mode default about calling 'real'.
+          - For shallow/uneven coverage, prefer leaving this unset (let auto-
+          calibration adapt) over lowering it manually -- a manual override applies
+          uniformly regardless of what this dataset actually achieved.
 
       --max-depth <max_depth>
           Override: maximum recursion depth when cutting foldback artefacts.
