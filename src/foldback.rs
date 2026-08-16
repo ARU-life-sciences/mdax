@@ -38,7 +38,8 @@
 
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
 use crate::fingerprint::{
-    SupportStats, foldback_signature, foldback_signature_from_local_matches, is_real_foldback,
+    SupportStats, best_support, foldback_signature_bands,
+    foldback_signature_from_local_matches_bands, is_real_foldback_stats,
 };
 use crate::minimizer::sampled_minimizers_into;
 use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
@@ -1154,7 +1155,7 @@ pub fn recursive_foldback_cut_from_first_range(
         // --- 3) signature (prefer local matches computed by detect_foldback) ---
         // Important: on the first iteration, scratch.best_matches is already populated
         // because pass2 called detect_foldback before calling this function.
-        let sig = foldback_signature_from_local_matches(
+        let bands = foldback_signature_from_local_matches_bands(
             &mut scratch.best_matches,
             rf.split_pos,
             cfg.sig.flank_bp,
@@ -1166,7 +1167,7 @@ pub fn recursive_foldback_cut_from_first_range(
             let q = 150usize;
             let split_q = (rf.split_pos / q) * q;
 
-            foldback_signature(
+            foldback_signature_bands(
                 view,
                 split_q,
                 &cfg.shared,
@@ -1177,11 +1178,13 @@ pub fn recursive_foldback_cut_from_first_range(
             )
         });
 
-        let Some(sig) = sig else { break };
+        let Some(bands) = bands else { break };
 
-        if is_real_foldback(sig, support, cfg) {
-            // real -> don't cut
-            break;
+        if let Some((_, st)) = best_support(&bands, support) {
+            if is_real_foldback_stats(st, cfg) {
+                // real -> don't cut
+                break;
+            }
         }
 
         // artefact -> cut left (i.e., keep prefix of current view).
@@ -1206,6 +1209,7 @@ pub fn recursive_foldback_cut_from_first_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fingerprint::foldback_signature_from_local_matches;
     use crate::utils::revcomp_in_place;
     use crate::{
         cfg::{FoldOnlyCfg, MinimizerCfg, RefineCfg, SharedCfg},

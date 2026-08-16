@@ -24,6 +24,38 @@ fn fmt_param<T: std::fmt::Display + PartialEq>(
     }
 }
 
+/// Weighted median of histogram keys `n`, restricted to entries with `n >= min_n`.
+///
+/// `histogram` maps support count -> number of support-map entries with that
+/// count (as built from `SupportStats::n` after pass1). Used to estimate the
+/// dataset's own "typical" recurrence depth among loci that recur at all, so
+/// `min_support` can be calibrated to it instead of staying a fixed constant
+/// blind to how much coverage this particular dataset actually achieved.
+fn weighted_median_at_least(
+    histogram: &std::collections::HashMap<usize, usize>,
+    min_n: usize,
+) -> Option<usize> {
+    let mut entries: Vec<(usize, i64)> = histogram
+        .iter()
+        .filter(|&(&n, _)| n >= min_n)
+        .map(|(&n, &c)| (n, c as i64))
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort_unstable_by_key(|&(n, _)| n);
+    let total: i64 = entries.iter().map(|&(_, c)| c).sum();
+    let half = (total + 1) / 2; // 1-indexed median position
+    let mut cum = 0i64;
+    for (n, c) in entries {
+        cum += c;
+        if cum >= half {
+            return Some(n);
+        }
+    }
+    None
+}
+
 fn main() -> Result<()> {
     let args = cli::build_cli();
 
@@ -172,7 +204,7 @@ fn main() -> Result<()> {
     }
 
     // cfg here:
-    let cfg = MdaxCfg {
+    let mut cfg = MdaxCfg {
         shared: SharedCfg {
             minimizer: MinimizerCfg { k, w, forward_only },
             min_matches,
@@ -265,6 +297,44 @@ fn main() -> Result<()> {
         (total_n as f64 / support.len().max(1) as f64),
     );
 
+    // Self-calibrate min_support to this dataset's own observed recurrence
+    // level, unless the user explicitly passed --min-support (or this is the
+    // fairness baseline, which must stay behaviorally frozen for legacy
+    // comparison).
+    //
+    // min_support alone is a *fixed absolute* recurrence threshold, blind to
+    // local sequencing depth. MDA coverage is notoriously uneven, so a real
+    // inverted repeat sitting in a low-coverage patch of the library can
+    // easily be spanned by fewer reads than a hardcoded preset value purely
+    // by chance -- in which case mdax's default behaviour is to cut it in
+    // every read that covers it, systematically damaging assembly
+    // contiguity at exactly the loci where long-read spanning matters most.
+    //
+    // We only ever LOWER the threshold here, clamped to the preset/override
+    // value the user already chose, so this can't make a well-covered
+    // dataset more permissive than requested -- it only rescues datasets
+    // where the achieved recurrence is genuinely lower than the preset
+    // assumed.
+    let min_support_explicit =
+        args.value_source("min_support") == Some(clap::parser::ValueSource::CommandLine);
+
+    if !fairness_baseline && !min_support_explicit {
+        if let Some(typical_recurrence) = weighted_median_at_least(&histogram, 2) {
+            let adaptive = typical_recurrence.clamp(2, min_support);
+            if adaptive < min_support {
+                elog!(
+                    "SUPPORT CALIBRATION",
+                    "min_support {} -> {} (dataset's typical recurrence among recurring loci is {})",
+                    min_support,
+                    adaptive,
+                    typical_recurrence
+                );
+                min_support = adaptive;
+                cfg.fold2.min_support = min_support;
+            }
+        }
+    }
+
     elog!(
         "SUPPORT SANITY",
         "total_clusters={} total_support_reads={} max_n={}",
@@ -319,9 +389,14 @@ fn main() -> Result<()> {
 
     let support_arc = Arc::new(support);
 
+    // Pass1 didn't need fold2.min_support (only pass2's real/artefact gate
+    // does), so it's safe that `cfg_arc` above was built before calibration --
+    // but pass2 must see the calibrated value, so build a fresh Arc here.
+    let cfg_arc_pass2 = Arc::new(cfg.clone());
+
     let (foldback_reads, cut_reads, real_reads) = pipeline::pass2_correct_and_write(
         &fasta,
-        cfg_arc.clone(),
+        cfg_arc_pass2,
         support_arc.clone(),
         max_depth,
         threads,

@@ -15,7 +15,8 @@ use std::thread;
 use crate::{
     cfg::MdaxCfg,
     fingerprint::{
-        SupportStats, foldback_signature, foldback_signature_from_local_matches, is_real_foldback,
+        SupportStats, best_support, foldback_signature_bands,
+        foldback_signature_from_local_matches_bands, is_real_foldback_stats,
     },
     foldback, io,
     scratch::{FoldScratch, SigScratch},
@@ -256,7 +257,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
                         }
                         dbg.bump("ident_ok");
 
-                        let sig = foldback_signature_from_local_matches(
+                        let bands = foldback_signature_from_local_matches_bands(
                             &mut fold_scratch.best_matches,
                             rf.split_pos,
                             cfg.sig.flank_bp,
@@ -266,7 +267,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
                         .or_else(|| {
                             let q = 150usize;
                             let split_q = (rf.split_pos / q) * q;
-                            foldback_signature(
+                            foldback_signature_bands(
                                 seq,
                                 split_q,
                                 &cfg.shared,
@@ -277,13 +278,19 @@ pub fn pass1_build_support<P: AsRef<Path>>(
                             )
                         });
 
-                        let Some(sig) = sig else { continue };
+                        let Some(bands) = bands else { continue };
                         dbg.bump("sig_ok");
 
-                        local
-                            .entry(sig)
-                            .and_modify(|st| st.update(rf.split_pos, rf.identity_est))
-                            .or_insert_with(|| SupportStats::new(rf.split_pos, rf.identity_est));
+                        // Every band is a candidate key for this read's locus (see
+                        // foldback_signature_from_local_matches_bands): a read whose
+                        // sketch differs from another read's by only one element still
+                        // shares a band with it, so insert under all of them.
+                        for band in bands {
+                            local
+                                .entry(band)
+                                .and_modify(|st| st.update(rf.split_pos, rf.identity_est))
+                                .or_insert_with(|| SupportStats::new(rf.split_pos, rf.identity_est));
+                        }
                     }
                 }
 
@@ -599,7 +606,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                     // The recursive cutter's first iteration will find an empty
                                     // window and fall back to the flank signature, which also
                                     // uses the refined split and therefore still matches pass 1.
-                                    let sig_from_matches = foldback_signature_from_local_matches(
+                                    let bands_from_matches = foldback_signature_from_local_matches_bands(
                                         &mut fold_scratch.best_matches,
                                         sig_split,
                                         cfg.sig.flank_bp,
@@ -607,10 +614,10 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                         cfg.sig.value_shift,
                                     );
 
-                                    let sig = sig_from_matches.or_else(|| {
+                                    let bands = bands_from_matches.or_else(|| {
                                         let q = 150usize;
                                         let split_q = (sig_split / q) * q;
-                                        foldback_signature(
+                                        foldback_signature_bands(
                                             &job.seq,
                                             split_q,
                                             &cfg.shared,
@@ -621,25 +628,25 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                         )
                                     });
 
-                                    if let Some(sig) = sig {
+                                    if let Some(bands) = bands {
                                         dbg.bump("sig_ok");
 
-                                        let (real, n, rank_frac, span) = if let Some(st) = support.get(&sig) {
+                                        let (real, n, rank_frac, span) = if let Some((band, st)) = best_support(&bands, &support) {
                                             dbg.bump("sig_in_support");
                                             if hit_sig_sample.len() < 5 {
-                                                hit_sig_sample.push((sig, st.n));
+                                                hit_sig_sample.push((band, st.n));
                                             }
-                                            let rf = *rank_map.get(&sig).unwrap_or(&0.0);
+                                            let rf = *rank_map.get(&band).unwrap_or(&0.0);
                                             (
-                                                is_real_foldback(sig, &support, &cfg),
+                                                is_real_foldback_stats(st, &cfg),
                                                 st.n,
                                                 rf,
                                                 st.split_span(),
                                             )
                                         } else {
                                             dbg.bump("sig_not_in_support");
-                                            if miss_sig_sample.len() < 5 {
-                                                miss_sig_sample.push(sig);
+                                            if miss_sig_sample.len() < 5 && !bands.is_empty() {
+                                                miss_sig_sample.push(bands[0]);
                                             }
                                             (false, 0, 0.0, 0)
                                         };

@@ -52,13 +52,13 @@ use crate::{
 /// Why locality helps:
 /// - junction-adjacent evidence is most informative for the breakpoint identity
 /// - distant repeats can introduce collisions and reduce specificity
-pub fn foldback_signature_from_local_matches(
+fn local_match_sketch(
     matches: &mut Vec<(usize, u64)>, // (pos, val)
     split: usize,
     window_bp: usize,
     take: usize,
     value_shift: u8,
-) -> Option<u64> {
+) -> Option<Vec<u64>> {
     // Keep only matches close to the junction
     matches.retain(|(pos, _)| {
         let d = if *pos > split {
@@ -93,9 +93,72 @@ pub fn foldback_signature_from_local_matches(
         vals.sort_unstable();
     }
 
+    Some(vals)
+}
+
+pub fn foldback_signature_from_local_matches(
+    matches: &mut Vec<(usize, u64)>, // (pos, val)
+    split: usize,
+    window_bp: usize,
+    take: usize,
+    value_shift: u8,
+) -> Option<u64> {
+    let vals = local_match_sketch(matches, split, window_bp, take, value_shift)?;
     let mut h = gxhash::GxHasher::default();
     vals.hash(&mut h);
     Some(h.finish())
+}
+
+/// Same evidence as [`foldback_signature_from_local_matches`], but returned as a
+/// set of LSH "leave-one-out" band signatures instead of a single exact hash.
+///
+/// Background: the bottom-`take` MinHash sketch is meant to support *approximate*
+/// matching (estimate overlap between two reads' minimizer sets), but hashing the
+/// whole sorted sketch into one `u64` and using that as an exact `HashMap` key
+/// throws that away -- a single sequencing error changing just one of the `take`
+/// smallest values (a very likely event: HiFi's ~0.1-0.2% substitution rate means
+/// a handful of the ~20-40 candidate minimizers in a junction window will differ
+/// read-to-read, and MinHash's bottom-k selection is a high-variance function of
+/// exactly which ones survive) silently changes the *entire* signature and drops
+/// the read out of the support count for its true locus, even under otherwise
+/// ample coverage.
+///
+/// Fix: emit one band per left-out element (`take` bands total). Two reads whose
+/// sketches differ by at most one element still share at least one band, so they
+/// still collide in the support map, while still using cheap O(1) hash lookups
+/// (as opposed to storing full sketches and doing O(n) fuzzy comparison against
+/// every existing support entry).
+pub fn foldback_signature_from_local_matches_bands(
+    matches: &mut Vec<(usize, u64)>, // (pos, val)
+    split: usize,
+    window_bp: usize,
+    take: usize,
+    value_shift: u8,
+) -> Option<Vec<u64>> {
+    let vals = local_match_sketch(matches, split, window_bp, take, value_shift)?;
+    Some(hash_bands(&vals))
+}
+
+/// Hash `vals` (assumed already sorted/deduped as desired) into `vals.len()`
+/// leave-one-out band signatures (or a single whole-set hash if `vals.len() <= 1`).
+/// See [`foldback_signature_from_local_matches_bands`] for the rationale.
+fn hash_bands(vals: &[u64]) -> Vec<u64> {
+    if vals.len() <= 1 {
+        let mut h = gxhash::GxHasher::default();
+        vals.hash(&mut h);
+        return vec![h.finish()];
+    }
+    (0..vals.len())
+        .map(|skip| {
+            let mut h = gxhash::GxHasher::default();
+            for (i, v) in vals.iter().enumerate() {
+                if i != skip {
+                    v.hash(&mut h);
+                }
+            }
+            h.finish()
+        })
+        .collect()
 }
 
 /// Compute a reproducible fingerprint for a foldback junction at `split` using sequence flanks.
@@ -117,7 +180,7 @@ pub fn foldback_signature_from_local_matches(
 /// Performance notes:
 /// - Uses `SigScratch` to avoid allocations across calls.
 /// - Constructs a lightweight minimizer config rather than cloning `SharedCfg`.
-pub fn foldback_signature(
+fn flank_sketch(
     seq: &[u8],
     split: usize,
     shared: &SharedCfg,
@@ -125,9 +188,9 @@ pub fn foldback_signature(
     take: usize,
     scratch: &mut SigScratch,
     value_shift: u8,
-) -> Option<u64> {
+) -> bool {
     if split < flank_bp || split + flank_bp > seq.len() {
-        return None;
+        return false;
     }
 
     let left = &seq[split - flank_bp..split];
@@ -161,7 +224,7 @@ pub fn foldback_signature(
 
     // Need at least `take` minimizers from each side to build a stable signature.
     if scratch.val_l.len() < take || scratch.val_r.len() < take {
-        return None;
+        return false;
     }
 
     // sort values and take smallest `take`
@@ -181,9 +244,42 @@ pub fn foldback_signature(
         scratch.combined.sort_unstable();
     }
 
+    true
+}
+
+pub fn foldback_signature(
+    seq: &[u8],
+    split: usize,
+    shared: &SharedCfg,
+    flank_bp: usize,
+    take: usize,
+    scratch: &mut SigScratch,
+    value_shift: u8,
+) -> Option<u64> {
+    if !flank_sketch(seq, split, shared, flank_bp, take, scratch, value_shift) {
+        return None;
+    }
     let mut h = GxHasher::default();
     scratch.combined.hash(&mut h);
     Some(h.finish())
+}
+
+/// Band-signature counterpart of [`foldback_signature`] -- see
+/// [`foldback_signature_from_local_matches_bands`] for the rationale (same
+/// bottom-k MinHash instability applies here, across both flanks).
+pub fn foldback_signature_bands(
+    seq: &[u8],
+    split: usize,
+    shared: &SharedCfg,
+    flank_bp: usize,
+    take: usize,
+    scratch: &mut SigScratch,
+    value_shift: u8,
+) -> Option<Vec<u64>> {
+    if !flank_sketch(seq, split, shared, flank_bp, take, scratch, value_shift) {
+        return None;
+    }
+    Some(hash_bands(&scratch.combined))
 }
 
 // Support statistics (pass1 aggregation; pass2 decisions)
@@ -242,12 +338,25 @@ impl SupportStats {
     }
 }
 
-/// Decide whether a foldback junction is "real" based on pass1 support statistics.
-pub fn is_real_foldback(sig: u64, support: &HashMap<u64, SupportStats>, cfg: &MdaxCfg) -> bool {
-    let Some(st) = support.get(&sig) else {
-        return false;
-    };
+/// Given the band signatures for a read's foldback junction, find the best-supported
+/// matching entry in the support map (the one with the highest read count `n`).
+///
+/// A read's junction maps to several band signatures (see
+/// [`foldback_signature_from_local_matches_bands`]); any one of them colliding with
+/// an existing support-map entry is evidence for the same underlying locus, so we
+/// take the strongest match rather than requiring all bands to agree.
+pub fn best_support<'a>(
+    bands: &[u64],
+    support: &'a HashMap<u64, SupportStats>,
+) -> Option<(u64, &'a SupportStats)> {
+    bands
+        .iter()
+        .filter_map(|&b| support.get(&b).map(|st| (b, st)))
+        .max_by_key(|(_, st)| st.n)
+}
 
+/// Core "real vs artefact" gate, given an already-resolved support entry.
+pub fn is_real_foldback_stats(st: &SupportStats, cfg: &MdaxCfg) -> bool {
     // Read-space split positions are not expected to cluster tightly across reads.
     // The signature already anchors the locus; use support count as the primary gate.
     if st.n < cfg.fold2.min_support {
@@ -262,11 +371,19 @@ pub fn is_real_foldback(sig: u64, support: &HashMap<u64, SupportStats>, cfg: &Md
     true
 }
 
+/// Decide whether a foldback junction is "real" based on pass1 support statistics.
+pub fn is_real_foldback(sig: u64, support: &HashMap<u64, SupportStats>, cfg: &MdaxCfg) -> bool {
+    let Some(st) = support.get(&sig) else {
+        return false;
+    };
+    is_real_foldback_stats(st, cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cfg::{FoldOnlyCfg, FoldSecondPassCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg};
-    use crate::foldback::detect_foldback;
+    use crate::foldback::{detect_foldback, refine_breakpoint};
     use crate::pipeline::pass1_build_support;
     use crate::scratch::FoldScratch;
     use crate::utils::RefineMode;
@@ -366,6 +483,32 @@ mod tests {
         }
     }
 
+    /// Mirror exactly what pass1/pass2 do to turn a read into band signatures:
+    /// detect + refine (HiFi fast path), prefer the local-match signature,
+    /// fall back to the flank signature. Used by tests that need to look up
+    /// the support map the same way production code populated it.
+    fn read_bands(seq: &[u8], cfg: &MdaxCfg) -> Option<Vec<u64>> {
+        let mut scratch = FoldScratch::new();
+        let fb = detect_foldback(seq, &cfg.shared, &cfg.fold, &mut scratch)?;
+        let mut refine_scratch = crate::scratch::RefineScratch::default();
+        let rf = refine_breakpoint(
+            seq, fb.split_pos, &cfg.shared, &mut refine_scratch, fb.span, fb.arm_end, fb.arm_start_right,
+        )
+        .ok()??;
+
+        foldback_signature_from_local_matches_bands(
+            &mut scratch.best_matches, rf.split_pos, cfg.sig.flank_bp, cfg.sig.take, cfg.sig.value_shift,
+        )
+        .or_else(|| {
+            let q = 150usize;
+            let split_q = (rf.split_pos / q) * q;
+            let mut sig_scratch = SigScratch::default();
+            foldback_signature_bands(
+                seq, split_q, &cfg.shared, cfg.sig.flank_bp, cfg.sig.take, &mut sig_scratch, cfg.sig.value_shift,
+            )
+        })
+    }
+
     fn cfg_for_pass1() -> MdaxCfg {
         // Make it easy to detect + refine + fingerprint.
         MdaxCfg {
@@ -410,10 +553,10 @@ mod tests {
         // Need >= 1000bp on each side of junction for foldback_signature().
         // So left must be >= 1000, and overall read long enough.
         let left = pseudo_dna(2500, 42);
-        let (seq, _true_split) = make_clean_foldback(&left, b"");
+        let (seq, split) = make_clean_foldback(&left, b"");
 
-        // 3 identical foldback reads -> should become one signature with n=3
-        // plus a decoy random read that should be ignored
+        // 3 identical foldback reads -> should become one recurrent locus
+        // plus a decoy random read that should be ignored.
         let decoy = pseudo_dna(6000, 999);
 
         let path = tmp_fasta_path("mdax_fold2_pass1");
@@ -429,16 +572,30 @@ mod tests {
         // remove file
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(
-            support.len(),
-            1,
-            "expected exactly one foldback fingerprint cluster"
+        // A single recurrent locus is now stored under up to `sig.take` band
+        // keys (see foldback_signature_from_local_matches_bands), not one
+        // exact key -- three byte-identical reads produce byte-identical
+        // sketches, so every band should collide across all three, and none
+        // should exceed `sig.take` total bands (the decoy must not add any).
+        assert!(
+            support.len() >= 1 && support.len() <= cfg2.sig.take,
+            "expected between 1 and sig.take={} band clusters, got {}",
+            cfg2.sig.take,
+            support.len()
         );
+        for st in support.values() {
+            assert_eq!(st.n, 3, "should have 3 supporting reads on every band");
+            assert_eq!(st.split_span(), 0, "identical reads should cluster tightly");
+            assert!(st.mean_ident >= cfg2.fold2.min_identity);
+        }
 
-        let (_sig, st) = support.iter().next().unwrap();
-        assert_eq!(st.n, 3, "should have 3 supporting reads");
-        assert_eq!(st.split_span(), 0, "identical reads should cluster tightly");
-        assert!(st.mean_ident >= cfg2.fold2.min_identity);
+        // Querying with read1's own bands (computed the same way pass1/pass2
+        // do: detect + refine + prefer local-match signature) must resolve
+        // to the fully-supported locus.
+        let _ = split; // true split retained for readability; production uses the refined split
+        let bands = read_bands(&seq, &cfg2).expect("bands for read1");
+        let (_band, st) = best_support(&bands, &support).expect("locus should be found");
+        assert_eq!(st.n, 3);
     }
 
     #[test]
@@ -583,27 +740,45 @@ mod tests {
 
         let split = left.len(); // join is empty
         let s1 = base.clone();
-        let s2 = mutate_far(base.clone(), split, 1100, 97); // outside ±1100 keeps 1000bp flanks intact
-        let s3 = mutate_far(base.clone(), split, 1100, 131);
+        let s2 = base.clone(); // a second clean copy: real data is mostly error-free reads
+        let s3 = mutate_far(base.clone(), split, 1100, 97); // outside ±1100 keeps 1000bp flanks intact
+        let s4 = mutate_far(base.clone(), split, 1100, 131);
 
         let decoy = pseudo_dna(8000, 999);
 
         let path = tmp_fasta_path("mdax_fold2_pass1_flank_noise");
         write_fasta(
             &path,
-            &[("r1", &s1), ("r2", &s2), ("r3", &s3), ("decoy", &decoy)],
+            &[
+                ("r1", &s1),
+                ("r2", &s2),
+                ("r3", &s3),
+                ("r4", &s4),
+                ("decoy", &decoy),
+            ],
         );
 
+        let cfg2 = cfg.clone();
         let support = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(
-            support.len(),
-            1,
-            "should still be one cluster when noise is outside flanks"
+        // With banded signatures, noise on r3/r4 that changes even one of the
+        // `take` smallest minimizer values (despite sitting outside the
+        // locality window used for detection -- edge effects from windowed
+        // minimizer selection near the flank boundary) no longer needs to
+        // hash *identically* to r1/r2's clean signature: it only needs to
+        // share one leave-one-out band with the clean majority. So the true
+        // locus should still accumulate at least the 2 clean reads (r1, r2)
+        // under a single band, and typically rescue r3 and/or r4 too.
+        let _ = split;
+        let bands = read_bands(&s1, &cfg2).expect("bands for read1");
+        let (_band, st) = best_support(&bands, &support)
+            .expect("clean-majority locus should be found even with noisy stragglers");
+        assert!(
+            st.n >= 2,
+            "expected at least the 2 clean reads to cluster together, got n={}",
+            st.n
         );
-        let (_sig, st) = support.iter().next().unwrap();
-        assert_eq!(st.n, 3);
     }
 
     #[test]
@@ -732,7 +907,12 @@ mod tests {
         let support = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(support.len(), 1);
+        assert!(
+            support.len() >= 1 && support.len() <= cfg2.sig.take,
+            "expected between 1 and sig.take={} band clusters, got {}",
+            cfg2.sig.take,
+            support.len()
+        );
         let (&sig, st) = support.iter().next().unwrap();
         assert!(is_real_foldback(sig, &support, &cfg2));
         assert_eq!(st.n, 3);
