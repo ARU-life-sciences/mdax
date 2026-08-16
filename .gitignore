@@ -23,3 +23,8 @@
 
 # chris_crossvalidation: ignore generated output artefacts (plots, joined tables)
 /tests/chris_crossvalidation/output/
+
+# synth_bench: ignore generated genomes/reads/assemblies (regenerable via run_all.sh); track scripts only
+/synth_bench/run_*/
+/synth_bench/test_*/
+/synth_bench/*.log
