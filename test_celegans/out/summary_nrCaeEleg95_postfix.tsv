@@ -1,0 +1,2 @@
+sample	max_reads	total	detected	detected_frac	artefact	artefact_frac	low_ident	low_ident_frac	real	real_frac	bases_before_bp	bases_after_bp	bases_removed_bp	frac_retained	identity_median	identity_mean	identity_q10	identity_q90
+nrCaeEleg95 (64.5% BUSCO, 7944 ctgs, post-fix)	200000	200000	77249	0.3862	70445	0.3522	0	0.0000	6804	0.0340	731010621	365395067	365615554	0.4998	0.9960	0.9615	0.9380	1.0000
