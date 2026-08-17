@@ -40,12 +40,23 @@ Input data is **not tracked in git** (stored in `out/`, gitignored):
 
 ## Results
 
+_Refreshed against the post-fix build (support-map signature banding,
+min-support auto-calibration, keep-longer-side cut policy — see main
+README/CHANGELOG). Numbers are unchanged from the pre-fix run: this
+20k-read ONT subsample has essentially no recurrent junctions
+(`avg_n≈1.0` in the pass1 support histogram — almost every detected
+signature is a singleton), so none of the three fixes have anything to
+act on here, and precision/recall/F1 are purely classification metrics
+that the cut-policy change doesn't touch at all. This is expected, not
+a null result: the fixes specifically target coverage-dependent support
+recurrence and output length, neither of which this benchmark exercises._
+
 Metrics are generous (artefact + low_ident both counted as true positive) unless noted.
 
 | Configuration | Precision | Recall | F1 |
 |---|---|---|---|
 | `balanced --refine-mode hifi` (default, `test_pal.sh`) | 0.998 | 0.647 | 0.785 |
-| `permissive --refine-mode ont --cut-low-ident` (best ONT, from sweep) | **0.995** | **0.803** | **0.889** |
+| `permissive --refine-mode ont --cut-low-ident` (best ONT, from sweep) | **0.995** | **0.803** | **0.888** |
 
 The default run uses balanced/HiFi mode with no additional flags — this is what `test_pal.sh` executes. The sweep explores all combinations; see `sweep_summary.tsv` for machine-readable per-configuration metrics.
 
@@ -71,7 +82,7 @@ This benchmark validates `mdax` on ONT data against an independent published too
 
 **ONT requires different settings to HiFi.** The default HiFi configuration (`--mode balanced --refine-mode hifi`) achieves ~65% recall on this ONT dataset. This is substantially lower than the ~80% recall of ONT mode — the Hamming-based refinement is tuned for the low error rate of HiFi CCS reads and places split positions less accurately in noisier ONT sequence, causing some reads to fall below the identity threshold. Switching to `--refine-mode ont` (banded Levenshtein) raises generous recall from 0.647 to 0.803.
 
-**Recommended ONT flags.** `--mode permissive --refine-mode ont --cut-low-ident` achieves the best balance (F1 ≈ 0.889, precision 0.995, recall 0.803). The `--mode permissive` flag lowers the support-map threshold, accepting weaker evidence that is typical in noisier ONT data. `--cut-low-ident` ensures reads with a confirmed foldback but lower arm identity are still corrected rather than flagged and kept.
+**Recommended ONT flags.** `--mode permissive --refine-mode ont --cut-low-ident` achieves the best balance (F1 ≈ 0.888, precision 0.995, recall 0.803). The `--mode permissive` flag lowers the support-map threshold, accepting weaker evidence that is typical in noisier ONT data. `--cut-low-ident` ensures reads with a confirmed foldback but lower arm identity are still corrected rather than flagged and kept.
 
 **Precision is consistently high.** Across all tested configurations precision is ≥ 0.995 — the tool almost never calls a false positive. The main lever for improving performance on ONT is recall, not false-positive suppression.
 

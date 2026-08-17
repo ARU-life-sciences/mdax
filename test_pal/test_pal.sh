@@ -124,7 +124,7 @@ echo "== Sanity check: ID overlap sample =="
 comm -12 \
   <(cut -f1 mdax.calls.norm.tsv | LC_ALL=C sort -u) \
   <(LC_ALL=C sort -u "$BASELINE_CANON_IDS") \
-  | head
+  | head || true
 
 echo "== Running comparison =="
 python3 ./test_pal.py
