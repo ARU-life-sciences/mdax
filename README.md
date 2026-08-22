@@ -2,6 +2,8 @@
 
 Read in HiFi or ONT raw data generated from Multiple Displacement Amplification methods, and correct reads. This tool currently only corrects 'foldback' or 'invert' chimeras (`mdax`). We also provide a binary to search for long Inverted Repeats (IR's) in assemblies (`irx`).
 
+**Contents:** [Install](#install) · [Quick start & recommended settings](#quick-start--recommended-settings) · [Full CLI reference](#usage) · [Tests and benchmarks](#tests-and-benchmarks) · [Performance](#performance) · [Algorithm overview](#algorithm-overview) · [`irx`](#irx-detecting-natural-irs-from-assemblies)
+
 ## Install
 
 Currently you'll have to clone this repo, have Rust installed, and compile:
@@ -18,15 +20,50 @@ RUSTFLAGS='-C target-feature=+aes,+sse2,+avx2' cargo build --release
 RUSTFLAGS='-C target-feature=+aes,+sse2,+avx2' cargo install --path=.
 ```
 
-## Usage
-
-There are lots of options (see below), but to get started:
+## Quick start & recommended settings
 
 ```bash
 mdax --output <output.fa> <in.fa> > <out.table>
 ```
 
-Default outputs are the fasta file of corrected reads, and a table of all detected foldback chimeras in the readset.
+Default outputs are the fasta file of corrected reads, and a table of all detected foldback chimeras in the readset. The full flag reference is below in [Usage](#usage) — this section covers the settings you actually need for the common cases.
+
+### Recommended by data type
+
+| Data type | Recommended command |
+|---|---|
+| PacBio HiFi / CCS | `mdax --mode balanced --refine-mode hifi --cut-low-ident -o out.fa -r out.tsv in.fa` |
+| ONT | `mdax --mode permissive --refine-mode ont --cut-low-ident -o out.fa -r out.tsv in.fa` |
+
+`--cut-low-ident` ensures reads detected as foldbacks are trimmed even when arm identity falls below the internal threshold (common in both MDA data types). For ONT, `--refine-mode ont` automatically switches to smaller k-mers (k=11, w=11) for better sensitivity on error-prone reads, unless you set `-k`/`-w` explicitly — the effective values are echoed in the parameter summary printed at startup.
+
+**On `--min-support`:** don't lower this manually to compensate for low or uneven coverage. Unless you pass `--min-support` explicitly, mdax self-calibrates it to your dataset's own achieved recurrence after pass 1 (never below 2, never above the mode default) — check stderr for a `SUPPORT CALIBRATION` line to see whether it fired and what it picked. A manual override applies uniformly regardless of what your dataset actually achieved and is easy to get wrong in either direction.
+
+### Examples
+
+Basic HiFi correction, writing the report to a file instead of stdout:
+```bash
+mdax --mode balanced --refine-mode hifi --cut-low-ident \
+    -o corrected.fa -r report.tsv reads.fasta.gz
+```
+
+ONT correction, using more threads:
+```bash
+mdax --mode permissive --refine-mode ont --cut-low-ident -t 16 \
+    -o corrected.fa -r report.tsv reads.fastq.gz
+```
+
+Conservative run for a dataset you don't fully trust yet — fewer, higher-confidence cuts:
+```bash
+mdax --mode strict --refine-mode hifi -o corrected.fa -r report.tsv reads.fasta.gz
+```
+
+Report only, no correction — inspect calls before deciding whether to trust them (nothing is written to `/dev/null` that you need):
+```bash
+mdax --mode balanced -o /dev/null -r report.tsv reads.fasta.gz
+```
+
+## Usage
 
 Current usage is:
 
@@ -437,15 +474,6 @@ Options:
           Print version
 ```
 
-## Recommendations by data type
-
-| Data type | Recommended flags |
-|---|---|
-| PacBio HiFi / CCS | `--mode balanced --refine-mode hifi --cut-low-ident` |
-| ONT | `--mode permissive --refine-mode ont --cut-low-ident` |
-
-`--cut-low-ident` ensures reads detected as foldbacks are trimmed even when arm identity falls below the internal threshold (common in both MDA data types). For ONT, `--refine-mode ont` automatically uses smaller k-mers (k=11, w=11) for better sensitivity on error-prone reads — this is shown in the parameter summary at runtime.
-
 ## Tests and benchmarks
 
 | Directory | Tool | Type | Data | README |
@@ -475,7 +503,7 @@ Metrics are generous (artefact + low_ident both counted as true positive).
 | Configuration | Precision | Recall | F1 |
 |---|---|---|---|
 | `balanced --refine-mode hifi` (default) | 0.998 | 0.647 | 0.785 |
-| `permissive --refine-mode ont --cut-low-ident` | **0.995** | **0.803** | **0.889** |
+| `permissive --refine-mode ont --cut-low-ident` | **0.995** | **0.803** | **0.888** |
 
 ```bash
 cd test_pal && ./test_pal.sh       # single run
@@ -486,13 +514,15 @@ cd test_pal && ./sweep.sh          # parameter sweep (cached)
 
 Two real PacBio CCS single-worm MDA samples with contrasting BUSCO scores. No external ground truth; primary metric is artefact detection rate.
 
-| | nrCaeEleg92 (82.3% BUSCO) | nrCaeEleg95 (64.5% BUSCO) |
+| | nrCaeEleg92 (82.3% BUSCO) — pre-fix, not refreshed | nrCaeEleg95 (64.5% BUSCO) — post-fix |
 |---|---|---|
 | Foldback detected | 85,508 (42.8%) | 77,249 (38.6%) |
-| → artefact cut | 85,137 (42.6%) | 76,714 (38.4%) |
-| → real palindrome | 371 (0.2%) | 535 (0.3%) |
-| Bases removed | ~422 Mb | ~396 Mb |
+| → artefact cut | 85,137 (42.6%) | 70,445 (35.2%) |
+| → real palindrome | 371 (0.2%) | 6,804 (3.4%) |
+| Bases removed | ~422 Mb | ~366 Mb |
 | Fraction of artefact read retained | ~49.8% | ~50.0% |
+
+Detection is unchanged by the current build (nrCaeEleg95: 77,249 both before and after); what changed is the real/artefact split — a 12.7x increase in junctions correctly classified "real" (535 → 6,804), because `min_support` now self-calibrates to this dataset's actual recurrence instead of using a fixed threshold. Confirmed at the assembly level too: reassembling a corrected nrCaeEleg95 subsample with hifiasm gives N50 216kb → 370kb (+71%) and BUSCO complete 92.2% → 96.6% versus no correction. See [test_celegans/README.md](test_celegans/README.md) for the full breakdown; nrCaeEleg92's raw reads weren't available to refresh.
 
 ```bash
 cd test_celegans && ./benchmark.sh           # 200k reads per sample
