@@ -348,34 +348,6 @@ fn classify_ir_str(spacer: isize, immediate_bp: usize, wide_bp: usize) -> &'stat
     }
 }
 
-#[inline]
-fn ir_class_from_arms(
-    la0: usize,
-    la1: usize,
-    ra0: usize,
-    ra1: usize,
-) -> Option<(&'static str, isize)> {
-    // require sane, ordered arms
-    if la0 >= la1 || ra0 >= ra1 {
-        return None;
-    }
-    // ensure left is left
-    let (_la0, la1, ra0, _ra1) = normalize_arms(la0, la1, ra0, ra1);
-
-    // spacer between arms (can be negative if overlapping)
-    let spacer = ra0 as isize - la1 as isize;
-
-    let class = if spacer <= 0 {
-        "immediate"
-    } else if spacer <= 10_000 {
-        "spaced"
-    } else {
-        "wide"
-    };
-
-    Some((class, spacer))
-}
-
 /// Generate (start,end) windows over a contig.
 ///
 /// If `window_len == 0`, yields the whole contig once.
@@ -1421,12 +1393,16 @@ fn main() -> Result<()> {
                         let qs: usize = (start / q) * q;
                         let qe: usize = (end / q) * q;
 
+                        // Use the same classifier (and the same user-configurable
+                        // --immediate-bp/--wide-bp thresholds) as the TSV's `ir_class`
+                        // column, so the FASTA header's `class=` field can't disagree
+                        // with it for the same candidate.
                         let (class, spacer_bp) = if la1g > la0g && ra1g > ra0g {
-                            if let Some((cls, sp)) = ir_class_from_arms(la0g, la1g, ra0g, ra1g) {
-                                (cls, sp.clamp(i32::MIN as isize, i32::MAX as isize) as i32)
-                            } else {
-                                ("unknown", 0)
-                            }
+                            let (_n_la0, n_la1, n_ra0, _n_ra1) =
+                                normalize_arms(la0g, la1g, ra0g, ra1g);
+                            let spacer = n_ra0 as isize - n_la1 as isize;
+                            let cls = classify_ir_str(spacer, immediate_bp, wide_bp);
+                            (cls, spacer.clamp(i32::MIN as isize, i32::MAX as isize) as i32)
                         } else {
                             ("unknown", 0)
                         };
