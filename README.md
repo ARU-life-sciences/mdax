@@ -39,6 +39,18 @@ Default outputs are the fasta file of corrected reads, and a table of all detect
 
 **On `--min-support`:** don't lower this manually to compensate for low or uneven coverage. Unless you pass `--min-support` explicitly, mdax self-calibrates it to your dataset's own achieved recurrence after pass 1 (never below 2, never above the mode default) — check stderr for a `SUPPORT CALIBRATION` line to see whether it fired and what it picked. A manual override applies uniformly regardless of what your dataset actually achieved and is easy to get wrong in either direction.
 
+### Picking a mode before you commit to assembly (`--qc-only`)
+
+`--qc-only` runs pass1 (detection + signature clustering) and then exits — no cutting, no FASTA/TSV written, `-o` not required. Pass1 is far cheaper than pass2 plus a downstream assembly, so this is meant for anyone trying mdax on a new species or dataset for the first time: run it once per `--mode` candidate to sanity-check a mode choice before spending hours on the real correction + assembly run.
+
+What to look at is the `QC SUMMARY` line's `max_cluster_n` — the size of the largest group of reads that collapsed onto the same foldback signature. Ideally this is small (tens, not hundreds) and doesn't swing wildly between modes. A large, mode-sensitive spike — especially one that appears under `--mode permissive` but not `strict`/`balanced` — is a red flag: it means a repetitive genomic region is being conflated into one artificial "recurring locus" rather than a single true recurring artefact, which combined with permissive's deeper cut recursion (`max_depth`) can fragment reads faster than the assembler can put them back together, making the assembly *worse* than doing nothing.
+
+This isn't hypothetical — it's exactly what we found benchmarking against Lee et al.'s single-worm nematode dataset (`test_single_nematode/`): Microlaimidae sp. showed `max_cluster_n=407` under permissive vs. 70–130 across three other species, and permissive mode did in fact blow up its assembly (BUSCO completeness dropped *below* doing no correction at all, total length nearly doubled). `--mode strict` fixed it outright. `--qc-only` would have flagged that in minutes instead of after a multi-hour Flye run.
+
+```bash
+mdax --mode permissive --refine-mode ont --qc-only reads.fastq.gz
+```
+
 ### Examples
 
 Basic HiFi correction, writing the report to a file instead of stdout:
@@ -527,6 +539,19 @@ Detection is unchanged by the current build (nrCaeEleg95: 77,249 both before and
 ```bash
 cd test_celegans && ./benchmark.sh           # 200k reads per sample
 MAX_READS=0 THREADS=16 ./benchmark.sh       # all reads, 16 threads
+```
+
+### Single-worm nematode benchmark (`test_single_nematode/`)
+
+Compares mdax against the palindrome-correction method from a published
+single-nematode-genome study (Lee et al., PRJNA953805), on real ONT WGA data
+across 4 species, with published GenBank assemblies as ground truth. Also
+where the `--qc-only` `max_cluster_n` red flag above was first found, on a
+species where `--mode permissive` blew up an assembly that `--mode strict`
+then fixed cleanly.
+
+```bash
+cd test_single_nematode && cat README.md   # full results tables + writeup
 ```
 
 ### `irx` synthetic evaluation (`irx_tests/`)

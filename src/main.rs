@@ -75,13 +75,18 @@ fn main() -> Result<()> {
             .map(|v| v == "1")
             .unwrap_or(false);
 
+    // pass1-only diagnostic mode: report signature-cluster stats, skip pass2
+    // entirely (no cutting, no FASTA/TSV written). See --qc-only long help.
+    let qc_only = args.get_flag("qc_only");
+
     // inputs and outputs
     let fasta = args
         .get_one::<PathBuf>("input")
         .expect("not allowed no input");
-    let output = args
-        .get_one::<PathBuf>("output")
-        .expect("not allowed no output");
+    // `output` is only required when not --qc-only (enforced by clap's
+    // required_unless_present); safe to unwrap once we're past the
+    // qc_only early-return below.
+    let output = args.get_one::<PathBuf>("output");
     let report = args.get_one::<PathBuf>("report").unwrap();
 
     // deal with the baseline mode
@@ -370,8 +375,48 @@ fn main() -> Result<()> {
         real_clusters
     );
 
+    // Machine-parseable one-line summary for the --qc-only workflow (and
+    // useful in a normal run too): the max signature-cluster size is the
+    // statistic that flagged a real permissive-mode over-fragmentation case
+    // during benchmarking (one dataset's largest cluster was 3-6x any other
+    // tested dataset's). A large cluster here means many reads collapsed
+    // onto the same signature -- consistent with a repetitive genomic
+    // region being conflated into one "recurring locus" rather than a
+    // single true recurring artefact, which --mode permissive's coarser
+    // signature (smaller sig_flank_bp/sig_take, non-zero sig_value_shift)
+    // and deeper cut recursion (max_depth) are more prone to.
+    let large_cluster_threshold = 50usize;
+    let max_cluster_n = support.values().map(|s| s.n).max().unwrap_or(0);
+    let large_clusters = support
+        .values()
+        .filter(|s| s.n > large_cluster_threshold)
+        .count();
+    let reads_in_large_clusters: u64 = support
+        .values()
+        .filter(|s| s.n > large_cluster_threshold)
+        .map(|s| s.n as u64)
+        .sum();
+    elog!(
+        "QC SUMMARY",
+        "mode={mode:?} max_cluster_n={} clusters_gt_{}={} reads_in_clusters_gt_{}={}",
+        max_cluster_n,
+        large_cluster_threshold,
+        large_clusters,
+        large_cluster_threshold,
+        reads_in_large_clusters,
+    );
+
+    if qc_only {
+        elog!(
+            "QC ONLY",
+            "--qc-only set: stopping after pass1, no reads were cut or written"
+        );
+        return Ok(());
+    }
+
     // PASS 2
     // PASS 2 writers
+    let output = output.expect("required_unless_present(\"qc_only\") guarantees this when qc_only is false");
     let fasta_out = output.clone();
     let tsv_out = report.clone();
 

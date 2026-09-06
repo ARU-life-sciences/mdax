@@ -107,7 +107,7 @@ For each input read, mdax writes one output record containing the sequence you d
                 .short('o')
                 .long("output")
                 .value_parser(value_parser!(PathBuf))
-                .required(true),
+                .required_unless_present("qc_only"),
         )
         // Minimizer k-mer size.
         // Larger values are more specific but less tolerant of sequencing errors.
@@ -518,6 +518,28 @@ recovers the cuts that would otherwise be suppressed.\n\
 \n\
 Use with care on HiFi data: genuine low-identity hits (e.g. partial repeats) \
 will also be cut.")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("qc_only")
+                .long("qc-only")
+                .help("Run pass1 only and report signature-cluster stats; skip cutting/output")
+                .long_help(
+"Stop after pass1 (detection + signature clustering) and report the same \
+SUPPORT HISTOGRAM / SUPPORT SANITY / SUPPORT GATE diagnostics that a normal \
+run already logs, then exit -- no pass2, no cutting, no FASTA/TSV written. \
+--output/-o is not required in this mode.\n\
+\n\
+Intended as a cheap pre-assembly check: pass1 is far cheaper than \
+pass2 + downstream assembly, so you can run this once per --mode candidate \
+to see which one is likely to be well-behaved on this dataset (e.g. an \
+unusually large max signature-cluster size under --mode permissive can \
+indicate a repetitive genome where permissive's coarser signature and \
+deeper cut recursion will over-fragment reads) before committing to a full \
+correction + assembly run.\n\
+\n\
+Note --mode changes pass1's own detection/signature parameters, so \
+comparing modes means rerunning this once per --mode, not one shared pass.")
                 .action(clap::ArgAction::SetTrue),
         )
         // Hidden “developer mode” for reproducible benchmarking.
