@@ -28,3 +28,6 @@
 /synth_bench/run_*/
 /synth_bench/test_*/
 /synth_bench/*.log
+
+# test_single_nematode: ignore raw ONT read data (symlinked to lustre); track scripts and BUSCO results
+/test_single_nematode/data/

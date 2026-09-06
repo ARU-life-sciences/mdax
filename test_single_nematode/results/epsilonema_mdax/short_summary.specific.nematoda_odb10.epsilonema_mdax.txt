@@ -1,0 +1,30 @@
+# BUSCO version is: 5.4.6 
+# The lineage dataset is: nematoda_odb10 (Creation date: 2024-01-08, number of genomes: 7, number of BUSCOs: 3131)
+# Summarized benchmarking in BUSCO notation for file /lustre/scratch122/tol/teams/blaxter/users/mb39/mdax_single_nematode_benchmark/asm/mdax/assembly.fasta
+# BUSCO was run in mode: euk_genome_met
+# Gene predictor used: metaeuk
+
+	***** Results: *****
+
+	C:48.3%[S:38.0%,D:10.3%],F:5.7%,M:46.0%,n:3131	   
+	1514	Complete BUSCOs (C)			   
+	1191	Complete and single-copy BUSCOs (S)	   
+	323	Complete and duplicated BUSCOs (D)	   
+	180	Fragmented BUSCOs (F)			   
+	1437	Missing BUSCOs (M)			   
+	3131	Total BUSCO groups searched		   
+
+Assembly Statistics:
+	9813	Number of scaffolds
+	9813	Number of contigs
+	180755055	Total length
+	0.000%	Percent gaps
+	35 KB	Scaffold N50
+	35 KB	Contigs N50
+
+
+Dependencies and versions:
+	hmmsearch: 3.1
+	bbtools: 39.01
+	metaeuk: 6.a5d39d9
+	busco: 5.4.6

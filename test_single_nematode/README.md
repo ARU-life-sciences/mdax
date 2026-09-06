@@ -1,0 +1,167 @@
+# test_single_nematode/
+
+Benchmarks `mdax` against the palindrome-correction method from Lee et al.'s
+single-worm nematode genome project, on real ONT whole-genome-amplification
+(WGA) data. Compares three arms per species — **raw** (no correction),
+**theirs** (`remove_palindrome.sh`, the paper's own method), **mdax** — all
+assembled identically downstream, so the only variable is the correction
+method itself.
+
+## Source data
+
+- Paper/pipeline: [Single-nematode-genome](https://zenodo.org/records/8144614)
+  (Yi-Chien Lee et al., Academia Sinica) — a Zenodo-archived academic
+  website containing their `remove_palindrome.sh` pipeline (copied into
+  `scripts/`, see [Their method](#their-method-remove_palindromesh) below)
+- Raw ONT reads: NCBI BioProject
+  [PRJNA953805](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA953805)
+  ("Free-living nematodes Genome sequencing and assembly"), 13 species total
+- Published assemblies (ground truth): NCBI GenBank, same BioProject,
+  `assembly_method: Flye v.2.9.1`, pipeline = Flye → Racon/Medaka polish →
+  NextPolish (Illumina) → `purge_dups` → contamination screen. All at
+  `assembly_level: Contig` (no chromosome-scale scaffolding) — directly
+  comparable in kind to what this benchmark produces, just with additional
+  polishing/dedup/decontam steps this benchmark deliberately omits (see
+  [Caveats](#caveats)).
+
+4 of the 13 species were run (picked for small ONT read size, plus one
+different clade for spread): Epsilonema sp. ZAB3_2, Microlaimidae sp. YZB2_3,
+Linhomoeus sp. GSCO2_2 (all Chromadorea), Trileptium ribeirensis (Enoplida).
+
+## Method
+
+Per species: `remove_palindrome.sh` (2 iterations, self-vs-self
+`minimap2 -x ava-ont` + midpoint chop) and `mdax --mode permissive
+--refine-mode ont --cut-low-ident` run independently on the same raw reads;
+each of the three resulting read sets (raw/theirs/mdax) assembled with
+`Flye --nano-raw --meta` (matching the paper's assembler choice), scored
+with BUSCO `nematoda_odb10` (genome mode). See `scripts/run_species_pipeline.sh`
+for the full LSF-orchestrated pipeline.
+
+## Results
+
+BUSCO nematoda_odb10, genome mode. Bold = best value per metric within a
+species (excluding the mdax-permissive anomaly on microlaimidae — see below).
+
+| Species | Arm | Complete | Single | Dup | Frag | Missing | Contigs | N50 | Total length |
+|---|---|---|---|---|---|---|---|---|---|
+| **Epsilonema sp.** | raw | 46.8% | 35.4% | 11.4% | 5.8% | 47.4% | 14,179 | 25 kb | 204.9 Mb |
+| | theirs | **49.3%** | **38.1%** | 11.2% | 5.6% | **45.1%** | 9,934 | **37 kb** | 182.1 Mb |
+| | mdax | 48.3% | 38.0% | **10.3%** | 5.7% | 46.0% | **9,813** | 35 kb | **180.7 Mb** |
+| **Microlaimidae sp.** | raw | 16.1% | 15.7% | 0.4% | 5.2% | 78.7% | 45,291 | 20 kb | 630.7 Mb |
+| | theirs | **20.1%** | **19.6%** | **0.5%** | 5.0% | **74.9%** | **42,179** | **21 kb** | **605.1 Mb** |
+| | mdax (permissive) ⚠️ | 11.9% | 6.4% | 5.5% | 3.2% | 84.9% | 40,978 | 34 kb | 1,084.4 Mb |
+| **Linhomoeus sp.** | raw | 35.8% | 28.4% | 7.4% | 3.9% | 60.3% | 21,289 | 20 kb | 254.3 Mb |
+| | theirs | **36.2%** | **29.1%** | 7.1% | 3.8% | **60.0%** | 20,795 | 19 kb | 246.4 Mb |
+| | mdax | 35.9% | 29.0% | **6.9%** | **3.6%** | 60.5% | **20,421** | 19 kb | **242.0 Mb** |
+| **Trileptium ribeirensis** | raw | 21.6% | 20.6% | 1.0% | **3.4%** | 75.0% | 42,276 | 34 kb | 813.0 Mb |
+| | theirs | **22.9%** | **21.8%** | 1.1% | 3.8% | **73.3%** | 39,932 | **37 kb** | 799.6 Mb |
+| | mdax | 22.0% | 21.0% | 1.0% | **3.4%** | 74.6% | **38,771** | 36 kb | **786.1 Mb** |
+
+### Ground truth (published GenBank assemblies, same BioProject)
+
+| Species | Accession | Total length | Contigs | N50 |
+|---|---|---|---|---|
+| Trileptium ribeirensis | GCA_030248225 | 746.0 Mb | 30,783 | 42.0 kb |
+| Linhomoeus sp. | GCA_030248115 | 240.5 Mb | 14,458 | 28.9 kb |
+| Microlaimidae sp. | GCA_030248175 | 575.8 Mb | 35,431 | 24.1 kb |
+
+Our raw/theirs/mdax total lengths land within 1-10% of the published final
+genome size on every species (these are genuinely large genomes, not
+inflated ones) — total assembly length was never really the gap. The
+persistent gap is **contiguity**: our best arms still run ~20-45% more
+contigs and 12-34% lower N50 than published. That gap is most plausibly
+`purge_dups` (haplotig/duplicate removal), a step outside any foldback
+corrector's scope by design — see write-up in the session this benchmark
+came from for the reasoning.
+
+## The microlaimidae anomaly, and mode comparison
+
+`mdax --mode permissive` produced a dramatically *worse* assembly than doing
+nothing at all on microlaimidae specifically: total length nearly doubled
+(1,084 Mb vs. 631 Mb raw / 576 Mb published), duplicated BUSCOs jumped 10x
+(0.4% → 5.5%), complete BUSCO dropped below raw (11.9% vs. 16.1%). This did
+not happen on the other three species.
+
+Tested `--mode balanced` and `--mode strict` on the same raw reads:
+
+| Mode | Complete | Single | Dup | Contigs | N50 | Total length |
+|---|---|---|---|---|---|---|
+| permissive ⚠️ | 11.9% | 6.4% | 5.5% | 40,978 | 34 kb | 1,084.4 Mb |
+| balanced | 17.4% | 17.0% | 0.4% | 40,143 | 21 kb | 582.3 Mb |
+| **strict** | **18.9%** | **18.4%** | 0.5% | **39,946** | 22 kb | **595.0 Mb** |
+
+Both `balanced` and `strict` fully resolve it — total length lands right at
+the published 575.8 Mb, duplication returns to normal. `strict` is the best
+of the three mdax modes on this species, just shy of `theirs` (20.1%
+complete) but clearly ahead of raw and permissive.
+
+### Root cause (investigation only, no code changes)
+
+`--mode` changes three things at once, not just a confidence threshold
+(`src/cfg.rs`, `CallMode::tuning()`): the detection threshold
+(`min_matches`/`min_identity`), the recursion cap on nested cutting
+(`max_depth`: strict=2, permissive=8), and the **signature coarseness**
+(`sig_flank_bp`/`sig_take`/`sig_value_shift`: permissive uses a much
+smaller flank window, fewer minimizers, and heavier value-quantization). A
+coarser signature is more collision-prone — reads from genuinely different
+loci that happen to be similar (e.g. members of a repeat family) can get
+folded into the same signature bucket, inflating the cross-read support
+count that `is_real_foldback_stats()` (`src/fingerprint.rs:369`) uses as its
+sole "real" gate.
+
+Directly measurable from the existing `report.tsv` per-read output (no new
+runs needed) — the `support_n` column, i.e. how many reads collapsed onto
+the same signature:
+
+| Species | Total reads | Max signature cluster | Reads in clusters >50 | Outcome (permissive) |
+|---|---|---|---|---|
+| Epsilonema | 368,903 | 70 | 70 (0.02%) | fine |
+| Linhomoeus | 150,055 | 73 | 73 (0.05%) | fine |
+| Trileptium | 286,229 | 130 | 130 (0.05%) | fine |
+| **Microlaimidae** | 376,892 | **407** | **970 (0.26%)** | **blowup** |
+
+Microlaimidae's largest signature cluster is 3-6x bigger than any other
+species', and it has 7-14x more reads embedded in large clusters. Consistent
+with an unusually large/repetitive family in this genome that permissive
+mode's coarse signature + deep recursion (`max_depth=8`) conflates into one
+massively "recurring" locus and fragments accordingly — while strict/balanced's
+tighter signature and shallower recursion don't let the same collision
+happen. Not yet fixed in code; a plausible cheap QC check (max
+signature-cluster size under permissive-mode parameters) is flagged as a
+candidate follow-up, not implemented.
+
+## Caveats
+
+- **Single-pass only.** No Illumina polishing, no `purge_dups`, no
+  decontamination — deliberately, to isolate the correction-method
+  comparison. Absolute BUSCO/N50 numbers here are not comparable to the
+  paper's own published headline figures (which are protein-mode BUSCO
+  against the `eukaryota` lineage on a fully-finished genome, not
+  genome-mode `nematoda_odb10` on a bare Flye assembly).
+- 4 of 13 species tested, picked mostly for small ONT read size. Not a
+  claim that this generalizes to the full species set.
+- microlaimidae was run through the full mode sweep; the other three
+  species were only tested under the default `--mode permissive`.
+
+## Scripts
+
+| Script | Description |
+|---|---|
+| `run_species_pipeline.sh` | Full driver: submits the 9-job LSF chain (2 corrections → 3 Flye → 3 BUSCO) for one species. |
+| `01_palindrome_removal.sh` | Wraps the authors' `remove_palindrome.sh` (2 iterations). |
+| `02_run_mdax.sh` | Runs `mdax --refine-mode ont --cut-low-ident`. |
+| `03_flye.sh` | `Flye --nano-raw --meta`. |
+| `04_busco.sh` | BUSCO `nematoda_odb10`, genome mode. |
+| `remove_palindrome.sh`, `pafIdentifyPalimdrom.pl`, `fastq_partition.and.chop.palindrome.pl` | Lee et al.'s original scripts, unmodified, copied from the Zenodo archive for provenance. |
+
+## Data
+
+Raw ONT reads are symlinked in `data/` (gitignored — points to
+`/lustre/scratch122/tol/teams/blaxter/users/mb39/mdax_single_nematode_benchmark/reads/`).
+Full working directory (corrected reads, Flye assemblies, LSF logs) lives
+alongside at the same lustre path, outside git.
+
+## Results
+
+Full BUSCO `short_summary.txt` for every run is under `results/<species>_<arm>/`.
