@@ -92,7 +92,7 @@ Workflow per contig:\n\
   - refine breakpoint position for each candidate\n\
   - derive left/right arm bounds from minimizer matchpoints\n\
   - best-first deduplicate across windows\n\
-  - emit BED-like TSV rows\n\n\
+  - emit BED-like TSV rows (and optionally GFF3 via --gff)\n\n\
 Output is 0-based, half-open coordinates (BED convention).\n\n\
 TSV columns (header line begins with '#'):\n\n\
 Column meanings:\n\
@@ -222,6 +222,35 @@ Higher values may find multiple IRs within the same window, at increased cost.",
                 .value_parser(value_parser!(usize)),
         )
         .arg(
+            Arg::new("min_arm")
+                .help("Minimum length (bp) of each IR arm.")
+                .long_help(
+                    "Minimum length (bp) of *each* IR arm.\n\n\
+Every emitted row satisfies arm_len >= --min-arm, where arm_len is the shorter of the \
+two reported (trimmed) arm bounds. Trimmed bounds (--trim-lo/--trim-hi) are somewhat \
+shorter than the full arm, so this is a conservative floor.\n\n\
+The coarse detector's span gate measures the whole IR footprint (arm + spacer + arm), \
+so on its own it does not bound arm length; the per-arm check is applied after arm \
+bounds are derived and before deduplication.",
+                )
+                .long("min-arm")
+                .default_value("2000")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("min_matches")
+                .help("Minimum minimizer matchpoints supporting a candidate.")
+                .long_help(
+                    "Minimum number of minimizer matchpoints in an anti-diagonal bin for it to \
+be considered.\n\n\
+Each matching k-mer pair contributes two mirrored points (left->right and right->left), \
+so this is roughly twice the number of distinct matching minimizers.",
+                )
+                .long("min-matches")
+                .default_value("20")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
             Arg::new("dedup_bp")
                 .help("Quantise starts/ends for faster dedup (bp). Used by the interval-overlap dedupper.")
                 .long_help(
@@ -330,6 +359,26 @@ The report is self-contained except for any external JS libraries referenced \
 by the template.",
         )
         .long("html")
+        .value_parser(value_parser!(PathBuf)),
+    )
+    .arg(
+    Arg::new("gff")
+        .help("Optional GFF3 output of IR calls (use '-' for stdout).")
+        .long_help(
+            "Write IR calls as GFF3 (1-based, closed coordinates), sorted by contig \
+(input order) then start, so the file can be bgzip'd and tabix-indexed directly.\n\n\
+Each IR is three features:\n\
+  inverted_repeat (SO:0000294)   left-arm start .. right-arm end, strand '.'\n\
+  repeat_component (SO:0000840)  left arm, strand '+', Parent=<IR id>\n\
+  repeat_component (SO:0000840)  right arm, strand '-', Parent=<IR id>\n\n\
+The right arm's '-' strand records that it is the reverse complement of the left. \
+The spacer is not a feature (it is negative for overlapping arms); it is the \
+parent's `spacer` attribute, with `ir_class`. Score column = tir_ident ('.' if \
+unavailable). `break_pos` is the 1-based position of the first base after the split.\n\n\
+The header lists a ##sequence-region for every contig scanned, including contigs \
+with no calls.",
+        )
+        .long("gff")
         .value_parser(value_parser!(PathBuf)),
     )
     .get_matches()
@@ -546,6 +595,29 @@ fn arm_bounds_from_best_pts(
     } else {
         None
     }
+}
+
+/// Upper bound on the arm length that either arm-bounds function can report
+/// from `pts`: the shorter of the left-arm and right-arm extents (plus k).
+///
+/// Matchpoints come in mirrored pairs, so the raw `p1` range spans the whole
+/// IR footprint; splitting each point into `min(p1,p2)` / `max(p1,p2)` gives
+/// the per-arm extents instead.
+fn arm_extent_upper_bound(pts: &[(i32, i32)], k: usize) -> usize {
+    if pts.is_empty() {
+        return 0;
+    }
+    let (mut lmin, mut lmax, mut rmin, mut rmax) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+    for &(p1, p2) in pts {
+        let (l, r) = (p1.min(p2), p1.max(p2));
+        lmin = lmin.min(l);
+        lmax = lmax.max(l);
+        rmin = rmin.min(r);
+        rmax = rmax.max(r);
+    }
+    let left = (lmax - lmin).max(0) as usize + k;
+    let right = (rmax - rmin).max(0) as usize + k;
+    left.min(right)
 }
 
 /// Pack two u32 values into a u64 (cheap HashSet key).
@@ -854,6 +926,131 @@ struct ReportRow {
     arm_ratio: f32,
 }
 
+/// Percent-encode characters GFF3 does not allow verbatim in a seqid or
+/// attribute value (control characters, whitespace, `%;=&,` and other
+/// non-seqid punctuation).
+fn gff_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let ok = b.is_ascii_alphanumeric() || b".:^*$@!+_?-|".contains(&b);
+        if ok {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Write IR calls as GFF3: one `inverted_repeat` parent per call spanning
+/// both arms, with two `repeat_component` children (left arm `+`, right arm
+/// `-`). Coordinates are converted from 0-based half-open to 1-based closed.
+///
+/// Rows for a contig are contiguous in `rows` (contigs are processed in
+/// order); within a contig, IRs are numbered and features sorted by start so
+/// the output is tabix-ready.
+fn write_gff3<W: Write>(
+    w: &mut W,
+    cmdline: &str,
+    contigs: &[(String, usize)],
+    rows: &[ReportRow],
+) -> std::io::Result<()> {
+    writeln!(w, "##gff-version 3")?;
+    writeln!(w, "#!irx-version {}", clap::crate_version!())?;
+    writeln!(w, "#!irx-command {cmdline}")?;
+    for (id, len) in contigs {
+        if *len > 0 {
+            writeln!(w, "##sequence-region {} 1 {len}", gff_escape(id))?;
+        }
+    }
+
+    let mut n_ir: usize = 0;
+    for chunk in rows.chunk_by(|a, b| a.contig == b.contig) {
+        let seqid = gff_escape(&chunk[0].contig);
+
+        // Normalised arms, then IRs in genome order (ids follow this order).
+        let mut irs: Vec<(&ReportRow, (usize, usize, usize, usize))> = chunk
+            .iter()
+            .map(|r| (r, normalize_arms(r.la0, r.la1, r.ra0, r.ra1)))
+            .collect();
+        irs.sort_by_key(|&(r, (la0, la1, ra0, ra1))| {
+            if la1 > la0 && ra1 > ra0 {
+                (la0, ra1)
+            } else {
+                (r.start, r.end)
+            }
+        });
+
+        // (start, kind, line): kind orders parent < left < right at equal starts.
+        let mut feats: Vec<(usize, u8, String)> = Vec::with_capacity(irs.len() * 3);
+        for (r, (la0, la1, ra0, ra1)) in irs {
+            let has_arms = la1 > la0 && ra1 > ra0;
+            let (p0, p1) = if has_arms {
+                (la0, la1.max(ra1))
+            } else {
+                (r.start, r.end)
+            };
+            if p1 <= p0 {
+                continue;
+            }
+            n_ir += 1;
+            let ir_id = format!("IR{n_ir:06}");
+            let score = match r.tir_ident {
+                Some(t) => format!("{t:.3}"),
+                None => ".".to_string(),
+            };
+            let tir_attr = match r.tir_ident {
+                Some(t) => format!("{t:.3}"),
+                None => "NA".to_string(),
+            };
+            feats.push((
+                p0,
+                0,
+                format!(
+                    "{seqid}\tirx\tinverted_repeat\t{}\t{p1}\t{score}\t.\t.\t\
+ID={ir_id};arm_len={};left_arm_len={};right_arm_len={};spacer={};ir_class={};\
+tir_ident={tir_attr};identity_est={:.3};break_pos={};matches={};kept_pts={}",
+                    p0 + 1,
+                    r.arm_len,
+                    r.left_arm_len,
+                    r.right_arm_len,
+                    r.spacer,
+                    gff_escape(&r.ir_class),
+                    r.identity_est,
+                    r.break_pos + 1,
+                    r.matches,
+                    r.kept_pts,
+                ),
+            ));
+            if has_arms {
+                feats.push((
+                    la0,
+                    1,
+                    format!(
+                        "{seqid}\tirx\trepeat_component\t{}\t{la1}\t.\t+\t.\tID={ir_id}.L;Parent={ir_id};Name=left_arm",
+                        la0 + 1
+                    ),
+                ));
+                feats.push((
+                    ra0,
+                    2,
+                    format!(
+                        "{seqid}\tirx\trepeat_component\t{}\t{ra1}\t.\t-\t.\tID={ir_id}.R;Parent={ir_id};Name=right_arm",
+                        ra0 + 1
+                    ),
+                ));
+            }
+        }
+
+        // Stable sort keeps IR-id order for features sharing (start, kind).
+        feats.sort_by_key(|f| (f.0, f.1));
+        for (_, _, line) in feats {
+            writeln!(w, "{line}")?;
+        }
+    }
+    Ok(())
+}
+
 /// One candidate IR call, computed in parallel per window and then deduplicated
 /// serially per contig.
 ///
@@ -1006,6 +1203,8 @@ fn main() -> Result<()> {
     let window_len = *args.get_one::<usize>("window_len").unwrap();
     let step = *args.get_one::<usize>("step").unwrap();
     let hits_per_window = *args.get_one::<usize>("hits_per_window").unwrap();
+    let min_arm = *args.get_one::<usize>("min_arm").unwrap();
+    let min_matches = *args.get_one::<usize>("min_matches").unwrap();
     let dedup_bp = *args.get_one::<usize>("dedup_bp").unwrap();
     let threads = *args.get_one::<usize>("threads").unwrap();
     let max_interval_bp = *args.get_one::<usize>("max_interval_bp").unwrap();
@@ -1021,6 +1220,9 @@ fn main() -> Result<()> {
 
     // HTML output
     let html = args.get_one::<PathBuf>("html").cloned();
+
+    // GFF3 output
+    let gff = args.get_one::<PathBuf>("gff").cloned();
 
     // Build a *local* Rayon pool if requested; otherwise, use the global/default.
     // This makes `--threads N` deterministic and avoids global-pool initialisation issues.
@@ -1043,7 +1245,7 @@ fn main() -> Result<()> {
                 w: 21,
                 forward_only: true,
             },
-            min_matches: 20,
+            min_matches,
             end_guard: 0,
             refine: RefineCfg {
                 window: 500,
@@ -1054,7 +1256,9 @@ fn main() -> Result<()> {
             },
             fold_diag_tol: 120,
         },
-        fold: FoldOnlyCfg { min_arm: 2000 },
+        // Coarse gate only: mdax's bin span is the IR footprint (arm + spacer + arm),
+        // which is >= one arm. The per-arm check happens after arm bounds are derived.
+        fold: FoldOnlyCfg { min_arm },
         fold2: FoldSecondPassCfg {
             min_support: 0,
             min_identity: 0.0,
@@ -1085,10 +1289,20 @@ fn main() -> Result<()> {
             .map(|p| p.to_string_lossy() == "-")
             .unwrap_or(false);
 
-        // can't have both outputs going to stdout
-        if bed_is_stdout && fasta_is_stdout {
+        let gff_is_stdout = gff
+            .as_ref()
+            .map(|p| p.to_string_lossy() == "-")
+            .unwrap_or(false);
+
+        // at most one output can go to stdout
+        if [bed_is_stdout, fasta_is_stdout, gff_is_stdout]
+            .iter()
+            .filter(|&&b| b)
+            .count()
+            > 1
+        {
             anyhow::bail!(
-                "Cannot write both TSV (--bed -) and FASTA (--fasta -) to stdout. Send one of them to a file."
+                "Only one of TSV (--bed -), FASTA (--fasta -) and GFF (--gff -) can go to stdout. Send the others to files."
             );
         }
 
@@ -1120,6 +1334,8 @@ fn main() -> Result<()> {
         }
 
         let mut report_rows: Vec<ReportRow> = Vec::new();
+        // Every contig scanned (for GFF ##sequence-region lines).
+        let mut contigs_seen: Vec<(String, usize)> = Vec::new();
 
         let mut r = io::open_fasta_reader(input)?;
 
@@ -1137,6 +1353,9 @@ fn main() -> Result<()> {
             let id = first_token_utf8(rec.id());
             let seq = rec.seq();
             let len = seq.len();
+            if gff.is_some() {
+                contigs_seen.push((id.to_string(), len));
+            }
 
             let q = dedup_bp.max(1);
             let mm_k = cfg.shared.minimizer.k;
@@ -1248,6 +1467,12 @@ fn main() -> Result<()> {
                         if hit.bin_span < cfg.fold.min_arm {
                             continue;
                         }
+                        // Cheap pre-refinement gate: the arm bounds derived below come
+                        // from a subset of these points, so this is an upper bound on
+                        // the reported arm length.
+                        if arm_extent_upper_bound(&hit.pts, mm_k) < min_arm {
+                            continue;
+                        }
 
                         let fb = hit.fb;
                         let bin = hit.bin;
@@ -1326,6 +1551,16 @@ fn main() -> Result<()> {
                                 start = s2;
                                 end = e2;
                             }
+                        }
+
+                        // Per-arm length gate, applied before dedup so a short-armed
+                        // candidate can never suppress an overlapping long-armed one.
+                        // Uses the same arm_len definition as the TSV column.
+                        let (n_la0, n_la1, n_ra0, n_ra1) = normalize_arms(la0g, la1g, ra0g, ra1g);
+                        let cand_arm_len =
+                            (n_la1.saturating_sub(n_la0)).min(n_ra1.saturating_sub(n_ra0));
+                        if cand_arm_len < min_arm {
+                            continue;
                         }
 
                         let raw_len = end.saturating_sub(start);
@@ -1685,6 +1920,22 @@ fn main() -> Result<()> {
 
         if let Some(html_path) = html.as_ref() {
             write_html_report(html_path, input, &report_rows)?;
+        }
+
+        if let Some(gff_path) = gff.as_ref() {
+            let mut gw: Box<dyn Write> = if gff_is_stdout {
+                Box::new(std::io::BufWriter::new(std::io::stdout()))
+            } else {
+                Box::new(std::io::BufWriter::new(std::fs::File::create(gff_path)?))
+            };
+            let cmdline = std::env::args().collect::<Vec<_>>().join(" ");
+            match write_gff3(&mut gw, &cmdline, &contigs_seen, &report_rows)
+                .and_then(|_| gw.flush())
+            {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
         }
 
         Ok(())

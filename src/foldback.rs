@@ -93,7 +93,9 @@ impl BinStat {
 
     /// Span of forward positions in this bin.
     ///
-    /// This approximates the arm length supporting the foldback.
+    /// Matchpoints come in mirrored pairs (one with `p1` in each arm), so this
+    /// approximates the whole foldback footprint (arm + gap + arm), not a
+    /// single arm. It is an upper bound on arm length.
     #[inline]
     fn span(&self) -> usize {
         (self.max_p1 as i64 - self.min_p1 as i64).max(0) as usize
