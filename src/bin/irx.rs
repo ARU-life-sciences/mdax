@@ -110,7 +110,7 @@ Column meanings:\n\
   ra0,ra1        Right arm bounds (contig coords)\n\
   contig_len     Length of the contig/chromosome (bp)\n\
   win_start,end  Window bounds that produced this hit (contig coords)\n\
-  kept_pts       Number of matchpoints retained near refined anti-diagonal (0 if unfiltered fallback)\n\
+  kept_pts       Matchpoints supporting the reported arm bounds (the chosen arm cluster; 0 if unfiltered fallback)\n\
   bin            Anti-diagonal bin id (debug / dedup key component)\n\n\
 ",
 )
@@ -227,8 +227,9 @@ Higher values may find multiple IRs within the same window, at increased cost.",
                 .long_help(
                     "Minimum length (bp) of *each* IR arm.\n\n\
 Every emitted row satisfies arm_len >= --min-arm, where arm_len is the shorter of the \
-two reported (trimmed) arm bounds. Trimmed bounds (--trim-lo/--trim-hi) are somewhat \
-shorter than the full arm, so this is a conservative floor.\n\n\
+two reported arms (full extent of the supporting matchpoints; see --arm-gap-bp). \
+Minimizer matches cannot reach the last few bases of an arm, so an arm exactly at the \
+threshold may measure a few bp short.\n\n\
 The coarse detector's span gate measures the whole IR footprint (arm + spacer + arm), \
 so on its own it does not bound arm length; the per-arm check is applied after arm \
 bounds are derived and before deduplication.",
@@ -278,27 +279,18 @@ Larger values are more permissive (can inflate intervals).",
         .value_parser(value_parser!(i32)),
         )
         .arg(
-            Arg::new("trim_lo")
-                .help("Lower quantile for trimmed arm bounds (0..1).")
+            Arg::new("arm_gap_bp")
+                .help("Minimum gap (bp) between matchpoints that splits an arm.")
                 .long_help(
-                    "After filtering matchpoints near the split, we derive arm bounds using\n\
-trimmed quantiles rather than min/max to avoid single-point inflation.\n\n\
-Example: --trim-lo 0.10 keeps the 10th percentile as the lower bound.",
+                    "Arm bounds come from gap-based clustering of the matchpoints along the arm:\n\
+points are split into clusters wherever consecutive ones are more than\n\
+max(--arm-gap-bp, 10 x median gap) apart; the cluster spanning the most arm bp is kept\n\
+and reported at its full extent. This keeps whole arms of clean IRs while excluding\n\
+stray matches from other repeat copies on the same anti-diagonal.",
                 )
-                .long("trim-lo")
-                .default_value("0.10")
-                .value_parser(value_parser!(f32)),
-        )
-        .arg(
-            Arg::new("trim_hi")
-                .help("Upper quantile for trimmed arm bounds (0..1).")
-                .long_help(
-                    "Upper quantile used for trimmed arm bounds.\n\
-Example: --trim-hi 0.90 uses the 90th percentile as the upper bound.",
-                )
-                .long("trim-hi")
-                .default_value("0.90")
-                .value_parser(value_parser!(f32)),
+                .long("arm-gap-bp")
+                .default_value("1000")
+                .value_parser(value_parser!(i32)),
         )
         .arg(
             Arg::new("classify_ir")
@@ -434,58 +426,95 @@ fn first_token_utf8(bytes: &[u8]) -> &str {
     std::str::from_utf8(&bytes[..end]).unwrap_or("<nonutf8>")
 }
 
-/// Robust bounds near split: keep split-consistent points, then take trimmed quantiles
-/// on left/right arms to avoid single-point inflation.
+/// Gap threshold multiplier for `--arm-bounds cluster`: a gap larger than this
+/// many median inter-point gaps splits the arm. Gaps between minimizer matches
+/// are roughly exponential, so P(gap > 10 x median ≈ 7 x mean) ≈ 0.1% per gap.
+const ARM_GAP_FACTOR: f32 = 10.0;
+
+/// Arm bounds by gap-based clustering of split-consistent matchpoints.
 ///
-/// q_lo/q_hi are fractions in [0,1], e.g. 0.05 and 0.95.
+/// Each kept point is a pair (left, right) of mirrored positions; their
+/// separation `right - left` grows by 2 bp per bp moved outward from the IR
+/// centre, so sorting by it orders points from the arms' inner edges outward
+/// without needing an estimate of the centre. Consecutive points further apart
+/// (in arm bp) than `max(min_gap_bp, gap_factor * median gap)` start a new
+/// cluster; the cluster spanning the most arm bp is the IR, and its min/max
+/// give the arm bounds in full (no quantile trimming).
+///
+/// Why: quantile trimming cut ~10% from each end of every genuine arm
+/// (plastid IR 25.7 kb -> 20.6 kb), while untrimmed min/max let a single
+/// stray match from another repeat copy on the same anti-diagonal stretch an
+/// arm by tens of kb. A dense homologous core has small gaps at any identity
+/// the detector can see (median ~70 bp at 90%, ~125 bp at 85%), whereas stray
+/// copies sit beyond a gap of kb.
 ///
 /// Returns (la0, la1, ra0, ra1, kept_pts) in window-local coords.
-fn arm_bounds_near_split_diag_trimmed(
+#[allow(clippy::too_many_arguments)]
+fn arm_bounds_near_split_diag_clustered(
     best_pts: &[(i32, i32)],
     split: usize,
     k: usize,
     win_len: usize,
     fold_diag_tol: i32,
     widen: i32,
-    q_lo: f32,
-    q_hi: f32,
+    min_gap_bp: i32,
+    gap_factor: f32,
 ) -> Option<(usize, usize, usize, usize, usize)> {
-    if best_pts.is_empty() {
-        return None;
-    }
-
     let split2 = 2 * (split as i32);
     let tol = fold_diag_tol.max(1) * widen.max(1);
 
-    let mut lefts: Vec<i32> = Vec::new();
-    let mut rights: Vec<i32> = Vec::new();
-
-    for &(p1, p2) in best_pts {
-        let d = p1 + p2;
-        if (d - split2).abs() > tol {
-            continue;
-        }
-        lefts.push(p1.min(p2));
-        rights.push(p1.max(p2));
-    }
-
-    let kept = lefts.len();
-    if kept == 0 {
+    // (separation, left, right) for split-consistent points.
+    let mut pts: Vec<(i32, i32, i32)> = best_pts
+        .iter()
+        .filter(|&&(p1, p2)| (p1 + p2 - split2).abs() <= tol)
+        .map(|&(p1, p2)| {
+            let (l, r) = (p1.min(p2), p1.max(p2));
+            (r - l, l, r)
+        })
+        .collect();
+    if pts.is_empty() {
         return None;
     }
+    pts.sort_unstable();
 
-    lefts.sort_unstable();
-    rights.sort_unstable();
+    // Gaps along the arm in bp (separation changes 2 bp per arm bp).
+    let gaps: Vec<i32> = pts.windows(2).map(|w| (w[1].0 - w[0].0) / 2).collect();
+    let mut positive: Vec<i32> = gaps.iter().copied().filter(|&g| g > 0).collect();
+    let median_gap = if positive.is_empty() {
+        0
+    } else {
+        let mid = positive.len() / 2;
+        *positive.select_nth_unstable(mid).1
+    };
+    let threshold = (min_gap_bp.max(1) as f32).max(gap_factor * median_gap as f32);
 
-    // Quantile indices (clamped)
-    let n = kept;
-    let lo = ((q_lo.clamp(0.0, 1.0) * (n.saturating_sub(1) as f32)).round() as usize).min(n - 1);
-    let hi = ((q_hi.clamp(0.0, 1.0) * (n.saturating_sub(1) as f32)).round() as usize).min(n - 1);
+    // Clusters as [start, end) index ranges. Keep the one spanning the most arm
+    // bp (then most points, then innermost): extent is what defines an arm, while
+    // point density falls with divergence -- by point count, a perfect 300 bp
+    // stray copy can outvote a genuine 2 kb arm at 90% identity.
+    let extent = |s: usize, e: usize| (pts[e - 1].0 - pts[s].0) / 2;
+    let (mut best_s, mut best_e) = (0usize, 0usize);
+    let mut best_key = (-1i32, 0usize);
+    let mut s = 0usize;
+    for i in 0..=gaps.len() {
+        let boundary = i == gaps.len() || gaps[i] as f32 > threshold;
+        if boundary {
+            let e = i + 1;
+            let key = (extent(s, e), e - s);
+            if key > best_key {
+                best_key = key;
+                best_s = s;
+                best_e = e;
+            }
+            s = i + 1;
+        }
+    }
+    let cluster = &pts[best_s..best_e];
 
-    let l0 = lefts[lo];
-    let l1 = lefts[hi];
-    let r0 = rights[lo];
-    let r1 = rights[hi];
+    let l0 = cluster.iter().map(|p| p.1).min()?;
+    let l1 = cluster.iter().map(|p| p.1).max()?;
+    let r0 = cluster.iter().map(|p| p.2).min()?;
+    let r1 = cluster.iter().map(|p| p.2).max()?;
 
     let la0 = l0.max(0) as usize;
     let la1 = (l1.max(0) as usize).saturating_add(k).min(win_len);
@@ -493,10 +522,25 @@ fn arm_bounds_near_split_diag_trimmed(
     let ra1 = (r1.max(0) as usize).saturating_add(k).min(win_len);
 
     if la0 < la1 && ra0 < ra1 {
-        Some((la0, la1, ra0, ra1, kept))
+        Some((la0, la1, ra0, ra1, cluster.len()))
     } else {
         None
     }
+}
+
+/// Split position implied by a bin's matchpoints: median of (p1 + p2) / 2.
+///
+/// Every point of a foldback/IR with centre `c` satisfies p1 + p2 ≈ 2c, so the
+/// median anti-diagonal is a robust estimate of the centre that does not depend
+/// on the spacer sequence (unlike breakpoint refinement).
+fn median_diag_split(pts: &[(i32, i32)]) -> Option<usize> {
+    if pts.is_empty() {
+        return None;
+    }
+    let mut d: Vec<i64> = pts.iter().map(|&(p1, p2)| p1 as i64 + p2 as i64).collect();
+    let mid = d.len() / 2;
+    let (_, &mut m, _) = d.select_nth_unstable(mid);
+    Some((m.max(0) / 2) as usize)
 }
 
 #[inline]
@@ -1209,8 +1253,7 @@ fn main() -> Result<()> {
     let threads = *args.get_one::<usize>("threads").unwrap();
     let max_interval_bp = *args.get_one::<usize>("max_interval_bp").unwrap();
     let diag_widen = *args.get_one::<i32>("diag_widen").unwrap();
-    let trim_lo = *args.get_one::<f32>("trim_lo").unwrap();
-    let trim_hi = *args.get_one::<f32>("trim_hi").unwrap();
+    let arm_gap_bp = *args.get_one::<i32>("arm_gap_bp").unwrap();
     let cap_policy = CapPolicy::parse(args.get_one::<String>("cap_policy").unwrap())?;
 
     // IR classification
@@ -1497,21 +1540,30 @@ fn main() -> Result<()> {
                         let break_pos = wstart + rf.split_pos;
 
                         // Determine arm bounds:
-                        //   1) prefer points near refined split (anti-diagonal proximity)
+                        //   1) prefer points near the bin's anti-diagonal (gap-clustered)
                         //   2) fall back to unfiltered bounds
                         //   3) fall back to break±span/2
+                        //
+                        // Centre the filter on the bin's own anti-diagonal, not on
+                        // `rf.split_pos`: refinement compares `refine.arm` bp either side
+                        // of the split, which for an IR with a spacer is spacer vs spacer,
+                        // so the refined split can wander by hundreds of bp. When it lands
+                        // > tol/2 from the true centre every point is rejected and the
+                        // unfiltered fallback inflates arms with stray matches (48% of
+                        // simulated IRs with a 10 kb spacer did this).
+                        let diag_split = median_diag_split(&hit.pts).unwrap_or(rf.split_pos);
+                        let bounds = arm_bounds_near_split_diag_clustered(
+                            &hit.pts,
+                            diag_split,
+                            mm_k,
+                            win_len,
+                            fold_diag_tol,
+                            diag_widen,
+                            arm_gap_bp,
+                            ARM_GAP_FACTOR,
+                        );
                         let (start, end, la0g, la1g, ra0g, ra1g, kept_pts) =
-                            if let Some((la0, la1, ra0, ra1, kept)) =
-                                arm_bounds_near_split_diag_trimmed(
-                                    &hit.pts,
-                                    rf.split_pos,
-                                    mm_k,
-                                    win_len,
-                                    fold_diag_tol,
-                                    diag_widen,
-                                    trim_lo,
-                                    trim_hi,
-                                )
+                            if let Some((la0, la1, ra0, ra1, kept)) = bounds
                             {
                                 let la0g = wstart + la0;
                                 let la1g = wstart + la1;
@@ -1946,5 +1998,84 @@ fn main() -> Result<()> {
         pool.install(run)
     } else {
         run()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrored matchpoints for an IR centred at `c`: one point every `step` bp
+    /// along an arm whose inner edge is `inner` bp from the centre, `len` bp long.
+    fn arm_points(c: i32, inner: i32, len: i32, step: i32) -> Vec<(i32, i32)> {
+        let mut v = Vec::new();
+        let mut u = inner;
+        while u < inner + len {
+            let (l, r) = (c - u, c + u - 17);
+            v.push((l, r));
+            v.push((r, l));
+            u += step;
+        }
+        v
+    }
+
+    #[test]
+    fn cluster_keeps_full_clean_arm() {
+        // 20 kb arms, 5 kb spacer (inner edge 2.5 kb from centre), a point every 11 bp.
+        let c = 100_000;
+        let pts = arm_points(c, 2_500, 20_000, 11);
+        let (la0, la1, ra0, ra1, kept) =
+            arm_bounds_near_split_diag_clustered(&pts, c as usize, 17, 250_000, 120, 4, 1000, 10.0)
+                .unwrap();
+        assert_eq!(kept, pts.len());
+        // Full extent, not trimmed: within one point spacing of 20 kb.
+        assert!((la1 - la0) as i32 >= 20_000 - 11 && (ra1 - ra0) as i32 >= 20_000 - 11);
+    }
+
+    #[test]
+    fn cluster_excludes_stray_matches_beyond_a_gap() {
+        // Dense 5 kb arm plus a few stray matches 30 kb further out on the same anti-diagonal.
+        let c = 100_000;
+        let mut pts = arm_points(c, 1_000, 5_000, 11);
+        pts.extend(arm_points(c, 36_000, 200, 50));
+        let (la0, la1, _, _, _) =
+            arm_bounds_near_split_diag_clustered(&pts, c as usize, 17, 250_000, 120, 4, 1000, 10.0)
+                .unwrap();
+        let arm = (la1 - la0) as i32;
+        assert!(arm < 6_000, "stray matches inflated the arm to {arm} bp");
+        assert!(arm >= 5_000 - 11, "core arm truncated to {arm} bp");
+    }
+
+    #[test]
+    fn cluster_prefers_longer_sparse_arm_over_dense_short_copy() {
+        // Genuine 2 kb arm at ~90% identity (a point every ~70 bp) vs a perfect
+        // 300 bp stray copy (a point every 11 bp, more points in total) 20 kb out.
+        let c = 100_000;
+        let mut pts = arm_points(c, 5_000, 2_000, 70);
+        pts.extend(arm_points(c, 27_000, 300, 5));
+        let (la0, la1, _, _, _) =
+            arm_bounds_near_split_diag_clustered(&pts, c as usize, 17, 250_000, 120, 4, 1000, 10.0)
+                .unwrap();
+        assert!((la1 - la0) as i32 >= 2_000 - 70, "picked the stray copy: {} bp", la1 - la0);
+    }
+
+    #[test]
+    fn cluster_tolerates_sparse_divergent_arm() {
+        // ~85%-identity arm: irregular gaps of 50-400 bp must not split it.
+        let c = 100_000;
+        let mut pts = Vec::new();
+        let mut u = 2_000;
+        let mut i = 0;
+        while u < 2_000 + 8_000 {
+            let (l, r) = (c - u, c + u - 17);
+            pts.push((l, r));
+            pts.push((r, l));
+            u += [50, 120, 400, 90, 200, 60][i % 6];
+            i += 1;
+        }
+        let (la0, la1, _, _, _) =
+            arm_bounds_near_split_diag_clustered(&pts, c as usize, 17, 250_000, 120, 4, 1000, 10.0)
+                .unwrap();
+        assert!((la1 - la0) as i32 >= 7_500, "divergent arm split: {} bp", la1 - la0);
     }
 }
