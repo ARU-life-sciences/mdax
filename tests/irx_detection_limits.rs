@@ -69,6 +69,7 @@ struct Call {
     arm_len: usize,
     locus_id: String,
     locus_n_irs: usize,
+    pass: String,
 }
 
 fn run(name: &str, seq: &[u8]) -> Vec<Call> {
@@ -86,7 +87,8 @@ fn run(name: &str, seq: &[u8]) -> Vec<Call> {
     let text = String::from_utf8(out.stdout).unwrap();
     let header: Vec<&str> = text.lines().next().unwrap().split('\t').collect();
     let col = |name: &str| header.iter().position(|h| h.trim_start_matches('#') == name).unwrap();
-    let (c_arm, c_locus, c_n) = (col("arm_len"), col("locus_id"), col("locus_n_irs"));
+    let (c_arm, c_locus, c_n, c_pass) =
+        (col("arm_len"), col("locus_id"), col("locus_n_irs"), col("pass"));
     text.lines()
         .filter(|l| !l.starts_with('#'))
         .map(|l| {
@@ -98,6 +100,7 @@ fn run(name: &str, seq: &[u8]) -> Vec<Call> {
                 arm_len: n(c_arm),
                 locus_id: f[c_locus].to_string(),
                 locus_n_irs: n(c_n),
+                pass: f[c_pass].to_string(),
             }
         })
         .collect()
@@ -195,4 +198,18 @@ fn inverted_copies_of_one_sequence_form_one_locus() {
     let c = found(&calls, &(x0, x1, c2, c2e)).expect("X / second copy not reported");
     assert_eq!(a.locus_id, c.locus_id, "IRs sharing an arm got different loci");
     assert!(a.locus_n_irs >= 2);
+}
+
+#[test]
+fn large_footprint_ir_found_by_large_pass() {
+    // 20 kb arms, 360 kb spacer: footprint 400 kb, beyond the local pass (complete
+    // to 200 kb, blind past 250 kb) but within the large pass (complete to 1 Mb).
+    let mut b = Builder::new(6);
+    b.random(100_000);
+    b.ir(20_000, |b| b.random(360_000));
+    b.random(100_000);
+    let calls = run("large_fp", &b.seq);
+    let c = found(&calls, &b.truth[0]).expect("400 kb-footprint IR missed");
+    assert_eq!(c.pass, "large");
+    assert!(c.arm_len >= 19_500, "arm {} of 20,000", c.arm_len);
 }

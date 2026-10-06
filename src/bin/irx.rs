@@ -119,7 +119,8 @@ Column meanings:\n\
   direct_better  1 if dir_ident > tir_ident (arms match better as a direct repeat)\n\
   locus_id       IRs whose arms share sequence (overlap, transitively) form one locus;\n\
                  copies of a repeat paired in inverted orientation give many IRs per locus\n\
-  locus_n_irs    Number of IRs in that locus\n\n\
+  locus_n_irs    Number of IRs in that locus\n\
+  pass           local (--window-len) or large (--large-window-len) pass that found it\n\n\
 ",
 )
         .arg(
@@ -288,6 +289,37 @@ Larger values are more permissive (can inflate intervals).",
         .long("diag-widen")
         .default_value("4")
         .value_parser(value_parser!(i32)),
+        )
+        .arg(
+            Arg::new("large_window_len")
+                .help("Window length (bp) of the second, large-IR pass (0 disables it).")
+                .long_help(
+                    "Second pass for IRs too large for the local windows.\n\n\
+The local pass (--window-len/--step) only sees an IR whole if its footprint (left-arm \
+start to right-arm end) is <= window-len - step (200 kb by default); recall falls to 0 at \
+window-len. The large pass scans --large-window-len windows every --large-step bp, \
+keeps only IRs with footprint > window-len - step, and merges them through the same \
+dedup; the TSV/GFF 'pass' column says which pass found each IR. Its coarse footprint \
+gate is raised so small IRs do not use its top-K slots. Complete for footprints up to \
+--large-window-len - --large-step (1 Mb by default).",
+                )
+                .long("large-window-len")
+                .default_value("1200000")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("large_step")
+                .help("Step (bp) between large-pass windows.")
+                .long("large-step")
+                .default_value("200000")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("large_max_interval_bp")
+                .help("Maximum emitted IR interval (bp) in the large pass.")
+                .long("large-max-interval-bp")
+                .default_value("1000000")
+                .value_parser(value_parser!(usize)),
         )
         .arg(
             Arg::new("min_tir_ident")
@@ -1061,6 +1093,7 @@ struct ReportRow {
     direct_better: bool,
     locus_id: String,
     locus_n_irs: usize,
+    pass: &'static str,
 }
 
 /// Percent-encode characters GFF3 does not allow verbatim in a seqid or
@@ -1151,7 +1184,7 @@ fn write_gff3<W: Write>(
                     "{seqid}\tirx\tinverted_repeat\t{}\t{p1}\t{score}\t.\t.\t\
 ID={ir_id};arm_len={};left_arm_len={};right_arm_len={};spacer={};ir_class={};\
 tir_ident={tir_attr};dir_ident={dir_attr};direct_better={};identity_est={:.3};\
-break_pos={};matches={};kept_pts={};locus={};locus_n_irs={}",
+break_pos={};matches={};kept_pts={};locus={};locus_n_irs={};pass={}",
                     p0 + 1,
                     r.arm_len,
                     r.left_arm_len,
@@ -1165,6 +1198,7 @@ break_pos={};matches={};kept_pts={};locus={};locus_n_irs={}",
                     r.kept_pts,
                     gff_escape(&r.locus_id),
                     r.locus_n_irs,
+                    r.pass,
                 ),
             ));
             if has_arms {
@@ -1235,6 +1269,9 @@ struct Cand {
     // ---- classification ----
     class: &'static str,
     spacer_bp: i32, // or isize/i64
+
+    // ---- which pass found it (false = local windows, true = large windows) ----
+    large: bool,
 }
 
 fn write_html_report(
@@ -1338,6 +1375,12 @@ fn main() -> Result<()> {
     let dedup_bp = *args.get_one::<usize>("dedup_bp").unwrap();
     let threads = *args.get_one::<usize>("threads").unwrap();
     let max_interval_bp = *args.get_one::<usize>("max_interval_bp").unwrap();
+    let large_window_len = *args.get_one::<usize>("large_window_len").unwrap();
+    let large_step = *args.get_one::<usize>("large_step").unwrap();
+    let large_max_interval_bp = *args.get_one::<usize>("large_max_interval_bp").unwrap();
+    // The local pass sees an IR whole only up to this footprint; the large pass
+    // takes over above it.
+    let large_min_footprint = window_len.saturating_sub(step.max(1));
     let diag_widen = *args.get_one::<i32>("diag_widen").unwrap();
     let arm_gap_bp = *args.get_one::<i32>("arm_gap_bp").unwrap();
     let min_tir_ident = *args.get_one::<f32>("min_tir_ident").unwrap();
@@ -1448,12 +1491,12 @@ fn main() -> Result<()> {
         let header = if classify_ir {
             writeln!(
                 out,
-                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\tcontig_len\twin_start\twin_end\tkept_pts\tbin\tarm_len\tspacer\tir_class\tdir_ident\tdirect_better\tlocus_id\tlocus_n_irs"
+                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\tcontig_len\twin_start\twin_end\tkept_pts\tbin\tarm_len\tspacer\tir_class\tdir_ident\tdirect_better\tlocus_id\tlocus_n_irs\tpass"
             )
         } else {
             writeln!(
                 out,
-                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\tcontig_len\twin_start\twin_end\tkept_pts\tbin\tdir_ident\tdirect_better\tlocus_id\tlocus_n_irs"
+                "#contig\tstart\tend\tname\tscore\tstrand\tbreak_pos\tidentity_est\ttir_ident\tmatches\tspan\tla0\tla1\tra0\tra1\tcontig_len\twin_start\twin_end\tkept_pts\tbin\tdir_ident\tdirect_better\tlocus_id\tlocus_n_irs\tpass"
             )
         };
 
@@ -1529,7 +1572,12 @@ fn main() -> Result<()> {
             //
             // We do *no* dedup here (that happens serially per contig).
 
-            let mut cands: Vec<Cand> = wins
+            let gen_cands = |wins: &[(usize, usize)],
+                             fold: &FoldOnlyCfg,
+                             max_interval_bp: usize,
+                             large: bool|
+             -> Vec<Cand> {
+            wins
                 .par_iter()
                 .flat_map_iter(|&(wstart, wend)| {
                     let sub = &scan[wstart..wend];
@@ -1548,7 +1596,7 @@ fn main() -> Result<()> {
                     let hits = foldback::detect_foldbacks_topk(
                         sub,
                         &cfg.shared,
-                        &cfg.fold,
+                        fold,
                         &mut scratch,
                         hits_per_window,
                     );
@@ -1564,7 +1612,7 @@ fn main() -> Result<()> {
                         if hit.bin_count < cfg.shared.min_matches {
                             continue;
                         }
-                        if hit.bin_span < cfg.fold.min_arm {
+                        if hit.bin_span < fold.min_arm {
                             continue;
                         }
                         // Cheap pre-refinement gate: the arm bounds derived below come
@@ -1771,15 +1819,43 @@ fn main() -> Result<()> {
                             precap_too_big,
                             class,
                             spacer_bp,
+                            large,
                         });
                     }
 
                     out_local.into_iter()
                 })
-                .collect();
+                .collect()
+            };
+
+            // Pass 1 (local): complete for footprints <= window_len - step.
+            let mut cands: Vec<Cand> = gen_cands(&wins, &cfg.fold, max_interval_bp, false);
+            let mut n_wins = wins.len();
+
+            // Pass 2 (large): longer windows for footprints the local pass cannot see
+            // whole. The coarse bin-span gate (which measures footprint) is raised to the
+            // local completeness limit so small IRs do not take the large windows' top-K
+            // slots; only candidates whose arms span more than that are kept, and both
+            // passes then go through the same dedup.
+            if large_window_len > 0 && len > large_min_footprint {
+                let large_fold = FoldOnlyCfg {
+                    min_arm: large_min_footprint.max(cfg.fold.min_arm),
+                };
+                let large_wins: Vec<(usize, usize)> =
+                    windows(len, large_window_len, large_step).collect();
+                n_wins += large_wins.len();
+                let large_cands =
+                    gen_cands(&large_wins, &large_fold, large_max_interval_bp, true);
+                cands.extend(large_cands.into_iter().filter(|c| {
+                    c.had_arms && {
+                        let (la0, _, _, ra1) = normalize_arms(c.la0, c.la1, c.ra0, c.ra1);
+                        ra1.saturating_sub(la0) > large_min_footprint
+                    }
+                }));
+            }
 
             let mut st = Stats::default();
-            st.windows = wins.len() as u64;
+            st.windows = n_wins as u64;
             st.cands_total = cands.len() as u64;
 
             if cands.is_empty() {
@@ -1794,75 +1870,119 @@ fn main() -> Result<()> {
                     .then_with(|| a.break_pos.cmp(&b.break_pos))
             });
 
-            // Stage A: cheap dedup on break/bin.
-            let mut seen_break_bins: HashSet<u64> = HashSet::new();
-            // Stage B: the same IR rediscovered from another window has BOTH arms
-            // overlapping an accepted call's arms. Overlap of the whole interval is not
-            // enough: that also discarded nested IRs (an inner IR always lies inside
-            // the outer one's interval) and distinct IRs that merely overlap.
-            let mut accepted_arms: Vec<(usize, usize, usize, usize)> = Vec::new();
-            let mut arm_index: HashMap<usize, Vec<usize>> = HashMap::new();
-
+            // Dedup + identity filter. Semantics: walk candidates best-first and accept
+            // one unless (A) it repeats an accepted call's (break_bin, diag_bin) key,
+            // (B) both its arms overlap an accepted call's arms (the same IR from another
+            // window -- whole-interval overlap is not enough, that also dropped nested and
+            // merely overlapping IRs), or its arm identity is below --min-tir-ident (so a
+            // non-homologous call can never suppress a genuine one).
+            //
+            // Arm identities (block alignment of whole arms) were ~70% of runtime when
+            // computed one at a time on this (serial) thread, so: run the cheap serial
+            // dedup skipping candidates already known to be low-identity, compute
+            // identities for the newly accepted ones in parallel, mark failures, repeat
+            // until no accepted candidate fails (usually 1-2 rounds). The fixed point is
+            // the sequential result, except that a low-identity candidate no longer
+            // reserves its Stage-A key.
             let cap_thresh = (max_interval_bp as f64 * 0.95).round() as usize; // “near cap” threshold
-
-            let mut rc_buf: Vec<u8> = Vec::new();
-            // Accepted calls for this contig, buffered so loci can be assigned first.
-            let mut accepted: Vec<(Cand, ReportRow)> = Vec::new();
-
-            for c in cands {
-                // A: check for duplicate break/bin key. This is very fast and removes exact duplicates and many near-duplicates.
-                if !seen_break_bins.insert(c.key_a) {
-                    st.stage_a_dups += 1;
-                    continue;
+            let ov = |a0: usize, a1: usize, b0: usize, b1: usize| a0 < b1 && b0 < a1;
+            let cand_arms: Vec<(usize, usize, usize, usize)> = cands
+                .iter()
+                .map(|c| {
+                    if c.had_arms {
+                        normalize_arms(c.la0, c.la1, c.ra0, c.ra1)
+                    } else {
+                        (c.start, c.end, c.start, c.end)
+                    }
+                })
+                .collect();
+            let mut ident: Vec<Option<(f32, f32)>> = vec![None; cands.len()];
+            let mut low = vec![false; cands.len()];
+            let (accepted_idx, accepted_arms) = loop {
+                let mut seen_break_bins: HashSet<u64> = HashSet::new();
+                let mut acc_arms: Vec<(usize, usize, usize, usize)> = Vec::new();
+                let mut arm_index: HashMap<usize, Vec<usize>> = HashMap::new();
+                let mut acc: Vec<usize> = Vec::new();
+                st.stage_a_dups = 0;
+                st.stage_a_kept = 0;
+                st.stage_b_dups = 0;
+                st.stage_b_kept = 0;
+                for (i, c) in cands.iter().enumerate() {
+                    if low[i] {
+                        continue;
+                    }
+                    if !seen_break_bins.insert(c.key_a) {
+                        st.stage_a_dups += 1;
+                        continue;
+                    }
+                    st.stage_a_kept += 1;
+                    let arms = cand_arms[i];
+                    let duplicate =
+                        (arms.0 / DEDUP_BIN..=arms.1.saturating_sub(1) / DEDUP_BIN).any(|bin| {
+                            arm_index.get(&bin).is_some_and(|ids| {
+                                ids.iter().any(|&j| {
+                                    let a = acc_arms[j];
+                                    ov(arms.0, arms.1, a.0, a.1) && ov(arms.2, arms.3, a.2, a.3)
+                                })
+                            })
+                        });
+                    if duplicate {
+                        st.stage_b_dups += 1;
+                        continue;
+                    }
+                    st.stage_b_kept += 1;
+                    for bin in arms.0 / DEDUP_BIN..=arms.1.saturating_sub(1) / DEDUP_BIN {
+                        arm_index.entry(bin).or_default().push(acc_arms.len());
+                    }
+                    acc_arms.push(arms);
+                    acc.push(i);
                 }
-                st.stage_a_kept += 1;
 
-                // B: same IR (both arms overlap) as an accepted call? Accepted calls are
-                // indexed by DEDUP_BIN-sized bins of their left arm.
-                let arms = if c.had_arms {
-                    normalize_arms(c.la0, c.la1, c.ra0, c.ra1)
-                } else {
-                    (c.start, c.end, c.start, c.end)
-                };
-                let ov = |a0: usize, a1: usize, b0: usize, b1: usize| a0 < b1 && b0 < a1;
-                let duplicate = (arms.0 / DEDUP_BIN..=arms.1.saturating_sub(1) / DEDUP_BIN).any(|bin| {
-                    arm_index.get(&bin).is_some_and(|ids| {
-                        ids.iter().any(|&j| {
-                            let a = accepted_arms[j];
-                            ov(arms.0, arms.1, a.0, a.1) && ov(arms.2, arms.3, a.2, a.3)
-                        })
+                let todo: Vec<usize> = acc.iter().copied().filter(|&i| ident[i].is_none()).collect();
+                let results: Vec<(usize, f32, f32)> = todo
+                    .par_iter()
+                    .map(|&i| {
+                        let c = &cands[i];
+                        let (la0n, la1n, ra0n, ra1n) = normalize_arms(c.la0, c.la1, c.ra0, c.ra1);
+                        if !(la1n > la0n && ra1n > ra0n && la1n <= seq.len() && ra1n <= seq.len()) {
+                            return (i, f32::NAN, f32::NAN);
+                        }
+                        let (left, right) = (&seq[la0n..la1n], &seq[ra0n..ra1n]);
+                        let mut rc_buf: Vec<u8> = Vec::with_capacity(right.len());
+                        revcomp_into(&mut rc_buf, right);
+                        let tir = arm_identity(left, &rc_buf);
+                        // Direct identity only for calls that will be kept.
+                        let dir = if min_tir_ident > 0.0 && !(tir >= min_tir_ident) {
+                            f32::NAN
+                        } else {
+                            arm_identity(left, right)
+                        };
+                        (i, tir, dir)
                     })
-                });
-                if duplicate {
-                    st.stage_b_dups += 1;
-                    continue;
+                    .collect();
+                let mut any_low = false;
+                for (i, tir, dir) in results {
+                    ident[i] = Some((tir, dir));
+                    if min_tir_ident > 0.0 && !(tir >= min_tir_ident) {
+                        low[i] = true;
+                        any_low = true;
+                    }
                 }
-                st.stage_b_kept += 1;
+                if !any_low {
+                    break (acc, acc_arms);
+                }
+            };
+            st.low_ident = low.iter().filter(|&&l| l).count() as u64;
 
-                // Arm geometry and identities, before acceptance: a call failing
-                // --min-tir-ident must not enter the dedup index, or it could suppress
-                // a genuine IR overlapping it.
+            // Accepted calls for this contig, buffered so loci can be assigned first.
+            let mut accepted: Vec<(Cand, ReportRow)> = Vec::with_capacity(accepted_idx.len());
+            for &i in &accepted_idx {
+                let c = cands[i].clone();
+                let (tir_ident, dir_ident) = ident[i].unwrap_or((f32::NAN, f32::NAN));
                 let (la0n, la1n, ra0n, ra1n) = normalize_arms(c.la0, c.la1, c.ra0, c.ra1);
                 let arm_len = (la1n.saturating_sub(la0n)).min(ra1n.saturating_sub(ra0n));
                 let spacer: isize = (ra0n as isize) - (la1n as isize);
                 let ir_class = classify_ir_str(spacer, immediate_bp, wide_bp);
-                let has_arm_seq =
-                    la1n > la0n && ra1n > ra0n && la1n <= seq.len() && ra1n <= seq.len();
-                let tir_ident = if has_arm_seq {
-                    revcomp_into(&mut rc_buf, &seq[ra0n..ra1n]);
-                    arm_identity(&seq[la0n..la1n], &rc_buf)
-                } else {
-                    f32::NAN
-                };
-                if min_tir_ident > 0.0 && !(tir_ident >= min_tir_ident) {
-                    st.low_ident += 1;
-                    continue;
-                }
-                let dir_ident = if has_arm_seq {
-                    arm_identity(&seq[la0n..la1n], &seq[ra0n..ra1n])
-                } else {
-                    f32::NAN
-                };
 
                 // Cap-hitter diagnostic (use the *actual* emitted length)
                 st.emitted += 1;
@@ -1886,11 +2006,6 @@ fn main() -> Result<()> {
                     st.precap_too_big += 1;
                 }
 
-                for bin in arms.0 / DEDUP_BIN..=arms.1.saturating_sub(1) / DEDUP_BIN {
-                    arm_index.entry(bin).or_default().push(accepted_arms.len());
-                }
-                accepted_arms.push(arms);
-
                 let left_arm_len = la1n.saturating_sub(la0n);
                 let right_arm_len = ra1n.saturating_sub(ra0n);
                 let arm_ratio = if left_arm_len > 0 && right_arm_len > 0 {
@@ -1901,6 +2016,7 @@ fn main() -> Result<()> {
                     f32::NAN
                 };
 
+                let pass = if c.large { "large" } else { "local" };
                 accepted.push((
                     c,
                     ReportRow {
@@ -1934,6 +2050,7 @@ fn main() -> Result<()> {
                             && dir_ident > tir_ident,
                         locus_id: String::new(),
                         locus_n_irs: 0,
+                        pass,
                     },
                 ));
             }
@@ -1975,11 +2092,12 @@ fn main() -> Result<()> {
                 let tir_ident = row.tir_ident.unwrap_or(f32::NAN);
                 let dir_ident = row.dir_ident.unwrap_or(f32::NAN);
                 let extra = format!(
-                    "\t{:.3}\t{}\t{}\t{}",
+                    "\t{:.3}\t{}\t{}\t{}\t{}",
                     dir_ident,
                     u8::from(row.direct_better),
                     row.locus_id,
-                    row.locus_n_irs
+                    row.locus_n_irs,
+                    row.pass
                 );
 
                 let r = if classify_ir {
