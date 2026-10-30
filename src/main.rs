@@ -8,7 +8,9 @@ use mdax::{
         CallMode, FairnessParams, FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg,
         SharedCfg, SigCfg,
     },
-    cli, elog, pipeline,
+    cli, elog,
+    fingerprint::is_real_foldback_stats,
+    pipeline,
     utils::{RefineMode, compact_histogram},
 };
 
@@ -112,6 +114,9 @@ fn main() -> Result<()> {
         .get_one::<usize>("sig_flank_bp")
         .unwrap_or(&t.sig_flank_bp);
     let sig_take = *args.get_one::<usize>("sig_take").unwrap_or(&t.sig_take);
+    let sig_value_shift = *args
+        .get_one::<u8>("sig_value_shift")
+        .unwrap_or(&t.sig_value_shift);
 
     let mut k = *args.get_one::<usize>("k").expect("defaulted k of 17");
     let mut w = *args.get_one::<usize>("w").expect("defaulted w of 21");
@@ -173,6 +178,7 @@ fn main() -> Result<()> {
         fmt_param("max_depth", max_depth, t.max_depth),
         fmt_param("sig_flank_bp", sig_flank_bp, t.sig_flank_bp),
         fmt_param("sig_take", sig_take, t.sig_take),
+        fmt_param("sig_value_shift", sig_value_shift, t.sig_value_shift),
         format!("k={k}  w={w}{ont_k_note}"),
         format!("refine_mode={refine_mode:?}  refine_arm={refine_arm}  refine_window={refine_window}"),
     ]
@@ -238,8 +244,7 @@ fn main() -> Result<()> {
         sig: SigCfg {
             flank_bp: sig_flank_bp,
             take: sig_take,
-            // TODO: maybe use in cli later
-            value_shift: t.sig_value_shift,
+            value_shift: sig_value_shift,
         },
     };
 
@@ -348,6 +353,11 @@ fn main() -> Result<()> {
         support.values().map(|s| s.n).max().unwrap_or(0),
     );
 
+    // Delegate to the same `is_real_foldback_stats()` pass2 actually gates on,
+    // rather than re-deriving the logic inline -- this diagnostic had drifted
+    // out of sync with the real gate before (it hardcoded the current gate
+    // conditions rather than calling the shared function), which would have
+    // silently stopped reflecting any future change to the real gate.
     let mut ge_support_clusters = 0usize;
     let mut ge_support_ident_clusters = 0usize;
     let mut real_clusters = 0usize;
@@ -361,8 +371,10 @@ fn main() -> Result<()> {
 
             if ident_ok {
                 ge_support_ident_clusters += 1;
-                real_clusters += 1;
             }
+        }
+        if is_real_foldback_stats(st, &cfg) {
+            real_clusters += 1;
         }
     }
 
@@ -405,6 +417,31 @@ fn main() -> Result<()> {
         large_cluster_threshold,
         reads_in_large_clusters,
     );
+
+    // Advisory only (not a gate change): --mode permissive's coarser signature
+    // is the one mode shown, on real data, to occasionally collapse an
+    // unrelated repeat family into one inflated "recurring locus" and
+    // fragment the assembly as a result (see test_single_nematode/README.md,
+    // "microlaimidae anomaly"). Thresholds below are set from that one
+    // confirmed case (max_cluster_n 407, 0.26% of reads in large clusters)
+    // vs. three unaffected species (max_cluster_n 70-130, <=0.05%) -- a
+    // small n, so treat this as a heuristic flag worth a second look, not a
+    // verdict. --mode strict/balanced are not flagged: not observed on this
+    // dataset and their tighter signature/shallower recursion make the same
+    // collision mechanism less likely (unvalidated beyond that one case).
+    if mode == CallMode::Permissive {
+        let frac_in_large_clusters = reads_in_large_clusters as f64 / total_n.max(1) as f64;
+        if max_cluster_n > 200 || frac_in_large_clusters > 0.001 {
+            elog!(
+                "QC MODE ADVICE",
+                "max_cluster_n={max_cluster_n} ({:.2}% of support reads in clusters_gt_{large_cluster_threshold}) \
+is high for --mode permissive on this dataset -- consider rerunning with --mode balanced or \
+--mode strict and comparing assembly/BUSCO outcome before committing to permissive. \
+(Heuristic from a single confirmed case; see test_single_nematode/README.md.)",
+                frac_in_large_clusters * 100.0,
+            );
+        }
+    }
 
     if qc_only {
         elog!(
