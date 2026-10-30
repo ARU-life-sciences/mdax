@@ -307,7 +307,18 @@ impl CallMode {
                 min_support: 2,
                 split_tol_bp: 100,
                 max_depth: 8,
-                sig_flank_bp: 200,
+                // 200 was the original value and is the documented cause of a
+                // signature-collision blowup on microlaimidae (max_cluster_n
+                // 407-454 vs. 70-130 on three other species; see
+                // test_single_nematode/README.md). 400 was swept 200-800bp on
+                // all 4 species with real data on disk and is strictly better
+                // than 200 on every one (microlaimidae 63->31, epsilonema
+                // 45->24, linhomoeus 8->6, trileptium 9->5, all on a matched
+                // 200k-read subsample). Note the relationship is NOT
+                // monotonic -- 800bp regresses microlaimidae back to 456,
+                // presumably by pulling in a second, more distant repeat
+                // family -- so don't push this further without re-sweeping.
+                sig_flank_bp: 400,
                 sig_take: 6,
                 sig_value_shift: 8,
             },

@@ -503,6 +503,25 @@ Guidance:\n\
                 .value_parser(value_parser!(usize)),
         )
         .arg(
+            Arg::new("sig_value_shift")
+                .long("sig-value-shift")
+                .help("Right-shift applied to signature hash values before dedup (0 = exact)")
+                .long_help("Quantization applied to the minimizer values that make up a junction \
+signature, before sorting/dedup. 0 (the default for balanced/strict) keeps signatures exact: a \
+single sequencing error that changes one minimizer's value changes that value's contribution to \
+the signature outright. A non-zero shift coarsens values first, so two minimizers that differ only \
+in low bits (common after a single-base substitution shifts a hash by a small amount) can quantize \
+to the same bucket and still agree.\n\
+\n\
+Tradeoff is the same one --mode permissive already makes with sig_value_shift=8: coarser signatures \
+merge more of a single real locus's reads together (less fragmentation, better recall of real \
+inverted repeats under the min_support gate), but also raise the chance that two genuinely \
+different loci collide into one cluster (inflating apparent support for what should be two separate, \
+possibly-artefactual junctions). Prefer increasing sig-take before this if you haven't already; this \
+is the more aggressive knob.")
+                .value_parser(value_parser!(u8)),
+        )
+        .arg(
             Arg::new("cut_low_ident")
                 .long("cut-low-ident")
                 .help("Cut low-identity foldbacks instead of labelling them low_ident")
