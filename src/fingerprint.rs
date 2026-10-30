@@ -19,7 +19,7 @@
 //! - quantization via `value_shift` can reduce sensitivity to small value jitter
 //! - `window_bp` / `flank_bp` bounds keep the signature local to the junction
 
-use gxhash::{GxHasher, HashMap};
+use gxhash::{GxHasher, HashMap, HashMapExt};
 use std::hash::{Hash, Hasher};
 
 use crate::{
@@ -348,20 +348,167 @@ impl SupportStats {
     }
 }
 
+/// Union-find (disjoint-set) over band-signature values.
+///
+/// A single real locus's reads frequently produce *disjoint* band sets that
+/// never all agree with each other (read A shares a band with read B, read B
+/// shares a different band with read C, but A and C share nothing directly).
+/// Treating each raw band as its own key under-counts support: every one of
+/// these reads' bands ends up a near-singleton even though they're all the
+/// same underlying locus. This structure merges any bands ever observed
+/// together in one read's own band set, and transitively merges clusters
+/// bridged by other reads, into one canonical cluster id (the union-find
+/// root) before support is counted. See `SupportMap`.
+#[derive(Debug, Default, Clone)]
+struct UnionFind {
+    parent: HashMap<u64, u64>,
+}
+
+impl UnionFind {
+    fn new() -> Self {
+        Self {
+            parent: HashMap::new(),
+        }
+    }
+
+    /// Resolve `x` to its canonical root, with path compression. Unseen
+    /// values are lazily registered as their own singleton root.
+    fn find(&mut self, x: u64) -> u64 {
+        let px = *self.parent.entry(x).or_insert(x);
+        if px == x {
+            x
+        } else {
+            let root = self.find(px);
+            self.parent.insert(x, root);
+            root
+        }
+    }
+
+    /// Merge the clusters containing `a` and `b`.
+    fn union(&mut self, a: u64, b: u64) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            // Deterministic attachment rule (smaller root under larger), so
+            // the same edge set always produces the same roots regardless of
+            // processing order.
+            if ra < rb {
+                self.parent.insert(ra, rb);
+            } else {
+                self.parent.insert(rb, ra);
+            }
+        }
+    }
+
+    /// All raw band values this structure has ever seen (as `find`/`union`
+    /// arguments), i.e. every band that may need re-mapping to its root.
+    fn known_keys(&self) -> Vec<u64> {
+        self.parent.keys().copied().collect()
+    }
+}
+
+/// Pass1's output: per-locus `SupportStats`, keyed by canonical cluster id,
+/// plus the raw-band -> canonical-root mapping needed to look up a freshly
+/// computed read's bands against those clusters.
+///
+/// Building this directly as a flat `HashMap<band, SupportStats>` (one entry
+/// per raw band, as pass1 used to) under-counts support for any real locus
+/// whose reads' band sets don't all agree with each other -- see
+/// `UnionFind`. `SupportMap::build` resolves that before any entry is
+/// counted, so `n` reflects reads-per-locus, not reads-per-raw-band.
+#[derive(Debug, Default, Clone)]
+pub struct SupportMap {
+    stats: HashMap<u64, SupportStats>,
+    band_root: HashMap<u64, u64>,
+}
+
+impl SupportMap {
+    pub fn empty() -> Self {
+        Self {
+            stats: HashMap::new(),
+            band_root: HashMap::new(),
+        }
+    }
+
+    /// Build a `SupportMap` from per-read observations (one `(band, split,
+    /// ident)` per read that produced a signature, using any one of that
+    /// read's own bands as the lookup key) and the edges connecting bands
+    /// that co-occurred within a single read's band set.
+    ///
+    /// Each read contributes exactly one observation to exactly one
+    /// canonical cluster -- never one observation per raw band -- so cluster
+    /// `n` is a true read count, not inflated by how many bands a read
+    /// happens to produce.
+    pub fn build(records: &[(u64, usize, f32)], edges: &[(u64, u64)]) -> Self {
+        let mut uf = UnionFind::new();
+        for &(a, b) in edges {
+            uf.union(a, b);
+        }
+
+        let mut stats: HashMap<u64, SupportStats> = HashMap::new();
+        for &(band, split, ident) in records {
+            let root = uf.find(band);
+            stats
+                .entry(root)
+                .and_modify(|st| st.update(split, ident))
+                .or_insert_with(|| SupportStats::new(split, ident));
+        }
+
+        let keys = uf.known_keys();
+        let mut band_root = HashMap::with_capacity(keys.len());
+        for b in keys {
+            band_root.insert(b, uf.find(b));
+        }
+
+        Self { stats, band_root }
+    }
+
+    /// Resolve a raw band value to its canonical cluster id. Bands never
+    /// involved in a union (e.g. a read whose own band set was a disjoint
+    /// singleton with no later read bridging it to anything else) resolve to
+    /// themselves.
+    pub fn resolve(&self, band: u64) -> u64 {
+        *self.band_root.get(&band).unwrap_or(&band)
+    }
+
+    pub fn get(&self, band: u64) -> Option<&SupportStats> {
+        self.stats.get(&self.resolve(band))
+    }
+
+    pub fn len(&self) -> usize {
+        self.stats.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stats.is_empty()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &SupportStats> {
+        self.stats.values()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &SupportStats)> {
+        self.stats.iter()
+    }
+}
+
 /// Given the band signatures for a read's foldback junction, find the best-supported
 /// matching entry in the support map (the one with the highest read count `n`).
 ///
 /// A read's junction maps to several band signatures (see
 /// [`foldback_signature_from_local_matches_bands`]); any one of them colliding with
 /// an existing support-map entry is evidence for the same underlying locus, so we
-/// take the strongest match rather than requiring all bands to agree.
-pub fn best_support<'a>(
-    bands: &[u64],
-    support: &'a HashMap<u64, SupportStats>,
-) -> Option<(u64, &'a SupportStats)> {
+/// take the strongest match rather than requiring all bands to agree. Returns the
+/// *canonical* cluster id (not necessarily equal to any of `bands`), so the same
+/// locus is reported identically regardless of which of a read's bands happened to
+/// hit the map.
+pub fn best_support<'a>(bands: &[u64], support: &'a SupportMap) -> Option<(u64, &'a SupportStats)> {
     bands
         .iter()
-        .filter_map(|&b| support.get(&b).map(|st| (b, st)))
+        .filter_map(|&b| {
+            let root = support.resolve(b);
+            support.get(root).map(|st| (root, st))
+        })
         .max_by_key(|(_, st)| st.n)
 }
 
@@ -382,8 +529,8 @@ pub fn is_real_foldback_stats(st: &SupportStats, cfg: &MdaxCfg) -> bool {
 }
 
 /// Decide whether a foldback junction is "real" based on pass1 support statistics.
-pub fn is_real_foldback(sig: u64, support: &HashMap<u64, SupportStats>, cfg: &MdaxCfg) -> bool {
-    let Some(st) = support.get(&sig) else {
+pub fn is_real_foldback(sig: u64, support: &SupportMap, cfg: &MdaxCfg) -> bool {
+    let Some(st) = support.get(sig) else {
         return false;
     };
     is_real_foldback_stats(st, cfg)
@@ -399,7 +546,6 @@ mod tests {
     use crate::utils::RefineMode;
 
     use calm_io::stderrln;
-    use gxhash::HashMapExt;
     use std::fs::File;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};

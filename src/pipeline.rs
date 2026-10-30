@@ -6,7 +6,6 @@
 
 use anyhow::Result;
 use crossbeam_channel as chan;
-use gxhash::{HashMap, HashMapExt};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use std::thread;
 use crate::{
     cfg::MdaxCfg,
     fingerprint::{
-        SupportStats, best_support, foldback_signature_bands,
+        SupportMap, best_support, foldback_signature_bands,
         foldback_signature_from_local_matches_bands, is_real_foldback_stats,
     },
     foldback, io,
@@ -155,7 +154,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
     cfg: Arc<MdaxCfg>,
     threads: usize,
     chan_cap: usize,
-) -> Result<HashMap<u64, SupportStats>> {
+) -> Result<SupportMap> {
     let (tx, rx) = chan::bounded::<BatchJob>(chan_cap);
     const BATCH_SIZE: usize = 256;
 
@@ -198,8 +197,14 @@ pub fn pass1_build_support<P: AsRef<Path>>(
         let rx = rx.clone();
 
         worker_handles.push(thread::spawn(
-            move || -> Result<HashMap<u64, SupportStats>> {
-                let mut local: HashMap<u64, SupportStats> = HashMap::new();
+            move || -> Result<(Vec<(u64, usize, f32)>, Vec<(u64, u64)>)> {
+                // One (band, split, ident) record per sig_ok read (any one of
+                // that read's own bands serves as the lookup key into the
+                // final union-find -- see SupportMap::build), plus the edges
+                // connecting that read's own bands together so the merge
+                // step can resolve them all to one canonical cluster.
+                let mut records: Vec<(u64, usize, f32)> = Vec::new();
+                let mut edges: Vec<(u64, u64)> = Vec::new();
 
                 let mut fold_scratch = FoldScratch::new();
                 let mut sig_scratch = SigScratch::default();
@@ -281,31 +286,31 @@ pub fn pass1_build_support<P: AsRef<Path>>(
                         let Some(bands) = bands else { continue };
                         dbg.bump("sig_ok");
 
-                        // Every band is a candidate key for this read's locus (see
-                        // foldback_signature_from_local_matches_bands): a read whose
-                        // sketch differs from another read's by only one element still
-                        // shares a band with it, so insert under all of them.
-                        for band in bands {
-                            local
-                                .entry(band)
-                                .and_modify(|st| st.update(rf.split_pos, rf.identity_est))
-                                .or_insert_with(|| SupportStats::new(rf.split_pos, rf.identity_est));
+                        // This read's own bands are, by construction, all evidence for
+                        // the same locus -- union them so the merge step treats them as
+                        // one cluster even if another read only ever shares one of them
+                        // (see SupportMap::build / fingerprint::UnionFind).
+                        for i in 1..bands.len() {
+                            edges.push((bands[0], bands[i]));
+                        }
+                        if let Some(&rep) = bands.first() {
+                            records.push((rep, rf.split_pos, rf.identity_est));
                         }
                     }
                 }
 
                 elog!(
                     "PASS1 WORKER DONE",
-                    "jobs={}, detected={}, refined={}, ident_ok={}, sig_ok={}, unique_sigs={}",
+                    "jobs={}, detected={}, refined={}, ident_ok={}, sig_ok={}, records={}",
                     dbg.jobs,
                     dbg.detected,
                     dbg.refined,
                     dbg.ident_ok,
                     dbg.sig_ok,
-                    local.len(),
+                    records.len(),
                 );
 
-                Ok(local)
+                Ok((records, edges))
             },
         ));
     }
@@ -314,31 +319,22 @@ pub fn pass1_build_support<P: AsRef<Path>>(
         .join()
         .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
 
-    // Reduce locals into global
-    let mut support: HashMap<u64, SupportStats> = HashMap::new();
+    // Merge every worker's per-read records and within-read band edges, then
+    // resolve the whole dataset's bands to canonical clusters in one shot.
+    // See `SupportMap::build` for why this can't be done as an incremental
+    // per-band reduce: a band's final cluster membership can depend on an
+    // edge discovered by a read processed by a different thread.
+    let mut all_records: Vec<(u64, usize, f32)> = Vec::new();
+    let mut all_edges: Vec<(u64, u64)> = Vec::new();
     for h in worker_handles {
-        let local = h
+        let (records, edges) = h
             .join()
             .map_err(|_| anyhow::anyhow!("worker thread panicked"))??;
-
-        for (sig, st) in local {
-            support
-                .entry(sig)
-                .and_modify(|g| {
-                    let total_n = g.n + st.n;
-                    let mean = if total_n > 0 {
-                        (g.mean_ident * g.n as f32 + st.mean_ident * st.n as f32) / total_n as f32
-                    } else {
-                        0.0
-                    };
-                    g.n = total_n;
-                    g.min_split = g.min_split.min(st.min_split);
-                    g.max_split = g.max_split.max(st.max_split);
-                    g.mean_ident = mean;
-                })
-                .or_insert(st);
-        }
+        all_records.extend(records);
+        all_edges.extend(edges);
     }
+
+    let support = SupportMap::build(&all_records, &all_edges);
 
     Ok(support)
 }
@@ -347,7 +343,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
 pub fn pass2_correct_and_write<P: AsRef<Path>>(
     input: P,
     cfg: Arc<MdaxCfg>,
-    support: Arc<HashMap<u64, SupportStats>>,
+    support: Arc<SupportMap>,
     max_depth: usize,
     threads: usize,
     chan_cap: usize,
@@ -439,7 +435,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
 
         // Write TSV header once (via bytes, no formatting)
         tsv_out.write_all(
-        b"read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tgap_est\tsupport_n\tsupport_rank_frac\tsupport_span\tdecision\n"
+        b"read_id\tlen\tevent\tcalled\tcoarse_split\trefined_split\tdelta\tmatches\tspan_p1\tp2_span\tcross_frac\tcoarse_score\trefined_score\tidentity_est\tgap_est\tsupport_n\tsupport_rank_frac\tsupport_span\tdecision\tsig_band\n"
     )?;
 
         // User-space batching buffers
@@ -592,7 +588,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                 (rf_call.split_pos, rf_call.identity_est)
                             };
 
-                            let (decision, support_n, support_rank_frac, support_span) =
+                            let (decision, support_n, support_rank_frac, support_span, sig_band) =
                                 if sig_ident >= cfg.fold2.min_identity {
                                     dbg.bump("ident_ok");
 
@@ -631,7 +627,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                     if let Some(bands) = bands {
                                         dbg.bump("sig_ok");
 
-                                        let (real, n, rank_frac, span) = if let Some((band, st)) = best_support(&bands, &support) {
+                                        let (real, n, rank_frac, span, band_val) = if let Some((band, st)) = best_support(&bands, &support) {
                                             dbg.bump("sig_in_support");
                                             if hit_sig_sample.len() < 5 {
                                                 hit_sig_sample.push((band, st.n));
@@ -642,13 +638,14 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                                 st.n,
                                                 rf,
                                                 st.split_span(),
+                                                Some(band),
                                             )
                                         } else {
                                             dbg.bump("sig_not_in_support");
                                             if miss_sig_sample.len() < 5 && !bands.is_empty() {
                                                 miss_sig_sample.push(bands[0]);
                                             }
-                                            (false, 0, 0.0, 0)
+                                            (false, 0, 0.0, 0, None)
                                         };
 
 
@@ -680,9 +677,9 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                             num_real += 1;
                                         }
 
-                                        (if real { "real" } else { "artefact" }, n, rank_frac, span)
+                                        (if real { "real" } else { "artefact" }, n, rank_frac, span, band_val)
                                     } else {
-                                        ("unknown", 0, 0.0, 0)
+                                        ("unknown", 0, 0.0, 0, None)
                                     }
                                 } else if cfg.fold2.cut_low_ident {
                                     // Identity gate failed but the caller opted-in to
@@ -694,16 +691,19 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                     );
                                     keep = 0..rf_call.split_pos;
                                     num_cut += 1;
-                                    ("artefact", 0, 0.0, 0)
+                                    ("artefact", 0, 0.0, 0, None)
                                 } else {
-                                    ("low_ident", 0, 0.0, 0)
+                                    ("low_ident", 0, 0.0, 0, None)
                                 };
 
                             // TSV row: only now do we build id_str
                             let id_str =
                                 std::str::from_utf8(&job.id).unwrap_or("<nonutf8_id>");
+                            let sig_band_str = sig_band
+                                .map(|b| format!("{b:x}"))
+                                .unwrap_or_else(|| "NA".to_string());
                             tsv_row = Some(format!(
-                                "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}\t{}\t{}\t{:.6}\t{}\t{}",
+                                "{id}\t{len}\tfoldback\t1\t{}\t{}\t\t{}\t{}\t\t\t{}\t{}\t{:.3}\t{}\t{}\t{:.6}\t{}\t{}\t{}",
                                 fb.split_pos,
                                 rf_call.split_pos,
                                 fb.matches,
@@ -716,6 +716,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                 support_rank_frac,
                                 support_span,
                                 decision,
+                                sig_band_str,
                                 id = id_str,
                                 len = len
                             ));

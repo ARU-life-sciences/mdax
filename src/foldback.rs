@@ -38,7 +38,7 @@
 
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
 use crate::fingerprint::{
-    SupportStats, best_support, foldback_signature_bands,
+    SupportMap, best_support, foldback_signature_bands,
     foldback_signature_from_local_matches_bands, is_real_foldback_stats,
 };
 use crate::minimizer::sampled_minimizers_into;
@@ -48,7 +48,6 @@ use crate::utils::{
     revcomp_into,
 };
 use anyhow::Result;
-use gxhash::HashMap;
 use std::ops::Range;
 
 /// Per-bin summary statistics used during coarse foldback detection.
@@ -1090,7 +1089,7 @@ pub fn recursive_foldback_cut_from_first_range(
     first_fb: FoldBreakpoint, // split_pos is assumed relative to `seq` (full coords)
     first_rf: Refined,        // split_pos is assumed relative to `seq` (full coords)
     cfg: &MdaxCfg,
-    support: &HashMap<u64, SupportStats>,
+    support: &SupportMap,
     max_depth: usize,
     scratch: &mut FoldScratch,
     sig_scratch: &mut SigScratch,
@@ -1244,8 +1243,6 @@ mod tests {
         cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg},
         scratch,
     };
-    use gxhash::HashMapExt;
-
     fn test_fold_cfg(
         k: usize,
         w: usize,
@@ -1666,7 +1663,7 @@ mod tests {
         .expect("should refine");
 
         // Empty support map: nothing is "real", so this is treated as an artefact.
-        let support: HashMap<u64, SupportStats> = HashMap::new();
+        let support = SupportMap::empty();
         let mut sig_scratch = SigScratch::default();
 
         let keep = recursive_foldback_cut_from_first_range(
@@ -1716,7 +1713,7 @@ mod tests {
         .unwrap()
         .expect("should refine");
 
-        let support: HashMap<u64, SupportStats> = HashMap::new();
+        let support = SupportMap::empty();
         let mut sig_scratch = SigScratch::default();
 
         let keep = recursive_foldback_cut_from_first_range(
@@ -1773,7 +1770,7 @@ mod tests {
         .unwrap()
         .expect("should refine");
 
-        let support: HashMap<u64, SupportStats> = HashMap::new();
+        let support = SupportMap::empty();
         let mut sig_scratch = SigScratch::default();
 
         let keep = recursive_foldback_cut_from_first_range(
