@@ -110,6 +110,57 @@ folded into the same signature bucket, inflating the cross-read support
 count that `is_real_foldback_stats()` (`src/fingerprint.rs:369`) uses as its
 sole "real" gate.
 
+### Attempted fix: signature-collision guard via split-position spread (ruled out, 2026-10-29)
+
+`ModeTuning` already had a `split_tol_bp` field (strict=30, balanced=50,
+permissive=100 bp) defined but never wired to anything (`#[allow(dead_code)]`)
+— its doc comment suggested gating "real" on how tightly a signature's
+observed split positions (`SupportStats::split_span()`) cluster across reads,
+on the theory that a true recurring locus's reads localize to a consistent
+split position while reads from unrelated loci colliding under a coarsened
+signature would not.
+
+Wired this into `is_real_foldback_stats()` and tested directly against the
+microlaimidae raw reads with `--qc-only` (fast, no reassembly needed). Result:
+it **does not discriminate** — it rejects "real" uniformly across every
+species, not just the collision-affected one:
+
+| Species | `real` clusters, guard off | `real` clusters, guard on (100bp) |
+|---|---|---|
+| Epsilonema (fine) | 3,215 | 105 (-97%) |
+| Linhomoeus (fine) | 1,335 | 23 (-98%) |
+| Microlaimidae (blowup) | 2,266 | 86 (-96%) |
+
+The reduction is ~96-98% on *every* species regardless of whether it has the
+collision problem. Root cause of the failure: `split` is a read-space
+position (where the breakpoint falls within that particular read), which
+varies with each read's own fragment boundaries regardless of whether the
+locus is a true recurring one or a collision — it carries no signal about
+inter-read relatedness. **Reverted** (`is_real_foldback_stats()`, `cfg.rs`,
+`cli.rs` back to pre-change state) rather than ship a change that would
+silently over-cut real palindromes in permissive mode. Left here so a future
+session doesn't re-attempt the same dead end.
+
+### Shipped instead: advisory-only mode suggestion (2026-10-29)
+
+Since the classifier itself couldn't be safely fixed with the signal
+available, `mdax` now prints a `QC MODE ADVICE` line (in both normal and
+`--qc-only` runs) when `--mode permissive` and `max_cluster_n > 200` (or
+>0.1% of support-map observations sit in clusters >50) — the threshold is
+set from this directory's one confirmed case (microlaimidae: 407) vs. three
+unaffected species (70-130), so treat it as a heuristic flag worth a second
+look, not a verdict. It recommends comparing against `--mode balanced`/
+`--mode strict` before committing to permissive; it does not change cutting
+behavior itself. Verified it fires only on microlaimidae across all 4 species
+tested here.
+
+Also fixed in the same pass: the `--qc-only` `SUPPORT GATE` diagnostic had
+its own inline reimplementation of the real/artefact decision instead of
+calling `is_real_foldback_stats()` directly — i.e. it was a second copy of
+the gate logic that could silently drift from the one pass2 actually uses.
+Now calls the shared function; output is unchanged (verified byte-identical
+on microlaimidae) but can't drift again.
+
 Directly measurable from the existing `report.tsv` per-read output (no new
 runs needed) — the `support_n` column, i.e. how many reads collapsed onto
 the same signature:
@@ -120,6 +171,59 @@ the same signature:
 | Linhomoeus | 150,055 | 73 | 73 (0.05%) | fine |
 | Trileptium | 286,229 | 130 | 130 (0.05%) | fine |
 | **Microlaimidae** | 376,892 | **407** | **970 (0.26%)** | **blowup** |
+
+*Read-count caveat (2026-10-30): the total-reads column above is stale —
+re-checked against the actual files on disk and all four are substantially
+larger (microlaimidae alone is ~1.45M reads, not 376,892; likely true of
+all four). Doesn't change the qualitative picture (microlaimidae's cluster
+is still 3-6x the others', scaled or not), just flagging so a future
+session doesn't trust these counts for anything quantitative.*
+
+### Fixed: sig_flank_bp 200 -> 400 (2026-10-30)
+
+The "candidate follow-up" flagged above — check max signature-cluster size
+under permissive-mode parameters — was carried out. Swept `--sig-flank-bp`
+200-800bp (and `--sig-value-shift` 0 vs. 8, which turned out to have no
+measurable effect at either setting — it's a bare bit-shift on a
+well-distributed hash, not a "fuzzy-match near-duplicates" operation)
+against all 4 species, qc-only, on matched 200k-read subsamples (first
+confirmed microlaimidae's default-vs-subsample scaling is near-linear, so
+subsample numbers are representative):
+
+| Species | fb=200 (old default) | fb=400 (new default) |
+|---|---|---|
+| Microlaimidae | 63 | 31 |
+| Epsilonema | 45 | 24 |
+| Linhomoeus | 8 | 6 |
+| Trileptium | 9 | 5 |
+
+400bp is strictly better than 200bp on every species tested — shipped as
+the new permissive-mode default (`src/cfg.rs`). Important caveat: this is
+**not** a "bigger is always safer" relationship — 800bp regresses
+microlaimidae back to 456 (as bad as the unfixed default), almost
+certainly by pulling a second, more distant repeat family into the
+window. Don't push this knob further without re-sweeping all 4 species.
+
+Also worth noting: the union-find support-merging fix shipped earlier the
+same session (commit `d993618`, aimed at the *opposite* problem — genuine
+inverted repeats losing real support to signature fragmentation) measurably
+*worsened* this specific collision case before the flank_bp fix landed
+(max_cluster_n 407 -> 454) — expected, since that fix exists to merge more
+aggressively, which is exactly the wrong direction when the underlying
+signature is already too collision-prone. The two fixes pull in opposite
+directions on purpose, for opposite failure modes; this is a reminder that
+either one in isolation can look worse on the other's test case.
+
+**Not yet closed**: the above is all from the `--qc-only` diagnostic
+(signature cluster sizes), not a reassembly. The original bug was
+documented at the assembly level (near-doubled genome length, 10x BUSCO
+duplication on microlaimidae). An assembly-level reconfirmation — mdax
+(permissive, fixed binary) -> Flye -> BUSCO on microlaimidae, same method
+as the original benchmark — was launched 2026-10-30 (LSF jobs 370979 ->
+370982 -> 370986, output under
+`.../mdax_single_nematode_benchmark/{corrected,asm,busco}/microlaimidae/mdax_permissive_fixed/`)
+but had not completed as of this writing. Update this section with the
+BUSCO result once it lands.
 
 Microlaimidae's largest signature cluster is 3-6x bigger than any other
 species', and it has 7-14x more reads embedded in large clusters. Consistent
