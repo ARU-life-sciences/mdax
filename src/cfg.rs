@@ -296,7 +296,24 @@ impl CallMode {
                 split_tol_bp: 50,
                 max_depth: 5,
                 sig_flank_bp: 600,
-                sig_take: 8,
+                // 8 was the original value. Each of the `take` leave-one-out
+                // band signatures requires take-1 minimizers to match
+                // *exactly* (see fingerprint::hash_bands), so a larger take
+                // makes every band stricter, not more forgiving -- it hurts
+                // support-map merging of a real locus's noisy reads, it
+                // doesn't help it. Swept 2-32 on synth_bench's run_main
+                // (7500 ground-truthed reads): take=3 is a clean local
+                // optimum (hard-case FPR, i.e. genuine inverted repeats
+                // wrongly cut, 4.4% -> 0.0%, recall unchanged at 99.7%).
+                // Checked for the obvious collision-risk concern (smaller
+                // take is the same direction as permissive mode's signature-
+                // collision bug) directly against microlaimidae, the one
+                // real dataset with a documented collision problem: balanced
+                // mode at take=3 moves max_cluster_n only 18->22, nothing
+                // like permissive's 400+, so flank_bp (already fixed
+                // separately) looks like the dominant driver of that bug,
+                // not take. Strict mode's take=10 was not swept; left as-is.
+                sig_take: 3,
                 sig_value_shift: 0, // not sure this should be > 0
             },
             // permissive: more calls/cuts (good for exploration)
