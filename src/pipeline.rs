@@ -149,12 +149,18 @@ struct OutRec {
 }
 
 /// Pass 1 (parallel): scan the input once and build the **support map**.
+/// Returns the support map plus the total number of input records scanned
+/// (not just the ones that produced a signature) -- callers computing a
+/// fraction against "how collision-prone is this dataset" should divide by
+/// this, not by the support map's own read count, which only covers reads
+/// that passed detection/refinement/identity/signature gates and can be a
+/// small, dataset-dependent fraction of the input.
 pub fn pass1_build_support<P: AsRef<Path>>(
     input: P,
     cfg: Arc<MdaxCfg>,
     threads: usize,
     chan_cap: usize,
-) -> Result<SupportMap> {
+) -> Result<(SupportMap, u64)> {
     let (tx, rx) = chan::bounded::<BatchJob>(chan_cap);
     const BATCH_SIZE: usize = 256;
 
@@ -197,7 +203,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
         let rx = rx.clone();
 
         worker_handles.push(thread::spawn(
-            move || -> Result<(Vec<(u64, usize, f32)>, Vec<(u64, u64)>)> {
+            move || -> Result<(Vec<(u64, usize, f32)>, Vec<(u64, u64)>, u64)> {
                 // One (band, split, ident) record per sig_ok read (any one of
                 // that read's own bands serves as the lookup key into the
                 // final union-find -- see SupportMap::build), plus the edges
@@ -310,7 +316,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
                     records.len(),
                 );
 
-                Ok((records, edges))
+                Ok((records, edges, dbg.jobs))
             },
         ));
     }
@@ -326,17 +332,19 @@ pub fn pass1_build_support<P: AsRef<Path>>(
     // edge discovered by a read processed by a different thread.
     let mut all_records: Vec<(u64, usize, f32)> = Vec::new();
     let mut all_edges: Vec<(u64, u64)> = Vec::new();
+    let mut total_reads: u64 = 0;
     for h in worker_handles {
-        let (records, edges) = h
+        let (records, edges, jobs) = h
             .join()
             .map_err(|_| anyhow::anyhow!("worker thread panicked"))??;
         all_records.extend(records);
         all_edges.extend(edges);
+        total_reads += jobs;
     }
 
     let support = SupportMap::build(&all_records, &all_edges);
 
-    Ok(support)
+    Ok((support, total_reads))
 }
 
 /// Pass 2 (parallel): detect foldbacks, decide whether they're "real", and (optionally) correct reads.

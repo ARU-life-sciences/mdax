@@ -177,7 +177,7 @@ fn run_pipeline(
     let threads = 1;
     let chan_cap = 64;
 
-    let support =
+    let (support, _total_reads) =
         pipeline::pass1_build_support(input, cfg_arc.clone(), threads, chan_cap).unwrap();
     let support_arc = Arc::new(support);
 

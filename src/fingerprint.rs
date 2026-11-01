@@ -512,11 +512,42 @@ pub fn best_support<'a>(bands: &[u64], support: &'a SupportMap) -> Option<(u64, 
         .max_by_key(|(_, st)| st.n)
 }
 
+/// Safety-valve ceiling on a cluster's read count, independent of `min_support`.
+///
+/// `SupportMap::build`'s union-find has no bound on transitive merging: a
+/// single band value shared between two otherwise-unrelated reads unions
+/// *all* of each read's own bands together, and that merge chains through
+/// the whole dataset via any other read that bridges two components. Before
+/// the union-find fix, a collision only inflated the one shared band's count;
+/// now it can fold two or more real loci's entire read populations into one
+/// cluster. `test_single_nematode/README.md` already documents this
+/// mechanism making microlaimidae's collision-prone case *worse* (max
+/// cluster 407 -> 454) before the (separate) sig_flank_bp fix brought it back
+/// down -- i.e. this isn't hypothetical, it's the exact thing that regressed.
+///
+/// This is a blunt backstop, not a precision classifier: calibrated from the
+/// same data as the `QC MODE ADVICE` heuristic in `main.rs` (max_cluster_n
+/// 407-454 on the one confirmed collision case vs. 18-130 on every other
+/// real/synthetic cluster measured so far, including the deliberately-
+/// stressed `run_main` ground-truth set, max 41). A cluster this large is
+/// far more likely to be an unbounded collision cascade than a genuinely
+/// recurring locus, so treat it as artefact (cut) rather than silently
+/// trusting it as real and leaving a potentially large duplicated/uncut
+/// region in the assembly. `main.rs`'s advisory threshold reuses this same
+/// constant rather than hardcoding its own copy.
+pub const MAX_PLAUSIBLE_CLUSTER_N: usize = 200;
+
 /// Core "real vs artefact" gate, given an already-resolved support entry.
 pub fn is_real_foldback_stats(st: &SupportStats, cfg: &MdaxCfg) -> bool {
     // Read-space split positions are not expected to cluster tightly across reads.
     // The signature already anchors the locus; use support count as the primary gate.
     if st.n < cfg.fold2.min_support {
+        return false;
+    }
+
+    // See MAX_PLAUSIBLE_CLUSTER_N: an anomalously large cluster is far more
+    // likely to be a collision cascade than genuine recurrence.
+    if st.n > MAX_PLAUSIBLE_CLUSTER_N {
         return false;
     }
 
@@ -723,7 +754,7 @@ mod tests {
 
         let cfg2 = cfg.clone();
 
-        let support = pass1_build_support(&path, Arc::new(cfg), 1, 1).expect("pass1 support");
+        let (support, _total_reads) = pass1_build_support(&path, Arc::new(cfg), 1, 1).expect("pass1 support");
 
         // remove file
         let _ = std::fs::remove_file(&path);
@@ -915,7 +946,7 @@ mod tests {
         );
 
         let cfg2 = cfg.clone();
-        let support = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
+        let (support, _total_reads) = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
         let _ = std::fs::remove_file(&path);
 
         // With banded signatures, noise on r3/r4 that changes even one of the
@@ -1060,7 +1091,7 @@ mod tests {
 
         let cfg2 = cfg.clone();
 
-        let support = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
+        let (support, _total_reads) = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert!(

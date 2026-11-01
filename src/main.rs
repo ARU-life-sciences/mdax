@@ -9,7 +9,7 @@ use mdax::{
         SharedCfg, SigCfg,
     },
     cli, elog,
-    fingerprint::is_real_foldback_stats,
+    fingerprint::{MAX_PLAUSIBLE_CLUSTER_N, is_real_foldback_stats},
     pipeline,
     utils::{RefineMode, compact_histogram},
 };
@@ -285,7 +285,7 @@ fn main() -> Result<()> {
     let cfg_arc = Arc::new(cfg.clone());
 
     // PASS 1
-    let support = pipeline::pass1_build_support(&fasta, cfg_arc.clone(), threads, chan_cap)?;
+    let (support, total_reads) = pipeline::pass1_build_support(&fasta, cfg_arc.clone(), threads, chan_cap)?;
     elog!("SUPPORT MAP", "Number of entries: {}", support.len());
 
     // Collect histogram of clusters into buckets based on their size
@@ -430,11 +430,18 @@ fn main() -> Result<()> {
     // dataset and their tighter signature/shallower recursion make the same
     // collision mechanism less likely (unvalidated beyond that one case).
     if mode == CallMode::Permissive {
-        let frac_in_large_clusters = reads_in_large_clusters as f64 / total_n.max(1) as f64;
-        if max_cluster_n > 200 || frac_in_large_clusters > 0.001 {
+        // Denominator must match what the thresholds above were calibrated
+        // against in test_single_nematode/README.md: fractions there (e.g.
+        // epsilonema 70/368,903 = 0.02%) are against *all* input reads, not
+        // just the ones that passed detection/refinement/identity/signature
+        // gates (total_n, used above for avg_n -- a much smaller, dataset-
+        // dependent denominator that would make this fraction read higher
+        // than the calibration and could false-fire on a healthy dataset).
+        let frac_in_large_clusters = reads_in_large_clusters as f64 / total_reads.max(1) as f64;
+        if max_cluster_n > MAX_PLAUSIBLE_CLUSTER_N || frac_in_large_clusters > 0.001 {
             elog!(
                 "QC MODE ADVICE",
-                "max_cluster_n={max_cluster_n} ({:.2}% of support reads in clusters_gt_{large_cluster_threshold}) \
+                "max_cluster_n={max_cluster_n} ({:.2}% of all input reads in clusters_gt_{large_cluster_threshold}) \
 is high for --mode permissive on this dataset -- consider rerunning with --mode balanced or \
 --mode strict and comparing assembly/BUSCO outcome before committing to permissive. \
 (Heuristic from a single confirmed case; see test_single_nematode/README.md.)",
