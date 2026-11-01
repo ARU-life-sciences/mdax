@@ -28,7 +28,7 @@ for vs in 8 0; do
     echo "=== sig_flank_bp=200 sig_value_shift=$vs ===" | tee -a "$OUT/summary.txt"
     RUSTFLAGS="-C target-cpu=native" "$BIN" "$READS" \
         --mode permissive --refine-mode ont --cut-low-ident --qc-only \
-        --sig-value-shift "$vs" \
+        --sig-flank-bp 200 --sig-value-shift "$vs" \
         > "$log" 2>&1
     grep -E "SUPPORT UNIQUENESS|SUPPORT SANITY|QC SUMMARY|QC MODE ADVICE" "$log" | tee -a "$OUT/summary.txt"
 done
