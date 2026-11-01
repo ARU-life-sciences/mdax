@@ -214,16 +214,29 @@ signature is already too collision-prone. The two fixes pull in opposite
 directions on purpose, for opposite failure modes; this is a reminder that
 either one in isolation can look worse on the other's test case.
 
-**Not yet closed**: the above is all from the `--qc-only` diagnostic
-(signature cluster sizes), not a reassembly. The original bug was
-documented at the assembly level (near-doubled genome length, 10x BUSCO
-duplication on microlaimidae). An assembly-level reconfirmation — mdax
-(permissive, fixed binary) -> Flye -> BUSCO on microlaimidae, same method
-as the original benchmark — was launched 2026-10-30 (LSF jobs 370979 ->
-370982 -> 370986, output under
-`.../mdax_single_nematode_benchmark/{corrected,asm,busco}/microlaimidae/mdax_permissive_fixed/`)
-but had not completed as of this writing. Update this section with the
-BUSCO result once it lands.
+**Closed, confirmed at the assembly level (2026-10-31)**: mdax (permissive,
+fixed binary) -> Flye -> BUSCO on microlaimidae, same method as the
+original benchmark (job chain 374170 -> 374177 -> 374182, output under
+`.../mdax_single_nematode_benchmark/{corrected,asm,busco}/microlaimidae/mdax_permissive_fixed/`):
+
+| Arm | Complete | Single | Dup | Contigs | N50 | Total length |
+|---|---|---|---|---|---|---|
+| raw | 16.1% | 15.7% | 0.4% | 45,291 | 20 kb | 630.7 Mb |
+| theirs | 20.1% | 19.6% | 0.5% | 42,179 | 21 kb | 605.1 Mb |
+| balanced | 17.4% | 17.0% | 0.4% | 40,143 | 21 kb | 582.3 Mb |
+| strict | 18.9% | 18.4% | 0.5% | 39,946 | 22 kb | 595.0 Mb |
+| permissive (old, buggy) ⚠️ | 11.9% | 6.4% | **5.5%** | 40,978 | 34 kb | **1,084.4 Mb** |
+| **permissive (fixed)** | **16.4%** | 16.0% | **0.4%** | 40,922 | 19 kb | **566.3 Mb** |
+| published (ground truth) | — | — | — | 35,431 | 24.1 kb | 575.8 Mb |
+
+The fix fully resolves the original bug: total length collapses back from
+1,084 Mb to 566 Mb -- now the closest of any arm to the published 575.8
+Mb -- and duplicated BUSCOs drop from 5.5% to 0.4%, in line with every
+other arm. Complete BUSCO also improves (11.9% -> 16.4%, now ahead of raw
+and competitive with balanced/strict). The old 34kb N50 was an artifact
+of the duplication, not real contiguity; 19kb now that it's gone is
+consistent with the other arms. `sig_flank_bp` 200 -> 400 is the whole
+fix; nothing else needed changing for this case.
 
 Microlaimidae's largest signature cluster is 3-6x bigger than any other
 species', and it has 7-14x more reads embedded in large clusters. Consistent
