@@ -296,24 +296,30 @@ impl CallMode {
                 split_tol_bp: 50,
                 max_depth: 5,
                 sig_flank_bp: 600,
-                // 8 was the original value. Each of the `take` leave-one-out
-                // band signatures requires take-1 minimizers to match
-                // *exactly* (see fingerprint::hash_bands), so a larger take
-                // makes every band stricter, not more forgiving -- it hurts
-                // support-map merging of a real locus's noisy reads, it
-                // doesn't help it. Swept 2-32 on synth_bench's run_main
-                // (7500 ground-truthed reads): take=3 is a clean local
-                // optimum (hard-case FPR, i.e. genuine inverted repeats
-                // wrongly cut, 4.4% -> 0.0%, recall unchanged at 99.7%).
-                // Checked for the obvious collision-risk concern (smaller
-                // take is the same direction as permissive mode's signature-
-                // collision bug) directly against microlaimidae, the one
-                // real dataset with a documented collision problem: balanced
-                // mode at take=3 moves max_cluster_n only 18->22, nothing
-                // like permissive's 400+, so flank_bp (already fixed
-                // separately) looks like the dominant driver of that bug,
-                // not take. Strict mode's take=10 was not swept; left as-is.
-                sig_take: 3,
+                // REVERTED to 8 (2026-11-02) after sig_take=3 (tried
+                // 2026-10-30, see git history) turned out unsafe on real
+                // repeat-rich genomes. take=3's weaker 2-minimizer leave-
+                // one-out bands looked like a clean win on synth_bench's
+                // run_main (a low-repeat-content *synthetic* genome):
+                // hard-case FPR 4.4% -> 0.0%, recall unchanged. But a spot
+                // check against microlaimidae (balanced mode, max_cluster_n
+                // 18->22) wasn't enough to catch the real risk, because
+                // microlaimidae isn't especially repeat-dense. On an actual
+                // repeat-rich genome -- C. elegans, nrCaeEleg94 -- take=3
+                // plus the union-find merge fix produced a cluster of 9766
+                // reads and left 75.0% of all detected foldback reads
+                // classified "real" (i.e. not corrected). Reverting take to
+                // 8 alone only brought that down to 277,590 real clusters
+                // from 285,737 (barely moved) -- min_support=3 was *also*
+                // too permissive once the signature got weaker, and needed
+                // raising to 8 alongside this revert to actually fix it
+                // (425,350 reads classified real = 12.2%, down from 75.0%).
+                // See test_single_nematode/README.md for the full
+                // investigation. Lesson: validate a signature-specificity
+                // change against a genuinely repeat-rich real genome, not
+                // just a low-repeat synthetic one, before trusting it.
+                // Strict mode's take=10 was not swept; left as-is.
+                sig_take: 8,
                 sig_value_shift: 0, // not sure this should be > 0
             },
             // permissive: more calls/cuts (good for exploration)
