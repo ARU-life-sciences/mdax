@@ -248,6 +248,80 @@ happen. Not yet fixed in code; a plausible cheap QC check (max
 signature-cluster size under permissive-mode parameters) is flagged as a
 candidate follow-up, not implemented.
 
+## The nrCaeEleg94 anomaly: balanced mode's sig_take=3 was unsafe on real repeat-rich genomes (2026-11-02)
+
+An ultrareview of this session's union-find merge fix (see `src/fingerprint.rs`'s
+`MAX_PLAUSIBLE_CLUSTER_N` doc comment) flagged that it has no bound on
+transitive merging: a single band value shared between two otherwise-
+unrelated reads unions *all* of each read's own bands together, and that
+chains through the dataset via any other read bridging two components.
+Checked the farm batch for the separate C. elegans rerun and 11-species
+suite (both submitted 2026-10-30, before this was caught) and found it
+had already happened, badly:
+
+- Every C. elegans sample/mode combination except the two PiMmS samples
+  showed `max_cluster_n` well above the 70-130 "fine" range documented
+  above — several in the thousands (nrCaeEleg94 balanced: 9766).
+- 9 of 10 new nematode-suite species (permissive mode) also exceeded it.
+- Flye + BUSCO had already completed on top of these corrections for
+  most of the nematode suite, and hifiasm had completed for several
+  C. elegans samples across all 3 modes.
+
+Investigated on nrCaeEleg94 (balanced mode, the worst offender) with the
+exact detected/cut/"real" read counts at each step:
+
+| Fix attempted | max cluster | real clusters | real reads | real % |
+|---|---|---|---|---|
+| none (as-submitted) | 9,766 | 285,737 | 2,623,972 | **75.0%** |
+| hard cap (`MAX_PLAUSIBLE_CLUSTER_N=200`) | 9,766 (unenforced, just gated) | 285,659 | — | ~75% |
+| stop-value filter (band values shared by >200 reads can't bridge) | 6,321 | 285,721 | — | ~75% |
+| + revert `sig_take` 3→8 | 3,593 | 277,590 | — | ~74% (barely moved) |
+| + also raise `min_support` 3→8 | 3,593 | 36,536 | 425,350 | **12.2%** |
+
+Two things stood out. First, capping or filtering the *merge* step barely
+helped — the dominant failure mode wasn't a few catastrophic cascades,
+it was pervasive: 823,095 of ~906,000 clusters sat in the 0-9 size
+bucket, and huge numbers of those still cleared `min_support=3` by
+chance on a genome this repetitive. A merge-time fix can't touch that.
+Second, `sig_take=3` turns out to have been the real regression:
+`sig_take` 8→3 (committed 2026-10-30, reasoning in `src/cfg.rs` git
+history) was validated only against `run_main` (a low-repeat-content
+*synthetic* genome, where it was a clean win: hard-case FPR 4.4%→0.0%)
+and a collision-risk spot check against microlaimidae (which also isn't
+especially repeat-dense, so the check passed cleanly). Neither caught
+that take=3's weaker 2-minimizer leave-one-out bands collide far too
+easily on an actually repeat-rich genome like C. elegans.
+
+**Fixed**: `sig_take` reverted 3→8 in `src/cfg.rs` (commit `a9c010a`).
+**Still open**: reverting take alone only dropped real-cluster count 3%
+(285,737→277,590) — it took raising `min_support` to 8 *as well* to get
+nrCaeEleg94 down to a sane 12.2%. Whether 8 is the right new default (or
+whether the existing auto-calibration in `main.rs`, which currently only
+ever *lowers* min_support from the preset, needs an upper bound too, or
+a smarter mechanism entirely) has not yet been decided or implemented.
+
+**The union-find merge fix itself (`src/fingerprint.rs::SupportMap`) was
+not reverted** — it fixes a real, separately-validated problem (under-
+counting support for genuine recurring loci) and the evidence above
+shows the dominant cause here was signature specificity (`sig_take`),
+not the merge logic. The stop-value filter it gained during this
+investigation stays too: harmless where not needed, and it demonstrably
+reduces (if not eliminates) the worst individual cascades.
+
+**Lesson for future signature-specificity changes**: validate against a
+genuinely repeat-rich real genome, not just a low-repeat synthetic one
+or a single real species that happens not to be especially repetitive.
+`run_main` and microlaimidae both said take=3 was safe; C. elegans said
+otherwise, decisively.
+
+**Farm impact**: the whole batch (both suites) needs rerunning against
+the reverted binary once min_support is decided. Separately, most of the
+already-submitted downstream Flye/BUSCO jobs are now permanently stuck
+anyway — `bjobs -p` shows "Dependency condition invalid or never
+satisfied" on essentially every one, because their LSF dependency
+referenced an upstream job ID old enough to have aged out of the
+scheduler's history. Not a congestion issue; they will never run as-is.
+
 ## Caveats
 
 - **Single-pass only.** No Illumina polishing, no `purge_dups`, no
