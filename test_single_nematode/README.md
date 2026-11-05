@@ -293,12 +293,50 @@ that take=3's weaker 2-minimizer leave-one-out bands collide far too
 easily on an actually repeat-rich genome like C. elegans.
 
 **Fixed**: `sig_take` reverted 3→8 in `src/cfg.rs` (commit `a9c010a`).
-**Still open**: reverting take alone only dropped real-cluster count 3%
-(285,737→277,590) — it took raising `min_support` to 8 *as well* to get
-nrCaeEleg94 down to a sane 12.2%. Whether 8 is the right new default (or
-whether the existing auto-calibration in `main.rs`, which currently only
-ever *lowers* min_support from the preset, needs an upper bound too, or
-a smarter mechanism entirely) has not yet been decided or implemented.
+
+**`min_support`: investigated, deliberately left at its default of 3
+(2026-11-05) — raising it is not a fix.** Reverting `sig_take` alone only
+dropped nrCaeEleg94's real-cluster count 3% (285,737→277,590); raising
+`min_support` to 8 as well dropped the *aggregate* "real%" to a
+reassuring-looking 12.2%. But that aggregate was the wrong number to
+optimize: built real per-read ground truth for nrCaeEleg94 by aligning a
+51,423-read sample to the actual C. elegans reference genome (GCF_000002985.6
+/ WBcel235, 100,286,401 bp — downloaded fresh, a vastly better reference
+than anything available for microlaimidae) and applying `synth_bench/
+refbased_clip.py`'s overlapping-opposite-strand-alignment foldback test
+unmodified. That gave 48,619 confirmed true artefacts and 1,948 confirmed
+true genuine reads (856 unmapped reads excluded as uninformative) in the
+sample. Joining this against mdax's own decisions at min_support 5/8/10:
+
+| min_support | artefact recall (correctly cut) | genuine-read FPR (wrongly cut) |
+|---|---|---|
+| 5  | 76.2% | 71.7% |
+| 8  | 88.0% | 81.5% |
+| 10 | 92.1% | 84.9% |
+
+Raising `min_support` makes genuine-read FPR *worse*, not better — it
+only looked like an improvement in aggregate because artefacts
+outnumber genuine reads ~25:1 in the detected-foldback population here,
+so correctly reclassifying more artefacts as cut dominates the aggregate
+number and hides what's actually happening to the much smaller genuine
+population underneath it. This was a real methodological miss caught
+only by building actual ground truth instead of trusting the aggregate;
+see `synth_bench/celegans_refbased_eval.py` and
+`synth_bench/extract_reads_by_id.py` for the method, reusable on any
+other sample with a real reference genome available.
+
+**Decision (2026-11-05): leave `min_support` at 3.** No value tested in
+5-10 actually solves "don't cut real reads" on this genome — the
+genuine-read damage (72-85% FPR) looks structural (support fragmentation
+for genuinely low-recurrence real loci, the same class of problem
+`synth_bench/README.md` originally motivated this whole investigation
+with), not something this threshold, in this range, can fix. Raising it
+trades a small amount of additional artefact recall for more genuine-read
+damage, which is the wrong direction to default to. Documented here as a
+known, unresolved limitation rather than solved: a real fix needs either
+a smarter per-cluster signal (not just a count) or a different mechanism
+entirely (e.g. the learned-classifier idea discussed earlier in this
+project's history), not a `min_support` retune.
 
 **The union-find merge fix itself (`src/fingerprint.rs::SupportMap`) was
 not reverted** — it fixes a real, separately-validated problem (under-
