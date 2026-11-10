@@ -360,6 +360,18 @@ satisfied" on essentially every one, because their LSF dependency
 referenced an upstream job ID old enough to have aged out of the
 scheduler's history. Not a congestion issue; they will never run as-is.
 
+**Farm batch results (2026-11-09/10)**: after the full remediation, the
+11-species nematode suite and most of the C. elegans rerun samples
+confirm mdax performs comparably to or better than both raw and the
+"theirs" alternative, no catastrophic failures. The nrCaeEleg93/94/95
+samples confirm the documented min_support limitation above at the real
+assembly level (50-55% duplicated BUSCOs). A separate, unrelated finding
+-- a reproducible `hifiasm` (third-party assembler, not mdax) crash on
+nrCaeEleg33's permissive-mode assembly -- is documented in full in
+`mdax_celegans_rerun/README.md` on lustre (not duplicated here since it's
+a tooling issue, not an mdax one); decided to document and not chase
+further.
+
 ## Caveats
 
 - **Single-pass only.** No Illumina polishing, no `purge_dups`, no
