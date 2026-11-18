@@ -110,9 +110,12 @@ fn overlaps(r: &Row, (s, e): (usize, usize)) -> bool {
     r.start < e && s < r.end
 }
 
-fn write_fasta() -> (PathBuf, Planted) {
+/// Each test gets its own file: the tests in this binary run in parallel,
+/// and `std::fs::write` truncates before writing, so a shared path lets one
+/// test's `irx` open the file while another test has just emptied it.
+fn write_fasta(tag: &str) -> (PathBuf, Planted) {
     let (seq, planted) = build_contig();
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("irx_min_arm.fa");
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("irx_min_arm.{tag}.fa"));
     let mut rec = b">ctg1\n".to_vec();
     rec.extend_from_slice(&seq);
     rec.push(b'\n');
@@ -122,7 +125,7 @@ fn write_fasta() -> (PathBuf, Planted) {
 
 #[test]
 fn default_min_arm_rejects_short_arms_with_long_spacer() {
-    let (fa, planted) = write_fasta();
+    let (fa, planted) = write_fasta("default");
     let rows = run_irx(&fa, &[]);
 
     for r in &rows {
@@ -140,7 +143,7 @@ fn default_min_arm_rejects_short_arms_with_long_spacer() {
 
 #[test]
 fn gff_matches_tsv_and_is_well_formed() {
-    let (fa, planted) = write_fasta();
+    let (fa, planted) = write_fasta("gff");
     let gff_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("irx_min_arm.gff3");
     let rows = run_irx(&fa, &["--min-arm", "200", "--gff", gff_path.to_str().unwrap()]);
     assert!(rows.len() >= 2, "expected both planted IRs, got {} rows", rows.len());
@@ -190,7 +193,7 @@ fn gff_matches_tsv_and_is_well_formed() {
 
 #[test]
 fn lower_min_arm_admits_short_arms() {
-    let (fa, planted) = write_fasta();
+    let (fa, planted) = write_fasta("lower");
     let rows = run_irx(&fa, &["--min-arm", "200"]);
 
     for r in &rows {

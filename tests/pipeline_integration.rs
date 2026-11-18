@@ -109,14 +109,19 @@ fn parse_tsv(path: &PathBuf) -> Vec<HashMap<String, String>> {
         .collect()
 }
 
+/// A name component no other test (in this process or a concurrent one) can
+/// share: process id plus a process-wide counter. A timestamp alone is only
+/// probably unique across parallel test threads.
+fn unique_tag() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Write a minimal FASTA to a temp path and return that path.
 fn write_temp_fasta(reads: &[(&str, &[u8])]) -> PathBuf {
     use std::io::Write;
-    // Use thread ID + nanos for a collision-resistant name.
-    let id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
+    let id = unique_tag();
     let path = std::env::temp_dir().join(format!("mdax_inttest_{id}.fa"));
     let mut f = std::fs::File::create(&path).unwrap();
     for (name, seq) in reads {
@@ -165,10 +170,7 @@ fn run_pipeline(
     cfg: MdaxCfg,
     max_depth: usize,
 ) -> (u64, u64, u64, Vec<(String, String)>, Vec<HashMap<String, String>>) {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
+    let unique = unique_tag();
     let out_fa = std::env::temp_dir().join(format!("mdax_out_{unique}.fa"));
     let out_tsv = std::env::temp_dir().join(format!("mdax_out_{unique}.tsv"));
 
