@@ -406,3 +406,81 @@ alongside at the same lustre path, outside git.
 ## Results
 
 Full BUSCO `short_summary.txt` for every run is under `results/<species>_<arm>/`.
+
+## 2026-11-18: the gate was counting loci, not junctions — replaced with fold-axis support
+
+**How it was found.** Every earlier ground-truth check only scored reads mdax
+had already detected. Taking a *random* 3% of all nrCaeEleg92 reads (41,675),
+aligning them to WBcel235, and calling a read a true foldback when it splits
+into opposite-strand segments within 5 kb on one chromosome
+(`synth_bench/refbased_recall_eval.py`) showed half the library is foldback
+artefact, and that mdax was cutting far fewer of them than the logs implied:
+
+| build / settings (balanced, nrCaeEleg92) | true foldbacks cut | kept as "real" | not detected | linear reads cut |
+|---|---|---|---|---|
+| 30 Oct (`sig_take=3`; what every `mdax_celegans_rerun` assembly used) | 37.5% | 34.7% | 27.8% | 0.8% |
+| 2 Nov (`sig_take=8`) | 54.3% | 15.1% | 27.8% | 1.0% |
+| 2 Nov, gate off (`--min-support 1000000`) | 69.4% | 0 | 27.8% | 1.4% |
+| fold-axis support, old detection thresholds | 71.7% | 0.5% | 27.8% | 1.2% |
+| fold-axis support, new balanced defaults | 78.1% | 0.7% | 21.2% | 2.1% |
+
+On nrCaeEleg94 (~1500x) the 30 Oct build cut 15.6% and kept 51.5% as "real";
+fold-axis support cuts 73.1% and keeps 1.0%.
+
+**Why the old gate failed.** The signature was the bottom-k minimizers within
+±600 bp of the split: it names a locus. nrCaeEleg92 has ~534k detected
+junctions over 100 Mb, one per ~190 bp, so unrelated artefacts share a window
+by chance; nrCaeEleg94 has one per ~29 bp. The wrongly-"real" reads were not
+PCR duplicates (no cluster had fewer than two distinct (length, split)
+pairs). The old adaptive calibration made it worse by *lowering*
+`min_support` to the dataset's "typical recurrence" of 2, which is the
+chance-collision level; it fired on 5 of 12 C. elegans samples. This also
+supersedes the "clonal amplification" explanation for nrCaeEleg94 above as
+the main cause, though the measured support tail there is heavier than
+Poisson (decaying ~0.7x per step), consistent with clonal copies or coverage
+hotspots contributing.
+
+**The replacement** (`fingerprint::JunctionSupport`). For each foldback, key
+the matched minimizers nearest the axis by `(minimizer value, distance to its
+own inverted copy)`. That distance is twice the minimizer's distance to the
+symmetry axis, is read-coordinate-free, and needs no refinement, so two reads
+share a key only if they fold about the same axis. A read's support is the
+median, over its keys, of the number of reads carrying each. The threshold is
+calibrated upward from the data: a Poisson bound from the fraction of
+foldbacks sharing an axis with nobody, then extended along the measured
+histogram tail (nrCaeEleg92: 3 → 7-8; nrCaeEleg94: 3 → 15). `--sig-flank-bp`,
+`--sig-take`, `--sig-value-shift`, `MAX_PLAUSIBLE_CLUSTER_N` and the
+stop-value filter no longer take part in the gate.
+
+**Does read-level recall turn into assembly gains? Yes** (nrCaeEleg92,
+hifiasm, `nematoda_odb10`):
+
+| arm | contigs | N50 (Mb) | largest (Mb) | BUSCO C | D |
+|---|---|---|---|---|---|
+| raw | 1248 | 0.14 | 0.89 | 88.4% | 7.2% |
+| 30 Oct balanced | 894 | 0.25 | 1.32 | 93.9% | 5.4% |
+| 2 Nov balanced | 792 | 0.32 | 1.44 | 95.6% | 3.7% |
+| 2 Nov, gate off | 691 | 0.36 | 1.97 | 96.3% | 2.7% |
+| 2 Nov, gate off, loose detection (8/600/300) | 823 | 0.31 | 1.68 | 94.4% | 3.1% |
+| fold-axis, old detection (20/2000/1000) | 705 | 0.39 | 1.96 | 96.6% | 3.4% |
+| fold-axis, new balanced defaults (12/1000/500) | 682 | 0.39 | 1.82 | 96.5% | 2.9% |
+| fold-axis, loose detection (8/600/300) | 702 | 0.39 | 1.68 | 96.0% | 2.9% |
+
+Two things to take from it. Cutting more true artefacts helps, but false cuts
+hurt: loose detection with no gate is worse than tight detection with no
+gate, and with the gate in place loose detection buys nothing over the new
+defaults. And the three fold-axis arms sit within run-to-run noise of each
+other on N50 (an earlier build of the same settings gave 0.41), so the
+detection-threshold change is a small gain, the gate change the large one.
+
+**ONT** (celegans_wga, same method with `map-ont`, permissive mode): recall is
+unchanged at 65.4% because the old gate was already cutting ~99% of what it
+detected there; linear reads cut fall 2.4% → 1.7% and linear reads protected
+as "real" rise 0.1% → 0.7%. The ONT limit is detection: 20% of foldbacks with
+arms under 500 bp and 37% at 500-1000 bp are found.
+
+**Still open.** ~21% of true HiFi foldbacks (34% on ONT) go undetected, nearly
+all short-armed or within 500 bp of a read end. Non-foldback chimeras (1.4% of
+reads) are out of scope by design. The arm-identity estimate is noisy (only
+64% of true HiFi artefacts score >= 0.995). The numbers above come from two
+C. elegans libraries and one ONT library.

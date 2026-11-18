@@ -264,6 +264,8 @@ pub struct ModeTuning {
     pub sig_take: usize,
     /// Optional value shifting/quantization to stabilize signatures.
     pub sig_value_shift: u8,
+    /// Do not call foldbacks whose split lies within this distance of a read end (bp).
+    pub end_guard: usize,
 }
 
 impl CallMode {
@@ -286,11 +288,25 @@ impl CallMode {
                 sig_flank_bp: 800,
                 sig_take: 10,
                 sig_value_shift: 0,
+                end_guard: 1000,
             },
             // balanced: your current-ish defaults
+            // balanced.
+            //
+            // min_matches / min_span / end_guard were 20 / 2000 / 1000 until
+            // 2026-11-18. Scored against a reference (a random 3% of a
+            // ~140x C. elegans WGA HiFi library aligned to WBcel235), those
+            // values found 96% of true foldbacks with arms over 4 kb but
+            // only 72% at 1-2 kb, 44% at 500-1000 bp and 23-38% of those
+            // within 1 kb of a read end -- 28% missed overall. 12 / 1000 /
+            // 500 brings the miss rate to 21% (78% of true artefacts cut,
+            // up from 72%) and assembled at least as well (hifiasm: 682
+            // contigs vs 705, same N50 and BUSCO). Going further (8 / 600 /
+            // 300) gained 1 more point of recall, doubled the linear reads
+            // cut, and did nothing for the assembly, so stop here.
             CallMode::Balanced => ModeTuning {
-                min_matches: 20,
-                min_span: 2000,
+                min_matches: 12,
+                min_span: 1000,
                 min_identity: 0.60,
                 min_support: 3,
                 split_tol_bp: 50,
@@ -321,6 +337,7 @@ impl CallMode {
                 // Strict mode's take=10 was not swept; left as-is.
                 sig_take: 8,
                 sig_value_shift: 0, // not sure this should be > 0
+                end_guard: 500,
             },
             // permissive: more calls/cuts (good for exploration)
             CallMode::Permissive => ModeTuning {
@@ -344,6 +361,7 @@ impl CallMode {
                 sig_flank_bp: 400,
                 sig_take: 6,
                 sig_value_shift: 8,
+                end_guard: 1000,
             },
         }
     }

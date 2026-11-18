@@ -13,10 +13,7 @@ use std::thread;
 
 use crate::{
     cfg::MdaxCfg,
-    fingerprint::{
-        SupportMap, best_support, foldback_signature_bands,
-        foldback_signature_from_local_matches_bands, is_real_foldback_stats,
-    },
+    fingerprint::{JunctionSupport, axis_tol, junction_keys},
     foldback, io,
     scratch::{FoldScratch, SigScratch},
     utils::RefineMode,
@@ -148,8 +145,10 @@ struct OutRec {
     tsv_row: Option<String>,
 }
 
-/// Pass 1 (parallel): scan the input once and build the **support map**.
-/// Returns the support map plus the total number of input records scanned
+/// Pass 1 (parallel): scan the input once and count, for every detected
+/// foldback, how many reads fold about the same axis (see
+/// `fingerprint::JunctionSupport`).
+/// Returns that support plus the total number of input records scanned
 /// (not just the ones that produced a signature) -- callers computing a
 /// fraction against "how collision-prone is this dataset" should divide by
 /// this, not by the support map's own read count, which only covers reads
@@ -160,7 +159,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
     cfg: Arc<MdaxCfg>,
     threads: usize,
     chan_cap: usize,
-) -> Result<(SupportMap, u64)> {
+) -> Result<(JunctionSupport, u64)> {
     let (tx, rx) = chan::bounded::<BatchJob>(chan_cap);
     const BATCH_SIZE: usize = 256;
 
@@ -203,22 +202,12 @@ pub fn pass1_build_support<P: AsRef<Path>>(
         let rx = rx.clone();
 
         worker_handles.push(thread::spawn(
-            move || -> Result<(Vec<(u64, usize, f32)>, Vec<(u64, u64)>, u64)> {
-                // One (band, split, ident) record per sig_ok read (any one of
-                // that read's own bands serves as the lookup key into the
-                // final union-find -- see SupportMap::build), plus the edges
-                // connecting that read's own bands together so the merge
-                // step can resolve them all to one canonical cluster.
-                let mut records: Vec<(u64, usize, f32)> = Vec::new();
-                let mut edges: Vec<(u64, u64)> = Vec::new();
+            move || -> Result<(Vec<Vec<(u64, u64)>>, u64)> {
+                // One junction-key set per read with a detected foldback.
+                let mut groups: Vec<Vec<(u64, u64)>> = Vec::new();
+                let tol = axis_tol(&cfg);
 
                 let mut fold_scratch = FoldScratch::new();
-                let mut sig_scratch = SigScratch::default();
-
-                // pass1 uses cheap refinement for signature coherence
-                let mut shared_fast = cfg.shared.clone();
-                shared_fast.refine.mode = RefineMode::HiFi;
-
                 let mut dbg = DebugCounts::default();
 
                 while let Ok(batch) = rx.recv() {
@@ -229,94 +218,55 @@ pub fn pass1_build_support<P: AsRef<Path>>(
                             dbg.jobs,
                             50_000,
                             "PASS1",
-                            "jobs={} detected={} refined={} ident_ok={} sig_ok={}",
+                            "jobs={} detected={} keyed={}",
                             dbg.jobs,
                             dbg.detected,
-                            dbg.refined,
-                            dbg.ident_ok,
                             dbg.sig_ok
                         );
 
                         let seq = &job.seq;
 
-                        let Some(fb) = foldback::detect_foldback(
+                        if foldback::detect_foldback(
                             seq,
                             &cfg.shared,
                             &cfg.fold,
                             &mut fold_scratch,
-                        ) else {
+                        )
+                        .is_none()
+                        {
                             continue;
-                        };
+                        }
                         dbg.bump("detected");
 
-                        let Some(rf) = foldback::refine_breakpoint(
-                            seq,
-                            fb.split_pos,
-                            &shared_fast,
-                            &mut fold_scratch.refine,
-                            fb.span,
-                            fb.arm_end,
-                            fb.arm_start_right,
-                        )?
-                        else {
-                            continue;
-                        };
-                        dbg.bump("refined");
-
-                        if rf.identity_est < cfg.fold2.min_identity {
+                        // Every detected foldback registers its fold axis,
+                        // whatever its estimated arm identity: the keys
+                        // need no refinement, and a diverged genome-encoded
+                        // repeat needs its support counted just as much as
+                        // a pristine one does.
+                        junction_keys(
+                            &fold_scratch.best_trip,
+                            tol,
+                            &mut fold_scratch.jk_tmp,
+                            &mut fold_scratch.jk_out,
+                        );
+                        if fold_scratch.jk_out.is_empty() {
                             continue;
                         }
-                        dbg.bump("ident_ok");
-
-                        let bands = foldback_signature_from_local_matches_bands(
-                            &mut fold_scratch.best_matches,
-                            rf.split_pos,
-                            cfg.sig.flank_bp,
-                            cfg.sig.take,
-                            cfg.sig.value_shift,
-                        )
-                        .or_else(|| {
-                            let q = 150usize;
-                            let split_q = (rf.split_pos / q) * q;
-                            foldback_signature_bands(
-                                seq,
-                                split_q,
-                                &cfg.shared,
-                                cfg.sig.flank_bp,
-                                cfg.sig.take,
-                                &mut sig_scratch,
-                                cfg.sig.value_shift,
-                            )
-                        });
-
-                        let Some(bands) = bands else { continue };
                         dbg.bump("sig_ok");
 
-                        // This read's own bands are, by construction, all evidence for
-                        // the same locus -- union them so the merge step treats them as
-                        // one cluster even if another read only ever shares one of them
-                        // (see SupportMap::build / fingerprint::UnionFind).
-                        for i in 1..bands.len() {
-                            edges.push((bands[0], bands[i]));
-                        }
-                        if let Some(&rep) = bands.first() {
-                            records.push((rep, rf.split_pos, rf.identity_est));
-                        }
+                        groups.push(fold_scratch.jk_out.clone());
                     }
                 }
 
                 elog!(
                     "PASS1 WORKER DONE",
-                    "jobs={}, detected={}, refined={}, ident_ok={}, sig_ok={}, records={}",
+                    "jobs={}, detected={}, keyed={}",
                     dbg.jobs,
                     dbg.detected,
-                    dbg.refined,
-                    dbg.ident_ok,
-                    dbg.sig_ok,
-                    records.len(),
+                    groups.len(),
                 );
 
-                Ok((records, edges, dbg.jobs))
+                Ok((groups, dbg.jobs))
             },
         ));
     }
@@ -325,24 +275,17 @@ pub fn pass1_build_support<P: AsRef<Path>>(
         .join()
         .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
 
-    // Merge every worker's per-read records and within-read band edges, then
-    // resolve the whole dataset's bands to canonical clusters in one shot.
-    // See `SupportMap::build` for why this can't be done as an incremental
-    // per-band reduce: a band's final cluster membership can depend on an
-    // edge discovered by a read processed by a different thread.
-    let mut all_records: Vec<(u64, usize, f32)> = Vec::new();
-    let mut all_edges: Vec<(u64, u64)> = Vec::new();
+    let mut all_groups: Vec<Vec<(u64, u64)>> = Vec::new();
     let mut total_reads: u64 = 0;
     for h in worker_handles {
-        let (records, edges, jobs) = h
+        let (groups, jobs) = h
             .join()
             .map_err(|_| anyhow::anyhow!("worker thread panicked"))??;
-        all_records.extend(records);
-        all_edges.extend(edges);
+        all_groups.extend(groups);
         total_reads += jobs;
     }
 
-    let support = SupportMap::build(&all_records, &all_edges);
+    let support = JunctionSupport::build(&all_groups);
 
     Ok((support, total_reads))
 }
@@ -351,7 +294,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
 pub fn pass2_correct_and_write<P: AsRef<Path>>(
     input: P,
     cfg: Arc<MdaxCfg>,
-    support: Arc<SupportMap>,
+    support: Arc<JunctionSupport>,
     max_depth: usize,
     threads: usize,
     chan_cap: usize,
@@ -361,33 +304,6 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
     let (tx, rx) = chan::bounded::<BatchJob>(chan_cap);
     const BATCH_SIZE: usize = 256;
     let (out_tx, out_rx) = chan::bounded::<OutRec>(chan_cap * 8);
-
-    // Precompute support_rank_frac for every signature (once)
-    // rank_frac: 1.0 = top-ranked (largest n), 0.0 = bottom-ranked.
-    let rank_map: std::collections::HashMap<u64, f32> = {
-        let mut v: Vec<(u64, usize)> = support.iter().map(|(sig, st)| (*sig, st.n)).collect();
-
-        // Sort by descending n, then ascending sig for deterministic tie-break.
-        v.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-        let m = v.len();
-        let mut rm = std::collections::HashMap::with_capacity(m);
-
-        if m <= 1 {
-            // If 0 or 1 signatures, everything is trivially "top".
-            for (sig, _) in v {
-                rm.insert(sig, 1.0);
-            }
-        } else {
-            for (i, (sig, _n)) in v.into_iter().enumerate() {
-                let rank = i + 1; // 1..=m
-                let frac = 1.0 - ((rank - 1) as f32 / (m - 1) as f32);
-                rm.insert(sig, frac);
-            }
-        }
-        rm
-    };
-    let rank_map = std::sync::Arc::new(rank_map);
 
     // Reader thread
     let input_path = input.as_ref().to_owned();
@@ -499,7 +415,6 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
         let support = support.clone();
         let rx = rx.clone();
         let out_tx = out_tx.clone();
-        let rank_map = rank_map.clone();
 
         worker_handles.push(thread::spawn(move || -> Result<(u64, u64, u64)> {
             let mut num_foldbacks: u64 = 0;
@@ -513,8 +428,7 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
             shared_fast.refine.mode = RefineMode::HiFi;
 
             let mut dbg = DebugCounts::default();
-            let mut miss_sig_sample: Vec<u64> = Vec::new();
-            let mut hit_sig_sample: Vec<(u64, usize)> = Vec::new();
+            let tol = axis_tol(&cfg);
 
             while let Ok(batch) = rx.recv() {
                 for job in batch.jobs {
@@ -589,117 +503,98 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                         if let Some(rf_call) = rf_call_opt {
                             dbg.bump("refined");
 
-                            let (sig_split, sig_ident) = if let Some(rf_sig) = refined_sig.as_ref()
-                            {
-                                (rf_sig.split_pos, rf_sig.identity_est)
-                            } else {
-                                (rf_call.split_pos, rf_call.identity_est)
-                            };
+                            let sig_ident = refined_sig
+                                .as_ref()
+                                .map_or(rf_call.identity_est, |rf_sig| rf_sig.identity_est);
 
                             let (decision, support_n, support_rank_frac, support_span, sig_band) =
                                 if sig_ident >= cfg.fold2.min_identity {
                                     dbg.bump("ident_ok");
 
-                                    // Compute the local-match signature using the *refined* split
-                                    // (sig_split), not the coarse split from detect_foldback.
-                                    // Pass 1 also uses the refined split, so this keeps the two
-                                    // passes consistent and ensures support-map lookups work for
-                                    // genuine palindromes.
-                                    //
-                                    // Note: this destructively filters fold_scratch.best_matches.
-                                    // The recursive cutter's first iteration will find an empty
-                                    // window and fall back to the flank signature, which also
-                                    // uses the refined split and therefore still matches pass 1.
-                                    let bands_from_matches = foldback_signature_from_local_matches_bands(
-                                        &mut fold_scratch.best_matches,
-                                        sig_split,
-                                        cfg.sig.flank_bp,
-                                        cfg.sig.take,
-                                        cfg.sig.value_shift,
+                                    junction_keys(
+                                        &fold_scratch.best_trip,
+                                        tol,
+                                        &mut fold_scratch.jk_tmp,
+                                        &mut fold_scratch.jk_out,
                                     );
-
-                                    let bands = bands_from_matches.or_else(|| {
-                                        let q = 150usize;
-                                        let split_q = (sig_split / q) * q;
-                                        foldback_signature_bands(
-                                            &job.seq,
-                                            split_q,
-                                            &cfg.shared,
-                                            cfg.sig.flank_bp,
-                                            cfg.sig.take,
-                                            &mut sig_scratch,
-                                            cfg.sig.value_shift,
-                                        )
-                                    });
-
-                                    if let Some(bands) = bands {
+                                    let n_elems = fold_scratch.jk_out.len();
+                                    let key0 = fold_scratch.jk_out.first().map(|k| k.0);
+                                    if n_elems > 0 {
                                         dbg.bump("sig_ok");
-
-                                        let (real, n, rank_frac, span, band_val) = if let Some((band, st)) = best_support(&bands, &support) {
-                                            dbg.bump("sig_in_support");
-                                            if hit_sig_sample.len() < 5 {
-                                                hit_sig_sample.push((band, st.n));
-                                            }
-                                            let rf = *rank_map.get(&band).unwrap_or(&0.0);
-                                            (
-                                                is_real_foldback_stats(st, &cfg),
-                                                st.n,
-                                                rf,
-                                                st.split_span(),
-                                                Some(band),
-                                            )
-                                        } else {
-                                            dbg.bump("sig_not_in_support");
-                                            if miss_sig_sample.len() < 5 && !bands.is_empty() {
-                                                miss_sig_sample.push(bands[0]);
-                                            }
-                                            (false, 0, 0.0, 0, None)
-                                        };
-
-
-                                        if !real {
-                                            annot = Some(
-                                                format!("_chopped_at_{}", rf_call.split_pos)
-                                                    .into_bytes(),
-                                            );
-
-                                            let keep2 = foldback::recursive_foldback_cut_from_first_range(
-                                                &job.seq,
-                                                keep.clone(),   // <— use current keep window
-                                                fb.clone(),
-                                                rf_call.clone(),
-                                                &cfg,
-                                                &support,
-                                                max_depth,
-                                                &mut fold_scratch,
-                                                &mut sig_scratch,
-                                            )?;
-
-
-
-                                            if keep2.start != 0 || keep2.end != len {
-                                                num_cut += 1;
-                                            }
-                                            keep = keep2;
-                                        } else {
-                                            num_real += 1;
-                                        }
-
-                                        (if real { "real" } else { "artefact" }, n, rank_frac, span, band_val)
-                                    } else {
-                                        ("unknown", 0, 0.0, 0, None)
                                     }
+                                    let n = support.support_n(&fold_scratch.jk_out);
+                                    if n >= 2 {
+                                        dbg.bump("sig_in_support");
+                                    } else {
+                                        dbg.bump("sig_not_in_support");
+                                    }
+                                    let real = n >= cfg.fold2.min_support;
+
+                                    if !real {
+                                        annot = Some(
+                                            format!("_chopped_at_{}", rf_call.split_pos)
+                                                .into_bytes(),
+                                        );
+
+                                        let keep2 = foldback::recursive_foldback_cut_from_first_range(
+                                            &job.seq,
+                                            keep.clone(),
+                                            fb.clone(),
+                                            rf_call.clone(),
+                                            &cfg,
+                                            &support,
+                                            max_depth,
+                                            &mut fold_scratch,
+                                            &mut sig_scratch,
+                                        )?;
+
+                                        if keep2.start != 0 || keep2.end != len {
+                                            num_cut += 1;
+                                        }
+                                        keep = keep2;
+                                    } else {
+                                        num_real += 1;
+                                    }
+
+                                    (if real { "real" } else { "artefact" }, n, 0.0f32, n_elems, key0)
                                 } else if cfg.fold2.cut_low_ident {
-                                    // Identity gate failed but the caller opted-in to
-                                    // cutting anyway (useful for ONT where HiFi Hamming
-                                    // systematically underestimates arm similarity).
+                                    // Identity gate failed but the caller opted in to
+                                    // cutting anyway. The support gate still applies:
+                                    // a low-identity foldback that many reads share
+                                    // an axis with is a diverged genomic repeat, not
+                                    // an artefact.
+                                    junction_keys(
+                                        &fold_scratch.best_trip,
+                                        tol,
+                                        &mut fold_scratch.jk_tmp,
+                                        &mut fold_scratch.jk_out,
+                                    );
+                                    let n_elems = fold_scratch.jk_out.len();
+                                    let key0 = fold_scratch.jk_out.first().map(|k| k.0);
+                                    let n = support.support_n(&fold_scratch.jk_out);
+                                    if n >= cfg.fold2.min_support {
+                                        num_real += 1;
+                                        ("real", n, 0.0, n_elems, key0)
+                                    } else {
                                     annot = Some(
                                         format!("_chopped_at_{}", rf_call.split_pos)
                                             .into_bytes(),
                                     );
-                                    keep = 0..rf_call.split_pos;
+                                    // Same convention as the main cutter: drop
+                                    // one arm, keep any spacer, and keep
+                                    // whichever side is longer rather than
+                                    // always the left.
+                                    let half_gap = rf_call.gap_est / 2;
+                                    let arm_end = rf_call.split_pos.saturating_sub(half_gap);
+                                    let arm_start = (rf_call.split_pos + half_gap).min(len);
+                                    keep = if len - arm_end > arm_start {
+                                        arm_end..len
+                                    } else {
+                                        0..arm_start
+                                    };
                                     num_cut += 1;
-                                    ("artefact", 0, 0.0, 0, None)
+                                    ("artefact", n, 0.0, n_elems, key0)
+                                    }
                                 } else {
                                     ("low_ident", 0, 0.0, 0, None)
                                 };

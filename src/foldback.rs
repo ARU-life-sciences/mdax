@@ -37,10 +37,7 @@
 //!   coordinate systems during recursion.
 
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
-use crate::fingerprint::{
-    SupportMap, best_support, foldback_signature_bands,
-    foldback_signature_from_local_matches_bands, is_real_foldback_stats,
-};
+use crate::fingerprint::{JunctionSupport, axis_tol, junction_keys};
 use crate::minimizer::sampled_minimizers_into;
 use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
 use crate::utils::{
@@ -728,6 +725,7 @@ pub fn detect_foldback(
     let cap = scratch.stats.get(&best_bin).map(|s| s.count).unwrap_or(0);
     scratch.best_pts.clear();
     scratch.best_matches.clear();
+    scratch.best_trip.clear();
     scratch.best_pts.reserve(cap);
     scratch.best_matches.reserve(cap);
 
@@ -748,6 +746,7 @@ pub fn detect_foldback(
                 scratch.best_pts.push((p1, p2));
                 // Use forward minimizer position for locality filtering in signature
                 scratch.best_matches.push((p1 as usize, vrc));
+                scratch.best_trip.push((p1, p2, vrc));
             }
         }
     }
@@ -1081,7 +1080,7 @@ fn fold_breakpoint_from_pts(
 /// Important invariants:
 /// - `first_fb.split_pos` and `first_rf.split_pos` are in full-sequence coordinates.
 /// - All subsequent detections operate in view-local coordinates.
-/// - `scratch.best_matches` is assumed to correspond to the most recent
+/// - `scratch.best_trip` is assumed to correspond to the most recent
 ///   `detect_foldback` call.
 pub fn recursive_foldback_cut_from_first_range(
     seq: &[u8],               // original full sequence
@@ -1089,10 +1088,10 @@ pub fn recursive_foldback_cut_from_first_range(
     first_fb: FoldBreakpoint, // split_pos is assumed relative to `seq` (full coords)
     first_rf: Refined,        // split_pos is assumed relative to `seq` (full coords)
     cfg: &MdaxCfg,
-    support: &SupportMap,
+    support: &JunctionSupport,
     max_depth: usize,
     scratch: &mut FoldScratch,
-    sig_scratch: &mut SigScratch,
+    _sig_scratch: &mut SigScratch,
 ) -> anyhow::Result<Range<usize>> {
     // We already have the first hit/refine (full coords). After first cut, detect/refine on the view.
     let mut fb_opt = Some(first_fb);
@@ -1160,39 +1159,20 @@ pub fn recursive_foldback_cut_from_first_range(
             break;
         }
 
-        // --- 3) signature (prefer local matches computed by detect_foldback) ---
-        // Important: on the first iteration, scratch.best_matches is already populated
-        // because pass2 called detect_foldback before calling this function.
-        let bands = foldback_signature_from_local_matches_bands(
-            &mut scratch.best_matches,
-            rf.split_pos,
-            cfg.sig.flank_bp,
-            cfg.sig.take,
-            cfg.sig.value_shift,
-        )
-        .or_else(|| {
-            // fallback: flank signature, quantize split (view-local coords)
-            let q = 150usize;
-            let split_q = (rf.split_pos / q) * q;
-
-            foldback_signature_bands(
-                view,
-                split_q,
-                &cfg.shared,
-                cfg.sig.flank_bp,
-                cfg.sig.take,
-                sig_scratch,
-                cfg.sig.value_shift,
-            )
-        });
-
-        let Some(bands) = bands else { break };
-
-        if let Some((_, st)) = best_support(&bands, support) {
-            if is_real_foldback_stats(st, cfg) {
-                // real -> don't cut
-                break;
-            }
+        // --- 3) junction-specific support ---
+        // `scratch.best_trip` always corresponds to the most recent
+        // `detect_foldback` call (pass2's own call on the first iteration),
+        // and its keys are coordinate-free (minimizer value + arm
+        // separation), so they are valid in any view of the read.
+        junction_keys(
+            &scratch.best_trip,
+            axis_tol(cfg),
+            &mut scratch.jk_tmp,
+            &mut scratch.jk_out,
+        );
+        if support.support_n(&scratch.jk_out) >= cfg.fold2.min_support {
+            // real -> don't cut
+            break;
         }
 
         // artefact -> cut. Keep whichever side of the split is longer, rather
@@ -1663,7 +1643,7 @@ mod tests {
         .expect("should refine");
 
         // Empty support map: nothing is "real", so this is treated as an artefact.
-        let support = SupportMap::empty();
+        let support = JunctionSupport::empty();
         let mut sig_scratch = SigScratch::default();
 
         let keep = recursive_foldback_cut_from_first_range(
@@ -1713,7 +1693,7 @@ mod tests {
         .unwrap()
         .expect("should refine");
 
-        let support = SupportMap::empty();
+        let support = JunctionSupport::empty();
         let mut sig_scratch = SigScratch::default();
 
         let keep = recursive_foldback_cut_from_first_range(
@@ -1770,7 +1750,7 @@ mod tests {
         .unwrap()
         .expect("should refine");
 
-        let support = SupportMap::empty();
+        let support = JunctionSupport::empty();
         let mut sig_scratch = SigScratch::default();
 
         let keep = recursive_foldback_cut_from_first_range(

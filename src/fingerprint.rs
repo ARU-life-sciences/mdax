@@ -292,6 +292,263 @@ pub fn foldback_signature_bands(
     Some(hash_bands(&scratch.combined))
 }
 
+// ---------------------------------------------------------------------------
+// Junction-specific support (what pass1/pass2 actually gate on)
+// ---------------------------------------------------------------------------
+//
+// The band signatures above identify a *locus* (the minimizer content within
+// a few hundred bp of the split). That is not enough to tell a genome-encoded
+// inverted repeat from an amplification artefact once a library is deep:
+// artefact junctions land roughly uniformly along the genome, so at e.g. one
+// junction per ~190 bp (a typical 140x C. elegans WGA HiFi run) *every* locus
+// "recurs" by chance, and at one per ~29 bp (a 1500x run) essentially all of
+// them do. Measured against a reference on real data, the locus-level gate
+// left 15-50% of true artefacts uncut as "real" for that reason.
+//
+// What actually distinguishes a genomic inverted repeat is that its symmetry
+// axis sits at the *same genomic position* in every read, whereas independent
+// artefacts at the same locus fold at different positions. The distance
+// between a minimizer and its own inverted copy (`p2 - p1` for a matchpoint)
+// is exactly twice that minimizer's distance to the axis (plus any spacer),
+// is read-coordinate-free, and is strand-symmetric -- so `(minimizer value,
+// arm separation)` is a key that two reads share only if they fold about the
+// same axis.
+
+/// Maximum number of (value, separation) elements kept per junction: the
+/// matchpoints closest to the axis. Those are the ones every read through
+/// the junction is guaranteed to contain, however little of the arms it
+/// covers, so reads of very different extent still select the same elements.
+pub const JUNCTION_MAX_ELEMS: usize = 24;
+/// Fewer elements than this and the junction has no usable key (treated as
+/// unsupported).
+pub const JUNCTION_MIN_ELEMS: usize = 3;
+
+/// Tolerance (bp) on arm separation for two reads to count as the same axis.
+/// Keys are guaranteed to match within `tol/2` and never match beyond `tol`.
+/// HiFi separations are near-exact; noisy reads accumulate indel jitter along
+/// the arm and need more room.
+pub fn axis_tol(cfg: &MdaxCfg) -> usize {
+    match cfg.shared.refine.mode {
+        crate::utils::RefineMode::HiFi => 32,
+        crate::utils::RefineMode::ONT => 128,
+    }
+}
+
+/// Build junction keys from the best bin's matchpoints `(p1, p2, value)`.
+///
+/// Each output element is a pair of keys for the same `(value, separation)`
+/// under two half-offset quantisations of the separation; two reads agree on
+/// the element if they share either key. `out` is empty if the junction has
+/// fewer than [`JUNCTION_MIN_ELEMS`] usable elements.
+pub fn junction_keys(
+    trips: &[(i32, i32, u64)],
+    tol: usize,
+    tmp: &mut Vec<(i32, u64)>,
+    out: &mut Vec<(u64, u64)>,
+) {
+    tmp.clear();
+    out.clear();
+    for &(p1, p2, v) in trips {
+        // One of each mirrored pair is enough; the mirror has the same
+        // separation and carries no extra information.
+        if p1 < p2 {
+            tmp.push((p2 - p1, v));
+        }
+    }
+    tmp.sort_unstable();
+    tmp.dedup();
+    tmp.truncate(JUNCTION_MAX_ELEMS);
+    if tmp.len() < JUNCTION_MIN_ELEMS {
+        return;
+    }
+    let q = tol.max(2) as u64;
+    for &(sep, v) in tmp.iter() {
+        let sep = sep as u64;
+        let key = |bin: u64, which: u8| -> u64 {
+            let mut h = GxHasher::default();
+            (v, bin, which).hash(&mut h);
+            h.finish()
+        };
+        out.push((key(sep / q, 0), key((sep + q / 2) / q, 1)));
+    }
+}
+
+/// Pass1's output: how many reads carry each junction key.
+#[derive(Debug, Default, Clone)]
+pub struct JunctionSupport {
+    /// key -> number of reads carrying it (only keys seen in >= 2 reads are
+    /// stored; anything absent has count 1 when looked up by a read that
+    /// was itself part of pass1).
+    counts: HashMap<u64, u32>,
+    /// Histogram of per-read support (index = n, last bucket = ">= len-1").
+    pub n_hist: Vec<u64>,
+    /// Number of reads that contributed a junction.
+    pub reads: u64,
+    /// Largest per-read support observed.
+    pub max_n: usize,
+}
+
+impl JunctionSupport {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn build(per_read: &[Vec<(u64, u64)>]) -> Self {
+        let mut all: Vec<u64> = Vec::with_capacity(per_read.iter().map(|k| k.len() * 2).sum());
+        let mut one: Vec<u64> = Vec::new();
+        for keys in per_read {
+            one.clear();
+            for &(a, b) in keys {
+                one.push(a);
+                one.push(b);
+            }
+            // a read counts once per key, however many elements produced it
+            one.sort_unstable();
+            one.dedup();
+            all.extend_from_slice(&one);
+        }
+        all.sort_unstable();
+        let mut counts: HashMap<u64, u32> = HashMap::new();
+        let mut i = 0;
+        while i < all.len() {
+            let mut j = i + 1;
+            while j < all.len() && all[j] == all[i] {
+                j += 1;
+            }
+            if j - i >= 2 {
+                counts.insert(all[i], (j - i) as u32);
+            }
+            i = j;
+        }
+        drop(all);
+
+        let mut me = Self {
+            counts,
+            n_hist: vec![0; 258],
+            reads: per_read.len() as u64,
+            max_n: 0,
+        };
+        let top = me.n_hist.len() - 1;
+        for keys in per_read {
+            let n = me.support_n(keys);
+            me.max_n = me.max_n.max(n);
+            me.n_hist[n.min(top)] += 1;
+        }
+        me
+    }
+
+    /// Number of reads (including the querying read itself) that fold about
+    /// the same axis: the lower median, over the junction's elements, of how
+    /// many reads carry each element. The median makes this robust both to a
+    /// promiscuous element (a repeat k-mer that happens to recur at the same
+    /// separation elsewhere) and to elements lost to sequencing error.
+    /// Returns 0 if the junction has no usable key.
+    pub fn support_n(&self, keys: &[(u64, u64)]) -> usize {
+        if keys.len() < JUNCTION_MIN_ELEMS {
+            return 0;
+        }
+        let mut c: [u32; JUNCTION_MAX_ELEMS] = [1; JUNCTION_MAX_ELEMS];
+        let m = keys.len().min(JUNCTION_MAX_ELEMS);
+        for (slot, &(a, b)) in c.iter_mut().zip(keys.iter()) {
+            let ca = self.counts.get(&a).copied().unwrap_or(1);
+            let cb = self.counts.get(&b).copied().unwrap_or(1);
+            *slot = ca.max(cb);
+        }
+        let c = &mut c[..m];
+        c.sort_unstable();
+        c[(m - 1) / 2] as usize
+    }
+
+    pub fn len(&self) -> usize {
+        self.counts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    /// Mean number of *other* reads sharing a junction's axis by chance,
+    /// estimated from the fraction of junctions nobody else shares
+    /// (`P(0 others) = exp(-lambda)` for uniformly scattered junctions).
+    /// Genome-encoded repeats inflate this slightly, which errs towards
+    /// cutting.
+    pub fn chance_lambda(&self) -> f64 {
+        let keyed: u64 = self.n_hist.iter().skip(1).sum();
+        if keyed == 0 {
+            return 0.0;
+        }
+        let alone = self.n_hist[1].max(1) as f64;
+        -(alone / keyed as f64).ln()
+    }
+
+    /// Smallest support threshold `t >= floor` at which fewer than `alpha`
+    /// of chance co-located junctions would reach it, i.e.
+    /// `P(Poisson(lambda) >= t - 1) < alpha`.
+    ///
+    /// A fixed absolute threshold cannot be right across libraries: the
+    /// number of unrelated artefacts sharing an axis by chance grows with
+    /// junction density, so the bar for "this recurs because it is in the
+    /// genome" has to grow with it. This only ever raises the threshold.
+    pub fn adaptive_min_support(&self, floor: usize, alpha: f64) -> usize {
+        let lambda = self.chance_lambda();
+        let mut t = floor.max(2);
+        loop {
+            // P(X >= t-1) = 1 - sum_{i=0}^{t-2} e^-l l^i / i!
+            let mut term = (-lambda).exp();
+            let mut cdf = term;
+            for i in 1..=(t - 2) {
+                term *= lambda / i as f64;
+                cdf += term;
+            }
+            if 1.0 - cdf < alpha || t >= 64 {
+                break;
+            }
+            t += 1;
+        }
+        self.extend_past_heavy_tail(t)
+    }
+
+    /// Amplified libraries are not Poisson: coverage is wildly uneven and
+    /// early amplification products are copied many times over, so the
+    /// number of artefacts sharing an axis has a much heavier tail than the
+    /// mean rate predicts (on a ~1500x C. elegans library the Poisson
+    /// threshold still left 6% of reference-confirmed artefacts above it,
+    /// their support counts decaying smoothly by ~0.7x per step, while
+    /// genome-encoded repeats sat far out at n >= 20).
+    ///
+    /// So measure the tail instead of assuming it: take the decay ratio of
+    /// the per-read support histogram just above the Poisson threshold,
+    /// extrapolate it geometrically, and move the threshold out to where the
+    /// extrapolated chance tail holds under 0.2% of all keyed foldbacks.
+    /// Genuine repeats in those bins flatten the measured decay, which errs
+    /// towards a higher threshold (cutting), never a lower one.
+    fn extend_past_heavy_tail(&self, t: usize) -> usize {
+        const TAIL_FRAC: f64 = 0.002;
+        const MIN_COUNT: u64 = 50;
+        let h = |n: usize| self.n_hist.get(n).copied().unwrap_or(0);
+        // the last bucket is an overflow bin, never part of the fit
+        if t + 3 >= self.n_hist.len() {
+            return t;
+        }
+        let (h0, h1, h2) = (h(t), h(t + 1), h(t + 2));
+        if h0 + h1 < MIN_COUNT {
+            return t;
+        }
+        let r = ((h1 + h2) as f64 / (h0 + h1) as f64).clamp(0.0, 0.9);
+        let keyed: u64 = self.n_hist.iter().skip(1).sum();
+        let budget = TAIL_FRAC * keyed as f64;
+        let cap = self.n_hist.len() - 2;
+        let mut n = t;
+        let mut level = h0 as f64;
+        // tail mass from n upward under geometric decay: level / (1 - r)
+        while level / (1.0 - r) > budget && n < cap {
+            level *= r;
+            n += 1;
+        }
+        n
+    }
+}
+
 // Support statistics (pass1 aggregation; pass2 decisions)
 
 /// Aggregate support statistics for a given junction signature.
@@ -573,6 +830,8 @@ mod tests {
     use crate::cfg::{FoldOnlyCfg, FoldSecondPassCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg};
     use crate::foldback::{detect_foldback, refine_breakpoint};
     use crate::pipeline::pass1_build_support;
+    #[allow(unused_imports)]
+    use super::{JunctionSupport, axis_tol, junction_keys};
     use crate::scratch::FoldScratch;
     use crate::utils::RefineMode;
 
@@ -733,17 +992,23 @@ mod tests {
         }
     }
 
+    /// Junction keys for a read, computed the way pass1/pass2 compute them.
+    fn read_junction_keys(seq: &[u8], cfg: &MdaxCfg) -> Vec<(u64, u64)> {
+        let mut scratch = FoldScratch::new();
+        if detect_foldback(seq, &cfg.shared, &cfg.fold, &mut scratch).is_none() {
+            return Vec::new();
+        }
+        let mut tmp = Vec::new();
+        let mut out = Vec::new();
+        junction_keys(&scratch.best_trip, axis_tol(cfg), &mut tmp, &mut out);
+        out
+    }
+
     #[test]
     fn foldback_pass1_support_finds_one_cluster() {
         let cfg = cfg_for_pass1();
-
-        // Need >= 1000bp on each side of junction for foldback_signature().
-        // So left must be >= 1000, and overall read long enough.
         let left = pseudo_dna(2500, 42);
-        let (seq, split) = make_clean_foldback(&left, b"");
-
-        // 3 identical foldback reads -> should become one recurrent locus
-        // plus a decoy random read that should be ignored.
+        let (seq, _split) = make_clean_foldback(&left, b"");
         let decoy = pseudo_dna(6000, 999);
 
         let path = tmp_fasta_path("mdax_fold2_pass1");
@@ -751,38 +1016,94 @@ mod tests {
             &path,
             &[("r1", &seq), ("r2", &seq), ("r3", &seq), ("decoy", &decoy)],
         );
-
         let cfg2 = cfg.clone();
-
-        let (support, _total_reads) = pass1_build_support(&path, Arc::new(cfg), 1, 1).expect("pass1 support");
-
-        // remove file
+        let (support, total_reads) =
+            pass1_build_support(&path, Arc::new(cfg), 1, 1).expect("pass1 support");
         let _ = std::fs::remove_file(&path);
 
-        // A single recurrent locus is now stored under up to `sig.take` band
-        // keys (see foldback_signature_from_local_matches_bands), not one
-        // exact key -- three byte-identical reads produce byte-identical
-        // sketches, so every band should collide across all three, and none
-        // should exceed `sig.take` total bands (the decoy must not add any).
-        assert!(
-            support.len() >= 1 && support.len() <= cfg2.sig.take,
-            "expected between 1 and sig.take={} band clusters, got {}",
-            cfg2.sig.take,
-            support.len()
-        );
-        for st in support.values() {
-            assert_eq!(st.n, 3, "should have 3 supporting reads on every band");
-            assert_eq!(st.split_span(), 0, "identical reads should cluster tightly");
-            assert!(st.mean_ident >= cfg2.fold2.min_identity);
-        }
+        assert_eq!(total_reads, 4);
+        assert_eq!(support.reads, 3, "the decoy must not contribute a junction");
+        let keys = read_junction_keys(&seq, &cfg2);
+        assert!(keys.len() >= JUNCTION_MIN_ELEMS);
+        assert_eq!(support.support_n(&keys), 3);
+    }
 
-        // Querying with read1's own bands (computed the same way pass1/pass2
-        // do: detect + refine + prefer local-match signature) must resolve
-        // to the fully-supported locus.
-        let _ = split; // true split retained for readability; production uses the refined split
-        let bands = read_bands(&seq, &cfg2).expect("bands for read1");
-        let (_band, st) = best_support(&bands, &support).expect("locus should be found");
-        assert_eq!(st.n, 3);
+    /// The property the gate rests on: reads that fold about the *same* axis
+    /// support each other however much of the arms each one happens to
+    /// cover, while reads from the same locus that fold about *different*
+    /// axes do not.
+    #[test]
+    fn junction_support_is_axis_specific_not_locus_specific() {
+        let cfg = cfg_for_pass1();
+        let genome = pseudo_dna(6000, 7);
+
+        // Same axis (genome position 3000), three different read extents.
+        let same_axis: Vec<Vec<u8>> = [(0usize, 3000usize), (400, 3000), (900, 3000)]
+            .iter()
+            .map(|&(a, b)| make_clean_foldback(&genome[a..b], b"").0)
+            .collect();
+        // Same locus, axes 150 bp apart (far beyond any axis tolerance).
+        let other_axes: Vec<Vec<u8>> = [3150usize, 3300, 3450, 3600]
+            .iter()
+            .map(|&b| make_clean_foldback(&genome[500..b], b"").0)
+            .collect();
+
+        let path = tmp_fasta_path("mdax_axis_specific");
+        let mut recs: Vec<(String, &Vec<u8>)> = Vec::new();
+        for (i, r) in same_axis.iter().enumerate() {
+            recs.push((format!("same{i}"), r));
+        }
+        for (i, r) in other_axes.iter().enumerate() {
+            recs.push((format!("other{i}"), r));
+        }
+        let refs: Vec<(&str, &[u8])> = recs.iter().map(|(n, r)| (n.as_str(), r.as_slice())).collect();
+        write_fasta(&path, &refs);
+        let cfg2 = cfg.clone();
+        let (support, _) = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        for r in &same_axis {
+            assert_eq!(support.support_n(&read_junction_keys(r, &cfg2)), 3);
+        }
+        for r in &other_axes {
+            assert_eq!(
+                support.support_n(&read_junction_keys(r, &cfg2)),
+                1,
+                "a read folding about its own axis must not borrow support from neighbours"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_min_support_rises_with_junction_density() {
+        let with_hist = |alone: u64, shared: u64| {
+            let mut s = JunctionSupport::empty();
+            s.n_hist = vec![0; 66];
+            s.n_hist[1] = alone;
+            s.n_hist[2] = shared;
+            s
+        };
+        // Sparse: almost nobody shares an axis -> the preset floor stands.
+        assert_eq!(with_hist(9990, 10).adaptive_min_support(3, 0.01), 3);
+        // ~15% share by chance (lambda ~0.16) -> one step up.
+        assert_eq!(with_hist(8500, 1500).adaptive_min_support(3, 0.01), 4);
+        // Saturated library (lambda ~1) -> well above the floor.
+        assert!(with_hist(3700, 6300).adaptive_min_support(3, 0.01) >= 6);
+        // Never below the floor.
+        assert_eq!(with_hist(10000, 0).adaptive_min_support(5, 0.01), 5);
+
+        // Heavy (non-Poisson) tail: the mean rate alone says 4, but the
+        // histogram keeps decaying slowly above it, so the threshold has
+        // to move out past where that tail has died away.
+        let mut heavy = with_hist(85_000, 12_000);
+        heavy.n_hist[3] = 1500;
+        let mut c = 600.0f64;
+        for n in 4..20 {
+            heavy.n_hist[n] = c as u64;
+            c *= 0.6;
+        }
+        let t = heavy.adaptive_min_support(3, 0.01);
+        assert!((6..=12).contains(&t), "heavy tail should push the threshold out, got {t}");
     }
 
     #[test]
@@ -949,23 +1270,14 @@ mod tests {
         let (support, _total_reads) = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        // With banded signatures, noise on r3/r4 that changes even one of the
-        // `take` smallest minimizer values (despite sitting outside the
-        // locality window used for detection -- edge effects from windowed
-        // minimizer selection near the flank boundary) no longer needs to
-        // hash *identically* to r1/r2's clean signature: it only needs to
-        // share one leave-one-out band with the clean majority. So the true
-        // locus should still accumulate at least the 2 clean reads (r1, r2)
-        // under a single band, and typically rescue r3 and/or r4 too.
+        // Junction keys come from the matchpoints nearest the axis, so
+        // mutations far from the junction must not cost the locus any of
+        // its four reads.
         let _ = split;
-        let bands = read_bands(&s1, &cfg2).expect("bands for read1");
-        let (_band, st) = best_support(&bands, &support)
-            .expect("clean-majority locus should be found even with noisy stragglers");
-        assert!(
-            st.n >= 2,
-            "expected at least the 2 clean reads to cluster together, got n={}",
-            st.n
-        );
+        for r in [&s1, &s3, &s4] {
+            let n = support.support_n(&read_junction_keys(r, &cfg2));
+            assert_eq!(n, 4, "expected all 4 reads to support the axis, got n={n}");
+        }
     }
 
     #[test]
@@ -1077,32 +1389,6 @@ mod tests {
             same >= 2,
             "signature seems too sensitive to small split shifts"
         );
-    }
-
-    #[test]
-    fn is_real_foldback_only_when_supported_and_tight() {
-        let cfg = cfg_for_pass1();
-
-        let left = pseudo_dna(3000, 1);
-        let (seq, _split) = make_clean_foldback(&left, b"");
-
-        let path = tmp_fasta_path("mdax_real_logic");
-        write_fasta(&path, &[("r1", &seq), ("r2", &seq), ("r3", &seq)]);
-
-        let cfg2 = cfg.clone();
-
-        let (support, _total_reads) = pass1_build_support(&path, Arc::new(cfg), 1, 1).unwrap();
-        let _ = std::fs::remove_file(&path);
-
-        assert!(
-            support.len() >= 1 && support.len() <= cfg2.sig.take,
-            "expected between 1 and sig.take={} band clusters, got {}",
-            cfg2.sig.take,
-            support.len()
-        );
-        let (&sig, st) = support.iter().next().unwrap();
-        assert!(is_real_foldback(sig, &support, &cfg2));
-        assert_eq!(st.n, 3);
     }
 
     #[test]

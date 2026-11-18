@@ -9,7 +9,6 @@ use mdax::{
         SharedCfg, SigCfg,
     },
     cli, elog,
-    fingerprint::{MAX_PLAUSIBLE_CLUSTER_N, is_real_foldback_stats},
     pipeline,
     utils::{RefineMode, compact_histogram},
 };
@@ -24,38 +23,6 @@ fn fmt_param<T: std::fmt::Display + PartialEq>(
     } else {
         format!("{name}={effective} (override; mode={mode_default})")
     }
-}
-
-/// Weighted median of histogram keys `n`, restricted to entries with `n >= min_n`.
-///
-/// `histogram` maps support count -> number of support-map entries with that
-/// count (as built from `SupportStats::n` after pass1). Used to estimate the
-/// dataset's own "typical" recurrence depth among loci that recur at all, so
-/// `min_support` can be calibrated to it instead of staying a fixed constant
-/// blind to how much coverage this particular dataset actually achieved.
-fn weighted_median_at_least(
-    histogram: &std::collections::HashMap<usize, usize>,
-    min_n: usize,
-) -> Option<usize> {
-    let mut entries: Vec<(usize, i64)> = histogram
-        .iter()
-        .filter(|&(&n, _)| n >= min_n)
-        .map(|(&n, &c)| (n, c as i64))
-        .collect();
-    if entries.is_empty() {
-        return None;
-    }
-    entries.sort_unstable_by_key(|&(n, _)| n);
-    let total: i64 = entries.iter().map(|&(_, c)| c).sum();
-    let half = (total + 1) / 2; // 1-indexed median position
-    let mut cum = 0i64;
-    for (n, c) in entries {
-        cum += c;
-        if cum >= half {
-            return Some(n);
-        }
-    }
-    None
 }
 
 fn main() -> Result<()> {
@@ -152,7 +119,7 @@ fn main() -> Result<()> {
     let mut max_ed_rate = *args.get_one::<f32>("max_ed_rate").unwrap();
     let max_jump_clip = *args.get_one::<usize>("max_jump_clip").unwrap();
 
-    let mut end_guard = *args.get_one::<usize>("end_guard").unwrap();
+    let mut end_guard = *args.get_one::<usize>("end_guard").unwrap_or(&t.end_guard);
     let mut fold_diag_tol = *args.get_one::<i32>("fold_diag_tol").unwrap();
 
     let ont_k_note = if refine_mode == RefineMode::ONT {
@@ -170,15 +137,23 @@ fn main() -> Result<()> {
         String::new()
     };
 
+    for legacy in ["sig_flank_bp", "sig_take", "sig_value_shift"] {
+        if args.value_source(legacy) == Some(clap::parser::ValueSource::CommandLine) {
+            elog!(
+                "INIT",
+                "note: --{} no longer has any effect (support is now counted per fold axis, not per locus signature)",
+                legacy.replace('_', "-")
+            );
+        }
+    }
+
     let msg = [
         fmt_param("min_matches", min_matches, t.min_matches),
         fmt_param("min_span", min_span, t.min_span),
         fmt_param("min_identity", min_identity, t.min_identity),
         fmt_param("min_support", min_support, t.min_support),
+        fmt_param("end_guard", end_guard, t.end_guard),
         fmt_param("max_depth", max_depth, t.max_depth),
-        fmt_param("sig_flank_bp", sig_flank_bp, t.sig_flank_bp),
-        fmt_param("sig_take", sig_take, t.sig_take),
-        fmt_param("sig_value_shift", sig_value_shift, t.sig_value_shift),
         format!("k={k}  w={w}{ont_k_note}"),
         format!("refine_mode={refine_mode:?}  refine_arm={refine_arm}  refine_window={refine_window}"),
     ]
@@ -239,7 +214,7 @@ fn main() -> Result<()> {
             min_support,
             min_identity,
             min_support_ident: 0.0,
-            cut_low_ident: *args.get_one::<bool>("cut_low_ident").unwrap_or(&false),
+            cut_low_ident: !args.get_flag("keep_low_ident"),
         },
         sig: SigCfg {
             flank_bp: sig_flank_bp,
@@ -286,169 +261,60 @@ fn main() -> Result<()> {
 
     // PASS 1
     let (support, total_reads) = pipeline::pass1_build_support(&fasta, cfg_arc.clone(), threads, chan_cap)?;
-    elog!("SUPPORT MAP", "Number of entries: {}", support.len());
-
-    // Collect histogram of clusters into buckets based on their size
-    let mut histogram = std::collections::HashMap::new();
-    for st in support.values() {
-        *histogram.entry(st.n).or_insert(0) += 1;
-    }
-
-    // Print histogram
-    elog!("SUPPORT HISTOGRAM", "Cluster Size Distribution:");
+    // Per-read junction support: how many reads (including itself) fold
+    // about the same axis as each detected foldback.
+    elog!(
+        "SUPPORT",
+        "foldbacks with a junction key: {} (of {} input reads); shared keys: {}",
+        support.reads,
+        total_reads,
+        support.len()
+    );
+    elog!("SUPPORT HISTOGRAM", "reads by number of reads sharing their fold axis:");
+    let histogram: std::collections::HashMap<usize, usize> = support
+        .n_hist
+        .iter()
+        .enumerate()
+        .filter(|&(n, &c)| n > 0 && c > 0)
+        .map(|(n, &c)| (n, c as usize))
+        .collect();
     compact_histogram(&histogram, 30)?;
 
-    let total_n: u64 = support.values().map(|s| s.n as u64).sum();
-    elog!(
-        "SUPPORT UNIQUENESS",
-        "clusters={} total_n={} avg_n={:.3}",
-        support.len(),
-        total_n,
-        (total_n as f64 / support.len().max(1) as f64),
-    );
-
-    // Self-calibrate min_support to this dataset's own observed recurrence
-    // level, unless the user explicitly passed --min-support (or this is the
-    // fairness baseline, which must stay behaviorally frozen for legacy
-    // comparison).
-    //
-    // min_support alone is a *fixed absolute* recurrence threshold, blind to
-    // local sequencing depth. MDA coverage is notoriously uneven, so a real
-    // inverted repeat sitting in a low-coverage patch of the library can
-    // easily be spanned by fewer reads than a hardcoded preset value purely
-    // by chance -- in which case mdax's default behaviour is to cut it in
-    // every read that covers it, systematically damaging assembly
-    // contiguity at exactly the loci where long-read spanning matters most.
-    //
-    // We only ever LOWER the threshold here, clamped to the preset/override
-    // value the user already chose, so this can't make a well-covered
-    // dataset more permissive than requested -- it only rescues datasets
-    // where the achieved recurrence is genuinely lower than the preset
-    // assumed.
+    // Density-aware threshold. The number of *unrelated* artefacts that
+    // share a fold axis by chance grows with how densely junctions cover the
+    // genome, so a fixed min_support is too lax for deep libraries (measured
+    // against a reference: at ~140x, 15% of true artefacts were kept as
+    // "real"; at ~1500x, half). Estimate the chance rate from the data and
+    // raise the bar until under 1% of chance co-locations clear it. This
+    // only ever raises the threshold, and an explicit --min-support (or the
+    // frozen fairness baseline) disables it.
     let min_support_explicit =
         args.value_source("min_support") == Some(clap::parser::ValueSource::CommandLine);
-
+    let lambda = support.chance_lambda();
     if !fairness_baseline && !min_support_explicit {
-        if let Some(typical_recurrence) = weighted_median_at_least(&histogram, 2) {
-            let adaptive = typical_recurrence.clamp(2, min_support);
-            if adaptive < min_support {
-                elog!(
-                    "SUPPORT CALIBRATION",
-                    "min_support {} -> {} (dataset's typical recurrence among recurring loci is {})",
-                    min_support,
-                    adaptive,
-                    typical_recurrence
-                );
-                min_support = adaptive;
-                cfg.fold2.min_support = min_support;
-            }
+        let adaptive = support.adaptive_min_support(min_support, 0.01);
+        if adaptive != min_support {
+            elog!(
+                "SUPPORT CALIBRATION",
+                "min_support {} -> {} (chance co-location rate lambda={:.3}, plus measured tail)",
+                min_support,
+                adaptive,
+                lambda
+            );
+            min_support = adaptive;
+            cfg.fold2.min_support = min_support;
         }
     }
 
-    elog!(
-        "SUPPORT SANITY",
-        "total_clusters={} total_support_reads={} max_n={}",
-        support.len(),
-        support.values().map(|s| s.n as u64).sum::<u64>(),
-        support.values().map(|s| s.n).max().unwrap_or(0),
-    );
-
-    // Delegate to the same `is_real_foldback_stats()` pass2 actually gates on,
-    // rather than re-deriving the logic inline -- this diagnostic had drifted
-    // out of sync with the real gate before (it hardcoded the current gate
-    // conditions rather than calling the shared function), which would have
-    // silently stopped reflecting any future change to the real gate.
-    let mut ge_support_clusters = 0usize;
-    let mut ge_support_ident_clusters = 0usize;
-    let mut real_clusters = 0usize;
-
-    for st in support.values() {
-        if st.n >= cfg.fold2.min_support {
-            ge_support_clusters += 1;
-
-            let ident_ok = cfg.fold2.min_support_ident <= 0.0
-                || (st.mean_ident as f64) >= cfg.fold2.min_support_ident;
-
-            if ident_ok {
-                ge_support_ident_clusters += 1;
-            }
-        }
-        if is_real_foldback_stats(st, &cfg) {
-            real_clusters += 1;
-        }
-    }
-
-    elog!(
-        "SUPPORT GATE",
-        "clusters: total={} ge_support={} ge_support_ident={} real={}",
-        support.len(),
-        ge_support_clusters,
-        ge_support_ident_clusters,
-        real_clusters
-    );
-
-    // Machine-parseable one-line summary for the --qc-only workflow (and
-    // useful in a normal run too): the max signature-cluster size is the
-    // statistic that flagged a real permissive-mode over-fragmentation case
-    // during benchmarking (one dataset's largest cluster was 3-6x any other
-    // tested dataset's). A large cluster here means many reads collapsed
-    // onto the same signature -- consistent with a repetitive genomic
-    // region being conflated into one "recurring locus" rather than a
-    // single true recurring artefact, which --mode permissive's coarser
-    // signature (smaller sig_flank_bp/sig_take, non-zero sig_value_shift)
-    // and deeper cut recursion (max_depth) are more prone to.
-    let large_cluster_threshold = 50usize;
-    let max_cluster_n = support.values().map(|s| s.n).max().unwrap_or(0);
-    let large_clusters = support
-        .values()
-        .filter(|s| s.n > large_cluster_threshold)
-        .count();
-    let reads_in_large_clusters: u64 = support
-        .values()
-        .filter(|s| s.n > large_cluster_threshold)
-        .map(|s| s.n as u64)
-        .sum();
+    let real_reads_est: u64 = support.n_hist.iter().skip(min_support.min(support.n_hist.len())).sum();
     elog!(
         "QC SUMMARY",
-        "mode={mode:?} max_cluster_n={} clusters_gt_{}={} reads_in_clusters_gt_{}={}",
-        max_cluster_n,
-        large_cluster_threshold,
-        large_clusters,
-        large_cluster_threshold,
-        reads_in_large_clusters,
+        "mode={mode:?} lambda={:.3} min_support={} max_support_n={} reads_at_or_above_min_support={}",
+        lambda,
+        min_support,
+        support.max_n,
+        real_reads_est,
     );
-
-    // Advisory only (not a gate change): --mode permissive's coarser signature
-    // is the one mode shown, on real data, to occasionally collapse an
-    // unrelated repeat family into one inflated "recurring locus" and
-    // fragment the assembly as a result (see test_single_nematode/README.md,
-    // "microlaimidae anomaly"). Thresholds below are set from that one
-    // confirmed case (max_cluster_n 407, 0.26% of reads in large clusters)
-    // vs. three unaffected species (max_cluster_n 70-130, <=0.05%) -- a
-    // small n, so treat this as a heuristic flag worth a second look, not a
-    // verdict. --mode strict/balanced are not flagged: not observed on this
-    // dataset and their tighter signature/shallower recursion make the same
-    // collision mechanism less likely (unvalidated beyond that one case).
-    if mode == CallMode::Permissive {
-        // Denominator must match what the thresholds above were calibrated
-        // against in test_single_nematode/README.md: fractions there (e.g.
-        // epsilonema 70/368,903 = 0.02%) are against *all* input reads, not
-        // just the ones that passed detection/refinement/identity/signature
-        // gates (total_n, used above for avg_n -- a much smaller, dataset-
-        // dependent denominator that would make this fraction read higher
-        // than the calibration and could false-fire on a healthy dataset).
-        let frac_in_large_clusters = reads_in_large_clusters as f64 / total_reads.max(1) as f64;
-        if max_cluster_n > MAX_PLAUSIBLE_CLUSTER_N || frac_in_large_clusters > 0.001 {
-            elog!(
-                "QC MODE ADVICE",
-                "max_cluster_n={max_cluster_n} ({:.2}% of all input reads in clusters_gt_{large_cluster_threshold}) \
-is high for --mode permissive on this dataset -- consider rerunning with --mode balanced or \
---mode strict and comparing assembly/BUSCO outcome before committing to permissive. \
-(Heuristic from a single confirmed case; see test_single_nematode/README.md.)",
-                frac_in_large_clusters * 100.0,
-            );
-        }
-    }
 
     if qc_only {
         elog!(

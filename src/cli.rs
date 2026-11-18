@@ -204,37 +204,34 @@ Practical guidance:\n\
             Arg::new("min_support")
               .long("min-support")
               .help("Override: minimum support reads (coverage) for 'real' foldback")
-              .long_help("Override: minimum number of reads that must share the same junction signature for the foldback to be treated as 'real'.\n\
+              .long_help("Override: minimum number of reads (including the read itself) that must fold about the same axis for a foldback to be treated as 'real'.\n\
 \n\
 Interpretation:\n\
-- Pass1 builds a support map keyed by a fingerprint/signature of the junction.\n\
-- In pass2, if a signature is observed in >= min-support reads, `mdax` treats\n\
-  that junction as genome-templated and does NOT cut it by default.\n\
+- Pass1 records, for every detected foldback, where its symmetry axis sits\n\
+  relative to the minimizers next to it.\n\
+- A genome-encoded inverted repeat folds about the same axis in every read\n\
+  that spans it; independent amplification artefacts at the same locus fold\n\
+  about different ones. In pass2 a foldback whose axis is shared by\n\
+  >= min-support reads is treated as genome-templated and is NOT cut.\n\
 \n\
 How it affects cutting:\n\
 - Increasing min-support means harder to be considered real. More foldbacks treated as artefacts therefore more cutting.\n\
 - Decreasing min-support means easier to be considered real. Fewer cuts, but risk of keeping recurrent artefacts.\n\
 \n\
-Coverage dependence and auto-calibration:\n\
-- min-support is a fixed absolute recurrence count. MDA coverage is often\n\
-  uneven, so a real inverted repeat sitting in a low-coverage patch of the\n\
-  library can be spanned by fewer reads than a hardcoded threshold purely by\n\
-  chance -- in which case it gets cut in every read that covers it.\n\
-- Unless you pass this flag explicitly, `mdax` self-calibrates: after pass1\n\
-  it computes this dataset's own typical recurrence among loci that recur at\n\
-  all, and lowers the effective min-support to that (never below 2, never\n\
-  above the mode/default value). This only ever makes the default *more*\n\
-  lenient for datasets with genuinely lower achieved recurrence -- it never\n\
-  raises the threshold, and passing --min-support explicitly disables it.\n\
-  Check stderr for a `SUPPORT CALIBRATION` line showing whether it fired.\n\
+Depth dependence and auto-calibration:\n\
+- The deeper the library, the more unrelated artefacts share an axis purely\n\
+  by chance, so a fixed threshold that is right at 30x is far too lax at\n\
+  1000x.\n\
+- Unless you pass this flag explicitly, `mdax` calibrates after pass1: it\n\
+  estimates the chance co-location rate from the data and raises the\n\
+  threshold until chance alone rarely reaches it, then follows the measured\n\
+  tail of the support histogram further out if the library is over-dispersed\n\
+  (heavily amplified libraries are). It never goes below the mode value.\n\
+  Check stderr for a `SUPPORT CALIBRATION` line showing what it picked.\n\
 \n\
 Guidance:\n\
-- For deep coverage datasets, auto-calibration will typically leave this\n\
-  alone; raise it explicitly only if you want to be more conservative than\n\
-  the mode default about calling 'real'.\n\
-- For shallow/uneven coverage, prefer leaving this unset (let auto-\n\
-  calibration adapt) over lowering it manually -- a manual override applies\n\
-  uniformly regardless of what this dataset actually achieved.")
+- Leave this alone unless you have a reason: an explicit value disables the\n\
+  calibration and applies uniformly whatever the library's depth.")
               .value_parser(value_parser!(usize)),
         )
         .arg(
@@ -259,7 +256,7 @@ Guidance:\n\
         )
         .arg(
             Arg::new("end_guard")
-                .help("Do not call breakpoints within this distance of read ends (bp)")
+                .help("Do not call breakpoints within this distance of read ends (bp) [mode default: strict 1000, balanced 500, permissive 1000]")
                 .long_help("Guard region at both ends of reads (bp).\n\
 \n\
 Foldback calls near read ends are often unreliable because:\n\
@@ -275,7 +272,6 @@ Tip:\n\
 - If you have many short reads, a large end-guard can suppress almost all calls.\n\
   Ensure end-guard is comfortably smaller than typical read length.")
                 .long("end-guard")
-                .default_value("1000")
                 .value_parser(value_parser!(usize)),
         )
         // Refinement is the local, more expensive step after coarse detection.
@@ -463,10 +459,14 @@ Override precedence:\n\
                 .default_value("balanced")
                 .value_parser(value_parser!(CallMode)),
         )
-        // These impact how stable and specific the support-map signature keys are.
+        // Legacy locus-signature knobs. No longer used by the real/artefact gate.
         .arg(
             Arg::new("sig_flank_bp")
                 .long("sig-flank-bp")
+                // Inert since support became junction-axis based (see
+                // fingerprint::JunctionSupport); accepted so old command
+                // lines keep working.
+                .hide(true)
                 .help("Window (bp) around split for match-based fingerprinting")
                 .long_help("Signature flank size (bp) used to compute the junction fingerprint.\n\
 \n\
@@ -486,6 +486,10 @@ sig_flank_bp and/or sig_take to improve specificity.")
         .arg(
             Arg::new("sig_take")
                 .long("sig-take")
+                // Inert since support became junction-axis based (see
+                // fingerprint::JunctionSupport); accepted so old command
+                // lines keep working.
+                .hide(true)
                 .long_help("Number of minimizer-derived values retained when constructing the junction signature.\n\
 \n\
 This controls signature specificity:\n\
@@ -505,6 +509,10 @@ Guidance:\n\
         .arg(
             Arg::new("sig_value_shift")
                 .long("sig-value-shift")
+                // Inert since support became junction-axis based (see
+                // fingerprint::JunctionSupport); accepted so old command
+                // lines keep working.
+                .hide(true)
                 .help("Right-shift applied to signature hash values before dedup (0 = exact)")
                 .long_help("Quantization applied to the minimizer values that make up a junction \
 signature, before sorting/dedup. 0 (the default for balanced/strict) keeps signatures exact: a \
@@ -522,43 +530,46 @@ is the more aggressive knob.")
                 .value_parser(value_parser!(u8)),
         )
         .arg(
+            Arg::new("keep_low_ident")
+                .long("keep-low-ident")
+                .help("Leave low-identity foldbacks uncut (labelled low_ident)")
+                .long_help(
+"By default a detected foldback whose estimated arm identity falls below \
+--min-identity is still cut, unless enough other reads fold about the same \
+axis (the same support gate every other foldback goes through). With this \
+flag such reads are passed through unchanged and labelled low_ident.\n\
+\n\
+Why cutting is the default: measured against a reference genome on WGA HiFi \
+data, ~97% of detected foldbacks with a low identity estimate were true \
+amplification artefacts whose identity had simply been under-estimated, and \
+the estimate is systematically low on indel-rich (ONT / CLR) reads.")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            // Accepted for backwards compatibility: cutting low-identity
+            // foldbacks is now the default, so this is a no-op.
             Arg::new("cut_low_ident")
                 .long("cut-low-ident")
-                .help("Cut low-identity foldbacks instead of labelling them low_ident")
-                .long_help(
-"When set, reads whose detected foldback falls below the identity threshold \
-(--min-identity) are still cut at the estimated split position, rather than \
-labelled low_ident and passed through unchanged.\n\
-\n\
-Useful for ONT data where the HiFi Hamming estimator used internally for \
-signature coherence systematically underestimates arm similarity on indel-rich \
-reads. In that regime the identity gate fires too often, and --cut-low-ident \
-recovers the cuts that would otherwise be suppressed.\n\
-\n\
-Use with care on HiFi data: genuine low-identity hits (e.g. partial repeats) \
-will also be cut.")
+                .hide(true)
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("qc_only")
                 .long("qc-only")
-                .help("Run pass1 only and report signature-cluster stats; skip cutting/output")
+                .help("Run pass1 only and report support statistics; skip cutting/output")
                 .long_help(
-"Stop after pass1 (detection + signature clustering) and report the same \
-SUPPORT HISTOGRAM / SUPPORT SANITY / SUPPORT GATE diagnostics that a normal \
-run already logs, then exit -- no pass2, no cutting, no FASTA/TSV written. \
---output/-o is not required in this mode.\n\
+"Stop after pass1 (detection + fold-axis support counting) and report the \
+SUPPORT HISTOGRAM / SUPPORT CALIBRATION / QC SUMMARY diagnostics that a \
+normal run already logs, then exit -- no pass2, no cutting, no FASTA/TSV \
+written. --output/-o is not required in this mode.\n\
 \n\
-Intended as a cheap pre-assembly check: pass1 is far cheaper than \
-pass2 + downstream assembly, so you can run this once per --mode candidate \
-to see which one is likely to be well-behaved on this dataset (e.g. an \
-unusually large max signature-cluster size under --mode permissive can \
-indicate a repetitive genome where permissive's coarser signature and \
-deeper cut recursion will over-fragment reads) before committing to a full \
-correction + assembly run.\n\
+Intended as a cheap look at a new dataset before committing to correction + \
+assembly: the QC SUMMARY line reports the chance co-location rate (lambda), \
+the calibrated min_support, and how many foldback reads would be kept as \
+genome-templated.\n\
 \n\
-Note --mode changes pass1's own detection/signature parameters, so \
-comparing modes means rerunning this once per --mode, not one shared pass.")
+Note --mode changes pass1's own detection parameters, so comparing modes \
+means rerunning this once per --mode, not one shared pass.")
                 .action(clap::ArgAction::SetTrue),
         )
         // Hidden “developer mode” for reproducible benchmarking.

@@ -72,6 +72,18 @@ pub struct FoldScratch {
     ///   (e.g. `foldback_signature_from_local_matches`).
     pub best_matches: Vec<(usize, u64)>,
 
+    /// Matchpoints of the best bin with their minimizer value: `(p1, p2, value)`.
+    ///
+    /// Unlike `best_pts` (re-sorted by the chain builder) and `best_matches`
+    /// (destructively filtered by the legacy signature code), this is left
+    /// untouched after `detect_foldback`, so junction keys can be derived
+    /// from it at any later point. See `fingerprint::junction_keys`.
+    pub best_trip: Vec<(i32, i32, u64)>,
+    /// Scratch for `fingerprint::junction_keys`: `(arm separation, value)`.
+    pub jk_tmp: Vec<(i32, u64)>,
+    /// Output of `fingerprint::junction_keys` for the most recent call.
+    pub jk_out: Vec<(u64, u64)>,
+
     /// Scratch for refinement stage.
     pub refine: RefineScratch,
 
@@ -106,6 +118,9 @@ impl FoldScratch {
             stats: gxhash::HashMap::new(),
             best_pts: Vec::new(),
             best_matches: Vec::new(),
+            best_trip: Vec::new(),
+            jk_tmp: Vec::new(),
+            jk_out: Vec::new(),
             refine: RefineScratch::default(),
             top_bins: Vec::new(),
             bin_to_idx: gxhash::HashMap::new(),
