@@ -6,6 +6,7 @@ use std::sync::Arc;
 use mdax::{
     cfg::{
         CallMode, FairnessParams, FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg,
+        RescueCfg,
         SharedCfg, SigCfg,
     },
     cli, elog,
@@ -137,6 +138,49 @@ fn main() -> Result<()> {
         String::new()
     };
 
+    // Alignment-verified rescue of thin-evidence candidates. The fairness
+    // baseline stays frozen, so it never rescues.
+    let (rescue_arm_default, rescue_ident_default) = match refine_mode {
+        RefineMode::HiFi => (150usize, 0.90f32),
+        // ONT: two independently noisy arms align at ~70-85% even when they
+        // are true copies. 0.65 was the best measured trade-off on
+        // reference-scored ONT WGA data (C. elegans, 2026-11-19): true
+        // foldbacks cut 65.4% -> 77.5%, linear reads cut 1.7% -> 2.2%.
+        RefineMode::ONT => (200usize, 0.65f32),
+    };
+    let rescue = RescueCfg {
+        enabled: !fairness_baseline && !args.get_flag("no_rescue"),
+        min_pairs: *args.get_one::<usize>("rescue_min_pairs").unwrap_or(&3),
+        min_arm: *args
+            .get_one::<usize>("rescue_min_arm")
+            .unwrap_or(&rescue_arm_default),
+        min_identity: *args
+            .get_one::<f32>("rescue_min_identity")
+            .unwrap_or(&rescue_ident_default),
+        end_only: !args.get_flag("rescue_anywhere"),
+        end_slack: match refine_mode {
+            RefineMode::HiFi => 30,
+            RefineMode::ONT => 100,
+        },
+        terminal: match args.get_one::<String>("rescue_terminal").map(|v| v.as_str()) {
+            Some("on") => true,
+            Some("off") => false,
+            // Off in every mode: measured on reference-scored HiFi and ONT
+            // data it added almost nothing the minimizer-seeded rescue
+            // did not already find, at a worse true:false ratio.
+            _ => false,
+        },
+        term_k: *args.get_one::<usize>("rescue_term_k").unwrap_or(&match refine_mode {
+            RefineMode::HiFi => 13,
+            RefineMode::ONT => 9,
+        }),
+        term_min_seeds: match refine_mode {
+            RefineMode::HiFi => 4,
+            RefineMode::ONT => 5,
+        },
+        ..RescueCfg::disabled()
+    };
+
     for legacy in ["sig_flank_bp", "sig_take", "sig_value_shift"] {
         if args.value_source(legacy) == Some(clap::parser::ValueSource::CommandLine) {
             elog!(
@@ -156,6 +200,14 @@ fn main() -> Result<()> {
         fmt_param("max_depth", max_depth, t.max_depth),
         format!("k={k}  w={w}{ont_k_note}"),
         format!("refine_mode={refine_mode:?}  refine_arm={refine_arm}  refine_window={refine_window}"),
+        if rescue.enabled {
+            format!(
+                "rescue=on  rescue_min_arm={}  rescue_min_identity={}  rescue_min_pairs={}  terminal={} (k={})",
+                rescue.min_arm, rescue.min_identity, rescue.min_pairs, rescue.terminal, rescue.term_k
+            )
+        } else {
+            "rescue=off".to_string()
+        },
     ]
     .join("\n  ");
 
@@ -208,6 +260,7 @@ fn main() -> Result<()> {
             // This is the foldback “arm evidence span” threshold.
             // If you want a dedicated fold option, add a separate CLI flag.
             min_arm: min_span,
+            rescue,
         },
         fold2: FoldSecondPassCfg {
             // TODO: sensible defaults + add to cli

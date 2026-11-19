@@ -530,6 +530,69 @@ is the more aggressive knob.")
                 .value_parser(value_parser!(u8)),
         )
         .arg(
+            Arg::new("no_rescue")
+                .long("no-rescue")
+                .help("Disable alignment-verified rescue of short-arm / near-end foldbacks")
+                .long_help(
+"By default, when a read's foldback evidence is too thin for the coarse \
+gates (--min-matches, --min-span, --end-guard), mdax still considers any \
+anti-diagonal with a few matched minimizer pairs, and accepts it only if the \
+two arms then align base-for-base (--rescue-min-arm bp at \
+--rescue-min-identity or better). This is what finds foldbacks with short \
+arms or a junction close to a read end. With this flag only the coarse \
+gates are used.")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("rescue_anywhere")
+                .long("rescue-anywhere")
+                .help("Rescue path: also accept verified candidates in the middle of a read")
+                .long_help(
+"By default the rescue path only accepts a candidate whose shorter arm runs \
+to a read end. With this flag, verified candidates anywhere in the read are \
+accepted. On reference-scored WGA HiFi data the mid-read candidates were as \
+often genuine short inverted repeats as artefacts, so this is off by default.")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("rescue_terminal")
+                .long("rescue-terminal")
+                .help("Rescue path: scan read ends with dense short seeds (on|off) [default: off]")
+                .long_help(
+"Whether the rescue path also matches the first and last ~1.2 kb of each read \
+against its own reverse complement using every k-mer (--rescue-term-k) rather \
+than sampled minimizers, accepting a candidate only if the inverted copy runs \
+all the way to the read end and aligns. Off by default: on reference-scored \
+HiFi and ONT WGA data the minimizer-seeded rescue already proposed nearly \
+every candidate this finds, and the few extra calls were false nearly as \
+often as true.")
+                .value_parser(["on", "off"]),
+        )
+        .arg(
+            Arg::new("rescue_term_k")
+                .long("rescue-term-k")
+                .help("Rescue path: seed length for the read-end scan [default: 13 hifi, 9 ont]")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("rescue_min_arm")
+                .long("rescue-min-arm")
+                .help("Rescue path: minimum verified arm length (bp) [default: 150 hifi, 200 ont]")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("rescue_min_identity")
+                .long("rescue-min-identity")
+                .help("Rescue path: minimum identity of the verified arm alignment [default: 0.90 hifi, 0.65 ont]")
+                .value_parser(value_parser!(f32)),
+        )
+        .arg(
+            Arg::new("rescue_min_pairs")
+                .long("rescue-min-pairs")
+                .help("Rescue path: minimum matched minimizer pairs proposing a candidate [default: 3]")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
             Arg::new("keep_low_ident")
                 .long("keep-low-ident")
                 .help("Leave low-identity foldbacks uncut (labelled low_ident)")

@@ -977,6 +977,7 @@ mod tests {
             },
             fold: FoldOnlyCfg {
                 min_arm: 200, // span evidence for foldback detector
+                ..Default::default()
             },
             fold2: FoldSecondPassCfg {
                 min_support: 3,

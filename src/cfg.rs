@@ -157,6 +157,99 @@ impl Default for SharedCfg {
 ///
 /// These thresholds are applied during coarse detection before refinement.
 /// They capture basic geometric/evidence constraints for calling a foldback candidate.
+/// Alignment-verified "rescue" detection for foldbacks the coarse detector's
+/// evidence gates reject: short arms and junctions close to a read end.
+///
+/// The coarse gates (`min_matches`, `min_arm`, `end_guard`) use the *amount*
+/// of minimizer evidence as a proxy for "this is a real inverted duplicate".
+/// That proxy cannot be loosened without admitting spurious seed
+/// coincidences. The rescue path instead accepts very little seed evidence
+/// (`min_pairs` matched minimizer pairs on one anti-diagonal) but then
+/// requires the two arms to actually align, base for base, over at least
+/// `min_arm` bp at `min_identity` or better -- sensitivity from the seeds,
+/// specificity from the alignment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RescueCfg {
+    /// Off by default at the struct level so library callers and tests that
+    /// build a bare `FoldOnlyCfg` keep the historical behaviour; the `mdax`
+    /// binary switches it on.
+    pub enabled: bool,
+    /// Minimum matched minimizer pairs (left-arm copy + right-arm copy) with
+    /// distinct values on the candidate anti-diagonal.
+    pub min_pairs: usize,
+    /// Minimum verified arm length (bp).
+    pub min_arm: usize,
+    /// Minimum identity of the verified arm alignment.
+    pub min_identity: f32,
+    /// Longest arm window (bp) the verifier will align.
+    pub max_window: usize,
+    /// How many candidate anti-diagonals to verify per read at most.
+    pub max_candidates: usize,
+    /// Only rescue candidates whose shorter arm runs to a read end.
+    ///
+    /// Measured against a reference on WGA HiFi data, 94% of the true
+    /// artefacts the rescue path adds sit within one arm of a read end (the
+    /// strand switch happened shortly before the fragment ended), whereas
+    /// rescued candidates in the middle of a read were as often genome-encoded
+    /// short inverted repeats with too little coverage to clear the support
+    /// gate as they were artefacts. With this set, a candidate must have its
+    /// outer arm end at the read end, and the whole of that arm must align.
+    pub end_only: bool,
+    /// When an arm must run to a read end, how many of its outermost bases
+    /// are left out of the alignment (bp). Read ends carry adapter remnants
+    /// and low-quality bases that are not part of the inverted copy; on raw
+    /// ONT reads, requiring them to align cost a tenth of the identity and
+    /// with it a third of otherwise verifiable candidates.
+    pub end_slack: usize,
+    /// Also scan both read ends with dense (every-position) short seeds.
+    ///
+    /// The commonest short-arm foldback is one whose junction simply falls
+    /// near a read end, so its outer arm is cut short by the end of the
+    /// read. Sampled minimizers are too sparse to propose those reliably on
+    /// noisy reads, so the last/first `term_window` bp are matched against
+    /// their own reverse complement using all `term_k`-mers instead. A
+    /// terminal candidate is only accepted if the inverted copy runs all the
+    /// way to the read end -- the signature of a strand switch followed by
+    /// synthesis to the end of the fragment, as opposed to a small hairpin
+    /// that merely sits near the end.
+    pub terminal: bool,
+    /// Seed length for the terminal scan.
+    pub term_k: usize,
+    /// How much of each read end the terminal scan looks at (bp).
+    pub term_window: usize,
+    /// Minimum co-diagonal dense seeds proposing a terminal candidate.
+    pub term_min_seeds: usize,
+}
+
+impl RescueCfg {
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            min_pairs: 3,
+            min_arm: 150,
+            min_identity: 0.90,
+            max_window: 500,
+            max_candidates: 3,
+            end_only: true,
+            end_slack: 30,
+            terminal: false,
+            term_k: 13,
+            term_window: 1200,
+            term_min_seeds: 4,
+        }
+    }
+}
+
+impl Default for RescueCfg {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+/// Foldback-only gates.
+///
+/// These thresholds are applied during coarse detection before refinement.
+/// They capture basic geometric/evidence constraints for calling a foldback candidate.
 #[derive(Debug, Clone)]
 pub struct FoldOnlyCfg {
     /// Minimum span (bp) of “arm evidence” supporting the foldback on p1.
@@ -164,11 +257,16 @@ pub struct FoldOnlyCfg {
     /// This helps reject tiny, locally repetitive matches that don't represent a real
     /// foldback junction.
     pub min_arm: usize,
+    /// Alignment-verified rescue of candidates the gates above reject.
+    pub rescue: RescueCfg,
 }
 
 impl Default for FoldOnlyCfg {
     fn default() -> Self {
-        Self { min_arm: 200 }
+        Self {
+            min_arm: 200,
+            rescue: RescueCfg::disabled(),
+        }
     }
 }
 

@@ -83,6 +83,10 @@ pub struct FoldScratch {
     pub jk_tmp: Vec<(i32, u64)>,
     /// Output of `fingerprint::junction_keys` for the most recent call.
     pub jk_out: Vec<(u64, u64)>,
+    /// Terminal dense scan: forward k-mers of the window as `(code, pos)`.
+    pub term_fwd: Vec<(u32, u32)>,
+    /// Terminal dense scan: inverted seed pairs as `(p + q, p, q)`.
+    pub term_pairs: Vec<(i32, i32, i32)>,
 
     /// Scratch for refinement stage.
     pub refine: RefineScratch,
@@ -121,6 +125,8 @@ impl FoldScratch {
             best_trip: Vec::new(),
             jk_tmp: Vec::new(),
             jk_out: Vec::new(),
+            term_fwd: Vec::new(),
+            term_pairs: Vec::new(),
             refine: RefineScratch::default(),
             top_bins: Vec::new(),
             bin_to_idx: gxhash::HashMap::new(),
