@@ -1,0 +1,9 @@
+# gxhash needs AES + SSE2 and simd-minimizers needs AVX2; neither is in
+# rustc's default x86-64 baseline, so a plain `cargo build` fails without
+# these. They are named explicitly (rather than target-cpu=native) so a
+# binary built on one machine runs on any other x86-64 CPU with AVX2 and
+# AES-NI, e.g. the farm's compute nodes.
+#
+# Note: a RUSTFLAGS environment variable, if set, replaces these entirely.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+aes,+sse2,+avx2"]
