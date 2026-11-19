@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mdax::{
-    cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg},
+    cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg},
     pipeline::{self, TsvSink},
     utils::RefineMode,
 };
@@ -52,13 +52,7 @@ fn test_cfg(min_support: usize) -> MdaxCfg {
         fold2: FoldSecondPassCfg {
             min_support,
             min_identity: 0.50,
-            min_support_ident: 0.0,
             cut_low_ident: false,
-        },
-        sig: SigCfg {
-            flank_bp: 600,
-            take: 8,
-            value_shift: 0,
         },
     }
 }
@@ -165,6 +159,7 @@ fn revcomp(seq: &[u8]) -> Vec<u8> {
 
 /// Run the full two-pass pipeline on `input` using `cfg`.
 /// Returns `(detected, cut, real, fasta_records, tsv_rows)`.
+#[allow(clippy::type_complexity)]
 fn run_pipeline(
     input: &PathBuf,
     cfg: MdaxCfg,
@@ -536,13 +531,7 @@ fn real_data_cfg(min_support: usize) -> MdaxCfg {
         fold2: FoldSecondPassCfg {
             min_support,
             min_identity: 0.50,
-            min_support_ident: 0.0,
             cut_low_ident: false,
-        },
-        sig: SigCfg {
-            flank_bp: 600,
-            take: 8,
-            value_shift: 0,
         },
     }
 }
@@ -625,17 +614,16 @@ fn real_artefacts_detected_and_cut() {
         // BLAST-independent split.  blast_split==0 means "skip split check" for
         // reads with multiple valid junctions (non-deterministic coarse candidate).
         // low_ident reads have identity below threshold so we skip split check too.
-        if (decision == "artefact" || decision == "real") && blast_split > 0 {
-            if let Some(split_str) = row.get("refined_split") {
-                if let Ok(split) = split_str.parse::<usize>() {
-                    let diff = (split as isize - blast_split as isize).unsigned_abs();
-                    assert!(
-                        diff <= 100,
-                        "{label}: refined_split={split} vs BLAST split={blast_split} \
-                         (diff={diff} bp, tolerance ±100 bp)"
-                    );
-                }
-            }
+        if (decision == "artefact" || decision == "real") && blast_split > 0
+            && let Some(split_str) = row.get("refined_split")
+            && let Ok(split) = split_str.parse::<usize>()
+        {
+            let diff = (split as isize - blast_split as isize).unsigned_abs();
+            assert!(
+                diff <= 100,
+                "{label}: refined_split={split} vs BLAST split={blast_split} \
+                 (diff={diff} bp, tolerance ±100 bp)"
+            );
         }
     }
 }
@@ -699,13 +687,7 @@ fn large_gap_cfg(max_jump_clip: usize) -> MdaxCfg {
             // min_support = 2 with only one read → junction is never "real".
             min_support: 2,
             min_identity: 0.50,
-            min_support_ident: 0.0,
             cut_low_ident: false,
-        },
-        sig: SigCfg {
-            flank_bp: 600,
-            take: 8,
-            value_shift: 0,
         },
     }
 }

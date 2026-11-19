@@ -65,7 +65,7 @@ use std::{io::Write, path::PathBuf};
 use thread_local::ThreadLocal;
 
 use mdax::{
-    cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg},
+    cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg},
     foldback, io,
     scratch::FoldScratch,
     utils::RefineMode,
@@ -814,6 +814,7 @@ fn write_usize<W: Write>(w: &mut W, mut x: usize) -> std::io::Result<()> {
 
 /// FASTA writer that avoids any UTF-8 conversion and avoids `format!`.
 /// `seq` is written as raw bytes; line wrapping is done via slicing.
+#[allow(clippy::too_many_arguments)]
 fn write_fasta_record_bytes<W: Write>(
     w: &mut W,
     contig: &str,
@@ -1139,7 +1140,7 @@ fn write_gff3<W: Write>(
         let seqid = gff_escape(&chunk[0].contig);
 
         // Normalised arms, then IRs in genome order (ids follow this order).
-        let mut irs: Vec<(&ReportRow, (usize, usize, usize, usize))> = chunk
+        let mut irs: Vec<_> = chunk
             .iter()
             .map(|r| (r, normalize_arms(r.la0, r.la1, r.ra0, r.ra1)))
             .collect();
@@ -1435,13 +1436,7 @@ fn main() -> Result<()> {
         fold2: FoldSecondPassCfg {
             min_support: 0,
             min_identity: 0.0,
-            min_support_ident: 0.0,
             cut_low_ident: false,
-        },
-        sig: SigCfg {
-            flank_bp: 600,
-            take: 8,
-            value_shift: 0,
         },
     };
 
@@ -1701,13 +1696,12 @@ fn main() -> Result<()> {
 
                         // If we have real arm bounds, override the interval with a conservative one.
                         // This prevents huge “union inflation” when one arm is poorly bounded.
-                        if la1g > la0g && ra1g > ra0g {
-                            if let Some((s2, e2)) =
+                        if la1g > la0g && ra1g > ra0g
+                            && let Some((s2, e2)) =
                                 interval_from_arms_conservative(la0g, la1g, ra0g, ra1g, len)
-                            {
-                                start = s2;
-                                end = e2;
-                            }
+                        {
+                            start = s2;
+                            end = e2;
                         }
 
                         // Per-arm length gate, applied before dedup so a short-armed
@@ -1855,9 +1849,11 @@ fn main() -> Result<()> {
                 }));
             }
 
-            let mut st = Stats::default();
-            st.windows = n_wins as u64;
-            st.cands_total = cands.len() as u64;
+            let mut st = Stats {
+                windows: n_wins as u64,
+                cands_total: cands.len() as u64,
+                ..Default::default()
+            };
 
             if cands.is_empty() {
                 continue;
@@ -1953,6 +1949,8 @@ fn main() -> Result<()> {
                         revcomp_into(&mut rc_buf, right);
                         let tir = arm_identity(left, &rc_buf);
                         // Direct identity only for calls that will be kept.
+                        // `!(x >= t)` on purpose: a NaN identity counts as low.
+                        #[allow(clippy::neg_cmp_op_on_partial_ord)]
                         let dir = if min_tir_ident > 0.0 && !(tir >= min_tir_ident) {
                             f32::NAN
                         } else {
@@ -1964,6 +1962,7 @@ fn main() -> Result<()> {
                 let mut any_low = false;
                 for (i, tir, dir) in results {
                     ident[i] = Some((tir, dir));
+                    #[allow(clippy::neg_cmp_op_on_partial_ord)] // NaN counts as low
                     if min_tir_ident > 0.0 && !(tir >= min_tir_ident) {
                         low[i] = true;
                         any_low = true;
@@ -2155,30 +2154,31 @@ fn main() -> Result<()> {
                     Err(e) => return Err(e.into()),
                 }
 
-                if let Some(fw) = fasta_out.as_mut() {
-                    if c.start < c.end && c.end <= seq.len() {
-                        let ident_milli = (c.ident.clamp(0.0, 1.0) * 1000.0).round() as u16;
+                if let Some(fw) = fasta_out.as_mut()
+                    && c.start < c.end
+                    && c.end <= seq.len()
+                {
+                    let ident_milli = (c.ident.clamp(0.0, 1.0) * 1000.0).round() as u16;
 
-                        match write_fasta_record_bytes(
-                            fw,
-                            id,
-                            c.start,
-                            c.end,
-                            c.break_pos,
-                            ident_milli,
-                            tir_ident,
-                            c.matches,
-                            c.span,
-                            c.bin,
-                            c.class,
-                            c.spacer_bp,
-                            &seq[c.start..c.end],
-                            fasta_wrap,
-                        ) {
-                            Ok(_) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
-                            Err(e) => return Err(e.into()),
-                        }
+                    match write_fasta_record_bytes(
+                        fw,
+                        id,
+                        c.start,
+                        c.end,
+                        c.break_pos,
+                        ident_milli,
+                        tir_ident,
+                        c.matches,
+                        c.span,
+                        c.bin,
+                        c.class,
+                        c.spacer_bp,
+                        &seq[c.start..c.end],
+                        fasta_wrap,
+                    ) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                        Err(e) => return Err(e.into()),
                     }
                 }
 

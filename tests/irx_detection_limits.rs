@@ -49,7 +49,7 @@ impl Builder {
         self.seq.extend(d);
     }
     fn gap(&mut self, n: usize) {
-        self.seq.extend(std::iter::repeat(b'N').take(n));
+        self.seq.extend(std::iter::repeat_n(b'N', n));
     }
     /// Left arm, then `spacer` (closure appends it), then revcomp(left arm).
     fn ir(&mut self, arm: usize, spacer: impl FnOnce(&mut Self)) {

@@ -8,8 +8,7 @@ use crate::utils::RefineMode;
 /// - `shared`: parameters used by *both* coarse detection and refinement steps
 /// - `fold`: foldback-specific detection gates
 /// - `fold2`: second-pass support-aware decision thresholds
-/// - `sig`: signature/fingerprint parameters used to key junction support
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MdaxCfg {
     /// Parameters shared across detection modes (minimizers, guards, refinement).
     pub shared: SharedCfg,
@@ -17,19 +16,6 @@ pub struct MdaxCfg {
     pub fold: FoldOnlyCfg,
     /// Second-pass decision thresholds for “real vs artefact” foldbacks.
     pub fold2: FoldSecondPassCfg,
-    /// Signature configuration used for support map keys.
-    pub sig: SigCfg,
-}
-
-impl Default for MdaxCfg {
-    fn default() -> Self {
-        Self {
-            shared: SharedCfg::default(),
-            fold: FoldOnlyCfg::default(),
-            fold2: FoldSecondPassCfg::default(),
-            sig: SigCfg::default(),
-        }
-    }
 }
 
 /// Minimizer sampling configuration.
@@ -277,27 +263,27 @@ impl Default for FoldOnlyCfg {
 /// - an artefact (e.g. MDA-induced; safe to cut/correct).
 #[derive(Debug, Clone)]
 pub struct FoldSecondPassCfg {
-    /// Minimum number of reads supporting the same junction fingerprint for “real”.
+    /// Minimum number of reads folding about the same axis for “real”.
     ///
-    /// If a signature reaches this support threshold, the default behavior is to
-    /// treat it as *real* and therefore **do not** cut/correct (unless overridden).
+    /// If a junction reaches this support threshold (see
+    /// `fingerprint::JunctionSupport`), it is treated as *real* and therefore
+    /// **not** cut/corrected.
     pub min_support: usize,
 
     /// Minimum refinement identity estimate required to accept as a foldback candidate.
     ///
-    /// This is applied in pass2 before computing/looking up signatures, to avoid
-    /// spending work on low-confidence calls.
+    /// Applied in pass2 before the support lookup; what happens to reads below
+    /// it is governed by `cut_low_ident`.
     pub min_identity: f32,
 
-    /// Minimum support identity estimate required to accept as a foldback candidate.
-    pub min_support_ident: f64,
-
     /// When true, reads detected with a foldback whose arm identity is below
-    /// `min_identity` are still cut at the estimated split position rather than
-    /// labelled `low_ident` and passed through.
+    /// `min_identity` still go through the support gate and are cut if
+    /// unsupported, rather than labelled `low_ident` and passed through.
+    /// Set from the CLI as `!--keep-low-ident` (the legacy `--cut-low-ident`
+    /// flag is a no-op).
     ///
-    /// Useful for ONT data where the HiFi Hamming estimator used in pass1/signature
-    /// coherence systematically underestimates arm similarity on indel-rich reads.
+    /// Useful for ONT data where the HiFi Hamming estimator systematically
+    /// underestimates arm similarity on indel-rich reads.
     pub cut_low_ident: bool,
 }
 
@@ -306,7 +292,6 @@ impl Default for FoldSecondPassCfg {
         Self {
             min_support: 3,
             min_identity: 0.60,
-            min_support_ident: 0.0,
             cut_low_ident: false,
         }
     }
@@ -317,28 +302,23 @@ impl Default for FoldSecondPassCfg {
 /// These map to tuned thresholds that trade off:
 /// - sensitivity (how many events you call / cut)
 /// - specificity (false positive rate)
-/// - computational cost (depth, signature params)
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// - computational cost (recursion depth)
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum CallMode {
     /// Conservative: fewer calls/cuts, higher confidence.
     Strict,
     /// Middle-ground default: practical sensitivity/specificity trade-off.
+    #[default]
     Balanced,
     /// Aggressive: more calls/cuts; good for exploratory runs.
     Permissive,
-}
-
-impl Default for CallMode {
-    fn default() -> Self {
-        CallMode::Balanced
-    }
 }
 
 /// Concrete parameter bundle derived from a `CallMode`.
 ///
 /// This is convenient for CLI exposure: the user chooses a qualitative mode,
 /// and you apply a consistent set of thresholds across detection, refinement,
-/// recursion, and signature generation.
+/// and recursion.
 #[derive(Debug, Clone)]
 pub struct ModeTuning {
     /// Minimum evidence span threshold (bp).
@@ -351,17 +331,8 @@ pub struct ModeTuning {
     pub min_identity: f32,
     /// Support threshold for calling a foldback “real”.
     pub min_support: usize,
-    /// Required tightness of split clustering (bp) for “real”.
-    #[allow(dead_code)]
-    pub split_tol_bp: usize,
     /// Maximum recursion depth for iterative cutting of nested artefacts.
     pub max_depth: usize,
-    /// Signature flank size (bp) used around the split.
-    pub sig_flank_bp: usize,
-    /// Number of minimizers (or minimizer-derived values) retained per side in signature.
-    pub sig_take: usize,
-    /// Optional value shifting/quantization to stabilize signatures.
-    pub sig_value_shift: u8,
     /// Do not call foldbacks whose split lies within this distance of a read end (bp).
     pub end_guard: usize,
 }
@@ -372,7 +343,6 @@ impl CallMode {
     /// The intent is that these presets are internally coherent:
     /// - stricter modes demand more evidence and reduce recursion
     /// - permissive modes allow weaker evidence and increase recursion
-    /// - signature params scale with strictness (bigger flanks/more takes when stricter)
     pub fn tuning(self) -> ModeTuning {
         match self {
             // strict: fewer calls, fewer cuts, higher confidence
@@ -381,11 +351,7 @@ impl CallMode {
                 min_span: 3000,
                 min_identity: 0.75,
                 min_support: 5,
-                split_tol_bp: 30,
                 max_depth: 2,
-                sig_flank_bp: 800,
-                sig_take: 10,
-                sig_value_shift: 0,
                 end_guard: 1000,
             },
             // balanced: your current-ish defaults
@@ -407,34 +373,7 @@ impl CallMode {
                 min_span: 1000,
                 min_identity: 0.60,
                 min_support: 3,
-                split_tol_bp: 50,
                 max_depth: 5,
-                sig_flank_bp: 600,
-                // REVERTED to 8 (2026-11-02) after sig_take=3 (tried
-                // 2026-10-30, see git history) turned out unsafe on real
-                // repeat-rich genomes. take=3's weaker 2-minimizer leave-
-                // one-out bands looked like a clean win on synth_bench's
-                // run_main (a low-repeat-content *synthetic* genome):
-                // hard-case FPR 4.4% -> 0.0%, recall unchanged. But a spot
-                // check against microlaimidae (balanced mode, max_cluster_n
-                // 18->22) wasn't enough to catch the real risk, because
-                // microlaimidae isn't especially repeat-dense. On an actual
-                // repeat-rich genome -- C. elegans, nrCaeEleg94 -- take=3
-                // plus the union-find merge fix produced a cluster of 9766
-                // reads and left 75.0% of all detected foldback reads
-                // classified "real" (i.e. not corrected). Reverting take to
-                // 8 alone only brought that down to 277,590 real clusters
-                // from 285,737 (barely moved) -- min_support=3 was *also*
-                // too permissive once the signature got weaker, and needed
-                // raising to 8 alongside this revert to actually fix it
-                // (425,350 reads classified real = 12.2%, down from 75.0%).
-                // See test_single_nematode/README.md for the full
-                // investigation. Lesson: validate a signature-specificity
-                // change against a genuinely repeat-rich real genome, not
-                // just a low-repeat synthetic one, before trusting it.
-                // Strict mode's take=10 was not swept; left as-is.
-                sig_take: 8,
-                sig_value_shift: 0, // not sure this should be > 0
                 end_guard: 500,
             },
             // permissive: more calls/cuts (good for exploration)
@@ -443,22 +382,7 @@ impl CallMode {
                 min_span: 1200,
                 min_identity: 0.50,
                 min_support: 2,
-                split_tol_bp: 100,
                 max_depth: 8,
-                // 200 was the original value and is the documented cause of a
-                // signature-collision blowup on microlaimidae (max_cluster_n
-                // 407-454 vs. 70-130 on three other species; see
-                // test_single_nematode/README.md). 400 was swept 200-800bp on
-                // all 4 species with real data on disk and is strictly better
-                // than 200 on every one (microlaimidae 63->31, epsilonema
-                // 45->24, linhomoeus 8->6, trileptium 9->5, all on a matched
-                // 200k-read subsample). Note the relationship is NOT
-                // monotonic -- 800bp regresses microlaimidae back to 456,
-                // presumably by pulling in a second, more distant repeat
-                // family -- so don't push this further without re-sweeping.
-                sig_flank_bp: 400,
-                sig_take: 6,
-                sig_value_shift: 8,
                 end_guard: 1000,
             },
         }
@@ -540,33 +464,6 @@ impl FairnessParams {
             // guards (LOCKED)
             end_guard: 1000,
             fold_diag_tol: 120,
-        }
-    }
-}
-
-/// Signature configuration.
-///
-/// Signatures are compact fingerprints used as keys into the pass1 support map.
-/// They are designed to be:
-/// - stable across small breakpoint jitter (as much as possible)
-/// - fast to compute
-/// - specific enough to cluster the same junction across reads
-#[derive(Debug, Clone)]
-pub struct SigCfg {
-    /// Half-flank length (bp) taken on either side of the split when building a signature.
-    pub flank_bp: usize,
-    /// How many minimizer-derived values are retained in the signature (per side).
-    pub take: usize,
-    /// Optional shift/quantization applied to signature values for stability.
-    pub value_shift: u8,
-}
-
-impl Default for SigCfg {
-    fn default() -> Self {
-        Self {
-            flank_bp: 1000,
-            take: 12,
-            value_shift: 0, // default is exact (no quantization)
         }
     }
 }
