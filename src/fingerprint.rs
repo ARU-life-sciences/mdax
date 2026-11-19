@@ -467,18 +467,44 @@ impl JunctionSupport {
         self.counts.is_empty()
     }
 
-    /// Mean number of *other* reads sharing a junction's axis by chance,
-    /// estimated from the fraction of junctions nobody else shares
-    /// (`P(0 others) = exp(-lambda)` for uniformly scattered junctions).
-    /// Genome-encoded repeats inflate this slightly, which errs towards
-    /// cutting.
-    pub fn chance_lambda(&self) -> f64 {
+    /// Below this singleton share, calibration is skipped (see
+    /// [`Self::adaptive_min_support`]).
+    pub const ARTEFACT_DOMINATED: f64 = 0.5;
+
+    /// Share of keyed foldbacks whose axis no other read shares.
+    ///
+    /// The deciding statistic for whether calibration applies at all. In an
+    /// amplified library most detected foldbacks are artefacts with unique
+    /// axes (0.82-0.83 on two C. elegans WGA HiFi libraries). In a library
+    /// with few artefacts, most detected foldbacks are genome-encoded
+    /// inverted repeats, each shared by roughly the local coverage
+    /// (0.02-0.06 on three non-WGA C. elegans libraries).
+    pub fn singleton_frac(&self) -> f64 {
         let keyed: u64 = self.n_hist.iter().skip(1).sum();
         if keyed == 0 {
+            return 1.0;
+        }
+        self.n_hist[1] as f64 / keyed as f64
+    }
+
+    /// Mean number of *other* reads sharing a junction's axis by chance.
+    ///
+    /// For uniformly scattered artefact junctions the count of others
+    /// sharing an axis is Poisson, so `P(1 other) / P(0 others) = lambda`,
+    /// i.e. `h(2) / h(1)` in the per-read support histogram. This uses only
+    /// the bottom two bins, where artefacts dominate; genome-encoded
+    /// repeats sit at coverage-level support and barely touch them.
+    ///
+    /// (An earlier estimator, `-ln(h(1) / keyed)`, read every shared axis as
+    /// chance: fine for amplified libraries, but on a library whose foldbacks
+    /// are mostly genuine repeats it returned lambda ~3-4 and pushed the
+    /// threshold to 47-60, cutting the repeats it exists to protect.)
+    pub fn chance_lambda(&self) -> f64 {
+        let h1 = self.n_hist.get(1).copied().unwrap_or(0);
+        if h1 == 0 {
             return 0.0;
         }
-        let alone = self.n_hist[1].max(1) as f64;
-        -(alone / keyed as f64).ln()
+        self.n_hist.get(2).copied().unwrap_or(0) as f64 / h1 as f64
     }
 
     /// Smallest support threshold `t >= floor` at which fewer than `alpha`
@@ -490,6 +516,13 @@ impl JunctionSupport {
     /// junction density, so the bar for "this recurs because it is in the
     /// genome" has to grow with it. This only ever raises the threshold.
     pub fn adaptive_min_support(&self, floor: usize, alpha: f64) -> usize {
+        // Chance co-location needs dense artefacts. When most detected
+        // foldbacks already share their axis with other reads, the library
+        // is dominated by genome-encoded repeats, chance sharing is
+        // negligible, and raising the bar would only cut real repeats.
+        if self.singleton_frac() < Self::ARTEFACT_DOMINATED {
+            return floor.max(2);
+        }
         let lambda = self.chance_lambda();
         let mut t = floor.max(2);
         loop {
@@ -532,6 +565,13 @@ impl JunctionSupport {
         }
         let (h0, h1, h2) = (h(t), h(t + 1), h(t + 2));
         if h0 + h1 < MIN_COUNT {
+            return t;
+        }
+        // Only a decaying histogram is a chance tail. Flat or rising counts
+        // just above the Poisson threshold are genuine repeats at their
+        // coverage level, and extrapolating through them would walk the
+        // threshold out past them.
+        if !(h0 > h1 && h1 > h2) {
             return t;
         }
         let r = ((h1 + h2) as f64 / (h0 + h1) as f64).clamp(0.0, 0.9);
@@ -1088,8 +1128,8 @@ mod tests {
         assert_eq!(with_hist(9990, 10).adaptive_min_support(3, 0.01), 3);
         // ~15% share by chance (lambda ~0.16) -> one step up.
         assert_eq!(with_hist(8500, 1500).adaptive_min_support(3, 0.01), 4);
-        // Saturated library (lambda ~1) -> well above the floor.
-        assert!(with_hist(3700, 6300).adaptive_min_support(3, 0.01) >= 6);
+        // Dense artefacts (lambda 0.6) -> well above the floor.
+        assert_eq!(with_hist(6000, 3600).adaptive_min_support(3, 0.01), 5);
         // Never below the floor.
         assert_eq!(with_hist(10000, 0).adaptive_min_support(5, 0.01), 5);
 
@@ -1105,6 +1145,27 @@ mod tests {
         }
         let t = heavy.adaptive_min_support(3, 0.01);
         assert!((6..=12).contains(&t), "heavy tail should push the threshold out, got {t}");
+
+        // A library with few artefacts: most detected foldbacks are genuine
+        // repeats shared by ~coverage reads (shape of nrCaeEleg34, a non-WGA
+        // C. elegans library). Calibration must leave the floor alone.
+        let mut genuine = with_hist(555, 470);
+        for n in 3..10 {
+            genuine.n_hist[n] = 420;
+        }
+        for n in 10..30 {
+            genuine.n_hist[n] = 260;
+        }
+        assert!(genuine.singleton_frac() < JunctionSupport::ARTEFACT_DOMINATED);
+        assert_eq!(genuine.adaptive_min_support(3, 0.01), 3);
+
+        // Flat counts just above the Poisson threshold are not a chance
+        // tail: no extrapolation through them.
+        let mut flat = with_hist(80_000, 9_000);
+        for n in 3..40 {
+            flat.n_hist[n] = 300;
+        }
+        assert_eq!(flat.adaptive_min_support(3, 0.01), 3);
     }
 
     #[test]
