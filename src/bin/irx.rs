@@ -1431,7 +1431,7 @@ fn main() -> Result<()> {
         },
         // Coarse gate only: mdax's bin span is the IR footprint (arm + spacer + arm),
         // which is >= one arm. The per-arm check happens after arm bounds are derived.
-        fold: FoldOnlyCfg { min_arm },
+        fold: FoldOnlyCfg { min_arm, ..Default::default() },
         fold2: FoldSecondPassCfg {
             min_support: 0,
             min_identity: 0.0,
@@ -1840,6 +1840,7 @@ fn main() -> Result<()> {
             if large_window_len > 0 && len > large_min_footprint {
                 let large_fold = FoldOnlyCfg {
                     min_arm: large_min_footprint.max(cfg.fold.min_arm),
+                    ..Default::default()
                 };
                 let large_wins: Vec<(usize, usize)> =
                     windows(len, large_window_len, large_step).collect();

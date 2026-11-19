@@ -469,17 +469,16 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                         // Refine once for main call, optionally once more for stable sig coordinates.
                         // When mode is already HiFi, shared_fast == cfg.shared so we skip the
                         // second call and reuse the first result directly.
-                        let refined_call = foldback::refine_breakpoint(
+                        let refined_call = foldback::refine_detected(
                             &job.seq,
-                            fb.split_pos,
+                            &fb,
                             &cfg.shared,
                             &mut fold_scratch.refine,
-                            fb.span,
-                            fb.arm_end,
-                            fb.arm_start_right,
                         )?;
 
-                        let refined_sig = if cfg.shared.refine.mode == RefineMode::HiFi {
+                        let refined_sig = if cfg.shared.refine.mode == RefineMode::HiFi
+                            || fb.verified.is_some()
+                        {
                             refined_call.clone()
                         } else {
                             foldback::refine_breakpoint(

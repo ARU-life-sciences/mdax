@@ -172,6 +172,57 @@ pub struct FoldBreakpoint {
     /// Derived from the leftmost right-arm minimizer position.
     /// Zero if unavailable.
     pub arm_start_right: usize,
+    /// Set only for candidates found by the alignment-verified rescue path
+    /// (see [`crate::cfg::RescueCfg`]). Such a candidate already carries a
+    /// base-level arm alignment, so it must not go through
+    /// `refine_breakpoint` (which needs far more flanking sequence than a
+    /// short or near-end foldback has); use [`refine_detected`] instead.
+    pub verified: Option<Verified>,
+}
+
+/// Outcome of the rescue path's arm alignment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Verified {
+    /// Identity of the aligned arm window (1 - edit distance / window).
+    pub identity: f32,
+    /// Unpaired sequence between the two arms (bp); 0 for a clean hairpin.
+    pub gap: usize,
+    /// Length of the arm window that was aligned (bp).
+    pub arm: usize,
+}
+
+impl Verified {
+    fn as_refined(&self, split_pos: usize) -> Refined {
+        Refined {
+            split_pos,
+            score: (self.arm as f32 * (2.0 * self.identity - 1.0)) as i64,
+            identity_est: self.identity,
+            gap_est: self.gap,
+        }
+    }
+}
+
+/// Refine a detected foldback, whichever path found it: rescue candidates
+/// reuse the alignment that verified them, everything else goes through
+/// [`refine_breakpoint`] exactly as before.
+pub fn refine_detected(
+    seq: &[u8],
+    fb: &FoldBreakpoint,
+    cfg: &SharedCfg,
+    refine_scratch: &mut RefineScratch,
+) -> Result<Option<Refined>> {
+    match fb.verified {
+        Some(v) => Ok(Some(v.as_refined(fb.split_pos))),
+        None => refine_breakpoint(
+            seq,
+            fb.split_pos,
+            cfg,
+            refine_scratch,
+            fb.span,
+            fb.arm_end,
+            fb.arm_start_right,
+        ),
+    }
 }
 
 /// Refine a coarse foldback breakpoint into a more precise split position.
@@ -599,6 +650,526 @@ pub fn detect_foldback(
     fold: &FoldOnlyCfg,
     scratch: &mut FoldScratch,
 ) -> Option<FoldBreakpoint> {
+    // Anything the evidence gates accept behaves exactly as it always has;
+    // the rescue path only ever sees reads the gates turned away.
+    if let Some(fb) = detect_foldback_gated(seq, shared, fold, scratch) {
+        return Some(fb);
+    }
+    if fold.rescue.enabled {
+        return rescue_foldback(seq, shared, fold, scratch);
+    }
+    None
+}
+
+/// Rescue path: propose candidates from very little seed evidence, then
+/// confirm each by aligning one arm against the reverse complement of the
+/// other. See [`crate::cfg::RescueCfg`] for the rationale.
+///
+/// Relies on the matching state `detect_foldback_gated` left in `scratch`
+/// (`stats`, `idx_f`, `repetitive`, `pos_rc`, `val_rc`) for this same `seq`.
+fn rescue_foldback(
+    seq: &[u8],
+    shared: &SharedCfg,
+    fold: &FoldOnlyCfg,
+    scratch: &mut FoldScratch,
+) -> Option<FoldBreakpoint> {
+    if let Some(fb) = rescue_seeded(seq, shared, fold, scratch) {
+        return Some(fb);
+    }
+    if fold.rescue.terminal {
+        return rescue_terminal(seq, shared, fold, scratch);
+    }
+    None
+}
+
+/// Longest read-end arm the end-anchored rescue paths accept.
+///
+/// The evidence gates refuse any junction within `end_guard` of a read end,
+/// however much evidence it has, so the rescue paths have to reach at least
+/// that far in or foldbacks with arms between the two limits fall through
+/// both (on ONT, with `end_guard` 1000, that gap held half of all foldbacks
+/// with 500-1000 bp arms).
+#[inline]
+fn max_tail(shared: &SharedCfg, rc: &crate::cfg::RescueCfg) -> usize {
+    let base = rc.max_window.max(shared.end_guard);
+    base + base / 10
+}
+
+/// Length of a read-end arm to actually align: all of it bar the outermost
+/// `end_slack` bases, unless that would leave less than `min_arm`.
+#[inline]
+fn trim_end_slack(tail: usize, rc: &crate::cfg::RescueCfg) -> usize {
+    if tail >= rc.min_arm + rc.end_slack {
+        tail - rc.end_slack
+    } else {
+        tail
+    }
+}
+
+/// 2-bit code of a base, or `None` for anything that is not ACGT.
+#[inline]
+fn base2(b: u8) -> Option<u32> {
+    match b {
+        b'A' | b'a' => Some(0),
+        b'C' | b'c' => Some(1),
+        b'G' | b'g' => Some(2),
+        b'T' | b't' => Some(3),
+        _ => None,
+    }
+}
+
+/// A terminal candidate in window-local coordinates.
+struct TermHit {
+    arm_end: usize,
+    arm_start: usize,
+    tail: usize,
+    identity: f32,
+    seeds: usize,
+    /// `p + q + ks` of the anchoring seed pair: twice the fold axis.
+    axis2: i32,
+}
+
+/// Dense-seed scan of one read end. `win` is the first or last
+/// `term_window` bp of the read; `at_right_end` says which.
+fn terminal_candidate(
+    win: &[u8],
+    at_right_end: bool,
+    shared: &SharedCfg,
+    rc: &crate::cfg::RescueCfg,
+    scratch: &mut FoldScratch,
+) -> Option<TermHit> {
+    let ks = rc.term_k.clamp(6, 15);
+    let len = win.len();
+    if len < 2 * rc.min_arm + ks {
+        return None;
+    }
+    let mask: u32 = (1u32 << (2 * ks)) - 1;
+    let shift = 2 * (ks as u32 - 1);
+
+    // Forward k-mers, sorted by code.
+    scratch.term_fwd.clear();
+    let (mut code, mut valid) = (0u32, 0usize);
+    for (i, &b) in win.iter().enumerate() {
+        match base2(b) {
+            Some(x) => {
+                code = ((code << 2) | x) & mask;
+                valid += 1;
+            }
+            None => valid = 0,
+        }
+        if valid >= ks {
+            scratch.term_fwd.push((code, (i + 1 - ks) as u32));
+        }
+    }
+    scratch.term_fwd.sort_unstable();
+
+    // For every position q, look up the reverse complement of its k-mer:
+    // a hit at p means win[q..q+ks] is the inverted copy of win[p..p+ks].
+    const MAX_OCC: usize = 4;
+    scratch.term_pairs.clear();
+    let (mut rcode, mut valid) = (0u32, 0usize);
+    for (i, &b) in win.iter().enumerate() {
+        match base2(b) {
+            Some(x) => {
+                rcode = (rcode >> 2) | ((3 - x) << shift);
+                valid += 1;
+            }
+            None => valid = 0,
+        }
+        if valid < ks {
+            continue;
+        }
+        let q = (i + 1 - ks) as i32;
+        let lo = scratch.term_fwd.partition_point(|&(c, _)| c < rcode);
+        let mut hi = lo;
+        while hi < scratch.term_fwd.len() && scratch.term_fwd[hi].0 == rcode {
+            hi += 1;
+        }
+        // k-mers frequent within the window are low-complexity / tandem
+        // sequence, which pairs with itself on every anti-diagonal.
+        if hi == lo || hi - lo > MAX_OCC {
+            continue;
+        }
+        for j in lo..hi {
+            let p = scratch.term_fwd[j].1 as i32;
+            if p + ks as i32 <= q {
+                scratch.term_pairs.push((p + q, p, q));
+            }
+        }
+    }
+    if scratch.term_pairs.len() < rc.term_min_seeds {
+        return None;
+    }
+    scratch.term_pairs.sort_unstable();
+
+    // Densest run of anti-diagonals within the drift tolerance.
+    let d_w: i32 = match shared.refine.mode {
+        RefineMode::HiFi => 8,
+        RefineMode::ONT => 40,
+    };
+    let pairs = &scratch.term_pairs;
+    let (mut best_i, mut best_j) = (0usize, 0usize);
+    let mut j = 0usize;
+    for i in 0..pairs.len() {
+        if j < i {
+            j = i;
+        }
+        while j < pairs.len() && pairs[j].0 - pairs[i].0 <= d_w {
+            j += 1;
+        }
+        if j - i > best_j - best_i {
+            best_i = i;
+            best_j = j;
+        }
+    }
+    let run = &pairs[best_i..best_j];
+    if run.len() < rc.term_min_seeds {
+        return None;
+    }
+    // Seeds must come from distinct places on the arm, not one spot hit
+    // repeatedly.
+    let (mut p_lo, mut p_hi) = (i32::MAX, i32::MIN);
+    for &(_, p, _) in run {
+        p_lo = p_lo.min(p);
+        p_hi = p_hi.max(p);
+    }
+    if ((p_hi - p_lo) as usize) < rc.term_min_seeds * 4 {
+        return None;
+    }
+    // Innermost seed anchors the alignment.
+    let &(_, ap, aq) = run.iter().max_by_key(|&&(_, p, _)| p)?;
+    let arm_end = ap as usize + ks;
+    let arm_start = aq as usize;
+
+    // The inverted copy must run to the read end, and be short enough that
+    // the evidence gates could not have been expected to see it.
+    let tail = if at_right_end { len - arm_start } else { arm_end };
+    if tail < rc.min_arm || tail > max_tail(shared, rc) {
+        return None;
+    }
+    let other = if at_right_end { arm_end } else { len - arm_start };
+    if other < tail {
+        return None;
+    }
+    // Align from the junction outwards, stopping `end_slack` short of the
+    // read end.
+    let aln = trim_end_slack(tail, rc);
+    let left = &win[arm_end - aln..arm_end];
+    let right = &win[arm_start..arm_start + aln];
+    revcomp_into(&mut scratch.refine.right_rc, right);
+    let band = ((1.0 - rc.min_identity).max(0.0) * aln as f32).ceil() as usize + 1;
+    let ed = edit_distance_myers(left, &scratch.refine.right_rc, band);
+    if ed > band {
+        return None;
+    }
+    let identity = 1.0 - ed as f32 / aln as f32;
+    if identity < rc.min_identity {
+        return None;
+    }
+    Some(TermHit {
+        arm_end,
+        arm_start,
+        tail,
+        identity,
+        seeds: run.len(),
+        axis2: ap + aq + ks as i32,
+    })
+}
+
+/// Terminal rescue: dense-seed scan of both read ends. See
+/// [`crate::cfg::RescueCfg::terminal`].
+fn rescue_terminal(
+    seq: &[u8],
+    shared: &SharedCfg,
+    fold: &FoldOnlyCfg,
+    scratch: &mut FoldScratch,
+) -> Option<FoldBreakpoint> {
+    let rc = &fold.rescue;
+    let n = seq.len();
+    // Both arms of the longest tail we accept, plus room for a spacer.
+    let t = rc.term_window.max(2 * max_tail(shared, rc) + 200).min(n);
+    let mut best: Option<(f32, usize, TermHit)> = None;
+    // (window start, is this the right-hand end?)
+    let ends: [(usize, bool); 2] = [(n - t, true), (0, false)];
+    for &(start, at_right_end) in ends.iter() {
+        let win = &seq[start..start + t];
+        if let Some(hit) = terminal_candidate(win, at_right_end, shared, rc, scratch) {
+            let score = hit.tail as f32 * hit.identity;
+            if best.as_ref().map_or(true, |(bs, _, _)| score > *bs) {
+                best = Some((score, start, hit));
+            }
+        }
+    }
+    let (_, start, hit) = best?;
+    let arm_end = start + hit.arm_end;
+    let arm_start = start + hit.arm_start;
+    let gap = arm_start - arm_end;
+
+    // Hand the support gate whatever minimizer matchpoints lie on this
+    // fold's anti-diagonal (there may be too few for a key; then the
+    // junction is simply unsupported).
+    let k = shared.minimizer.k as i32;
+    let target = 2 * start as i32 + hit.axis2 - k;
+    let d_tol: i32 = match shared.refine.mode {
+        RefineMode::HiFi => 8,
+        RefineMode::ONT => 40,
+    };
+    collect_diag_points(n, shared, scratch, target, d_tol);
+
+    Some(FoldBreakpoint {
+        split_pos: (arm_end + arm_start) / 2,
+        score: (2 * hit.tail + gap) as i64 + hit.seeds as i64 * 10,
+        matches: hit.seeds,
+        span: 2 * hit.tail + gap,
+        arm_end,
+        arm_start_right: arm_start,
+        verified: Some(Verified {
+            identity: hit.identity,
+            gap,
+            arm: hit.tail,
+        }),
+    })
+}
+
+/// Like `collect_bin_points`, but selects matchpoints by distance from a
+/// target anti-diagonal rather than by bin. Leaves the buffers empty if the
+/// read never reached the matching stage.
+fn collect_diag_points(
+    seq_len: usize,
+    shared: &SharedCfg,
+    scratch: &mut FoldScratch,
+    target: i32,
+    d_tol: i32,
+) {
+    scratch.best_pts.clear();
+    scratch.best_matches.clear();
+    scratch.best_trip.clear();
+    if scratch.stats.is_empty() {
+        return;
+    }
+    let n = seq_len as i32;
+    let k_i32 = shared.minimizer.k as i32;
+    for (&prc, &vrc) in scratch.pos_rc.iter().zip(scratch.val_rc.iter()) {
+        if scratch.repetitive.contains_key(&vrc) {
+            continue;
+        }
+        let Some(p1s) = scratch.idx_f.get(&vrc) else {
+            continue;
+        };
+        let p2 = n - k_i32 - (prc as i32);
+        for &p1 in p1s {
+            if (p1 + p2 - target).abs() <= d_tol {
+                scratch.best_pts.push((p1, p2));
+                scratch.best_matches.push((p1 as usize, vrc));
+                scratch.best_trip.push((p1, p2, vrc));
+            }
+        }
+    }
+}
+
+/// Minimizer-seeded rescue: candidates are anti-diagonal bins the gates
+/// rejected.
+fn rescue_seeded(
+    seq: &[u8],
+    shared: &SharedCfg,
+    fold: &FoldOnlyCfg,
+    scratch: &mut FoldScratch,
+) -> Option<FoldBreakpoint> {
+    let rc = &fold.rescue;
+    if scratch.stats.is_empty() {
+        return None;
+    }
+    let k = shared.minimizer.k as i32;
+    let n = seq.len() as i32;
+    let tol = shared.fold_diag_tol.max(1);
+
+    // Candidate anti-diagonals: every matched pair contributes two mirrored
+    // points, so `min_pairs` pairs means 2 * min_pairs points in the bin.
+    scratch.top_bins.clear();
+    for (&bin, st) in scratch.stats.iter() {
+        if st.count() >= 2 * rc.min_pairs {
+            scratch.top_bins.push((bin, st.count() as i64, st.count(), st.span()));
+        }
+    }
+    if scratch.top_bins.is_empty() {
+        return None;
+    }
+    scratch
+        .top_bins
+        .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scratch.top_bins.truncate(rc.max_candidates.max(1));
+
+    // How far a point's anti-diagonal may sit from the candidate's median
+    // and still count as the same fold: near-exact for accurate reads,
+    // looser where indels make it drift along the arm.
+    let d_tol: i32 = match shared.refine.mode {
+        RefineMode::HiFi => 8,
+        RefineMode::ONT => 40,
+    };
+
+    let mut best: Option<(f32, i32, FoldBreakpoint)> = None;
+    let n_cand = scratch.top_bins.len();
+    for ci in 0..n_cand {
+        let bin = scratch.top_bins[ci].0;
+        collect_bin_points(seq.len(), shared, scratch, bin, tol);
+
+        // Left-arm copy first, right-arm copy second.
+        scratch.jk_tmp.clear();
+        for &(p1, p2, _) in scratch.best_trip.iter() {
+            if p1 < p2 {
+                scratch.jk_tmp.push((p1 + p2, 0));
+            }
+        }
+        if scratch.jk_tmp.len() < rc.min_pairs {
+            continue;
+        }
+        scratch.jk_tmp.sort_unstable();
+        let d_med = scratch.jk_tmp[scratch.jk_tmp.len() / 2].0;
+
+        // Points consistent with one fold axis; innermost one anchors the
+        // alignment, outermost one bounds the seeded arm.
+        let mut inner: Option<(i32, i32)> = None;
+        let mut p1_min = i32::MAX;
+        let mut p2_max = i32::MIN;
+        scratch.jk_tmp.clear();
+        for &(p1, p2, v) in scratch.best_trip.iter() {
+            if p1 < p2 && (p1 + p2 - d_med).abs() <= d_tol {
+                scratch.jk_tmp.push((0, v));
+                // The anchor must be a pair of two separate copies. In a
+                // clean hairpin a k-mer straddling the axis also matches
+                // its own (overlapping) reverse complement; that is real
+                // evidence of the fold but cannot anchor an arm alignment.
+                if p1 + k <= p2 && inner.map_or(true, |(ip1, _)| p1 > ip1) {
+                    inner = Some((p1, p2));
+                }
+                p1_min = p1_min.min(p1);
+                p2_max = p2_max.max(p2);
+            }
+        }
+        let n_pairs = scratch.jk_tmp.len();
+        // Distinct minimizer values, not just distinct positions: a short
+        // tandem repeat matches itself on many anti-diagonals with one or
+        // two values over and over, and is not evidence of a fold.
+        scratch.jk_tmp.sort_unstable();
+        scratch.jk_tmp.dedup();
+        let n_distinct = scratch.jk_tmp.len();
+        if n_distinct < rc.min_pairs || n_distinct * 2 < n_pairs {
+            continue;
+        }
+        let Some((ip1, ip2)) = inner else { continue };
+
+        let arm_end = ip1 + k; // exclusive end of the left arm
+        let arm_start = ip2; // inclusive start of the right arm
+        if arm_start < arm_end {
+            // the two copies overlap across the axis: a k-mer that is its
+            // own reverse complement, not a pair of arms
+            continue;
+        }
+        let seeded = arm_end - p1_min;
+        let avail = arm_end.min(n - arm_start);
+        let win = if rc.end_only {
+            // The shorter arm must be cut off by a read end, and all of it
+            // has to align: `avail` is exactly that arm's length.
+            if avail > max_tail(shared, rc) as i32 {
+                continue;
+            }
+            trim_end_slack(avail as usize, rc) as i32
+        } else {
+            (rc.max_window as i32)
+                .min(avail)
+                .min(seeded.max(rc.min_arm as i32))
+        };
+        if win < rc.min_arm as i32 {
+            continue;
+        }
+        let win_u = win as usize;
+        let left = &seq[(arm_end - win) as usize..arm_end as usize];
+        let right = &seq[arm_start as usize..(arm_start + win) as usize];
+        revcomp_into(&mut scratch.refine.right_rc, right);
+        let band = ((1.0 - rc.min_identity).max(0.0) * win_u as f32).ceil() as usize + 1;
+        let ed = edit_distance_myers(left, &scratch.refine.right_rc, band);
+        if ed > band {
+            continue;
+        }
+        let identity = 1.0 - ed as f32 / win_u as f32;
+        if identity < rc.min_identity {
+            continue;
+        }
+
+        let score = win_u as f32 * identity;
+        if best.as_ref().map_or(true, |(bs, _, _)| score > *bs) {
+            let span = (p2_max + k - p1_min).max(0) as usize;
+            best = Some((
+                score,
+                bin,
+                FoldBreakpoint {
+                    split_pos: ((arm_end + arm_start) / 2) as usize,
+                    score: span as i64 + (n_pairs as i64 * 20),
+                    matches: n_pairs * 2,
+                    span,
+                    arm_end: arm_end as usize,
+                    arm_start_right: arm_start as usize,
+                    verified: Some(Verified {
+                        identity,
+                        gap: (arm_start - arm_end) as usize,
+                        arm: win_u,
+                    }),
+                },
+            ));
+        }
+    }
+
+    let (_, bin, fb) = best?;
+    // Leave scratch describing the accepted candidate, as the gated path
+    // does, so junction keys / signatures are computed from the right bin.
+    collect_bin_points(seq.len(), shared, scratch, bin, tol);
+    Some(fb)
+}
+
+/// Fill `best_pts` / `best_matches` / `best_trip` with the matchpoints of
+/// one anti-diagonal bin, from the matching state left by
+/// `detect_foldback_gated`.
+fn collect_bin_points(
+    seq_len: usize,
+    shared: &SharedCfg,
+    scratch: &mut FoldScratch,
+    want_bin: i32,
+    tol: i32,
+) {
+    let n = seq_len as i32;
+    let k_i32 = shared.minimizer.k as i32;
+    scratch.best_pts.clear();
+    scratch.best_matches.clear();
+    scratch.best_trip.clear();
+    for (&prc, &vrc) in scratch.pos_rc.iter().zip(scratch.val_rc.iter()) {
+        if scratch.repetitive.contains_key(&vrc) {
+            continue;
+        }
+        let Some(p1s) = scratch.idx_f.get(&vrc) else {
+            continue;
+        };
+        let p2 = n - k_i32 - (prc as i32);
+        for &p1 in p1s {
+            if div_floor(p1 + p2, tol) == want_bin {
+                scratch.best_pts.push((p1, p2));
+                scratch.best_matches.push((p1 as usize, vrc));
+                scratch.best_trip.push((p1, p2, vrc));
+            }
+        }
+    }
+}
+
+/// The evidence-gated coarse detector (the historical `detect_foldback`).
+fn detect_foldback_gated(
+    seq: &[u8],
+    shared: &SharedCfg,
+    fold: &FoldOnlyCfg,
+    scratch: &mut FoldScratch,
+) -> Option<FoldBreakpoint> {
+    // Cleared up front (not just before use) so that an early return below
+    // can never leave a previous read's bins for the rescue path to find.
+    scratch.stats.clear();
+
     let k = shared.minimizer.k;
     let w = shared.minimizer.w;
 
@@ -1060,6 +1631,7 @@ fn fold_breakpoint_from_pts(
         span,
         arm_end,
         arm_start_right,
+        verified: None,
     })
 }
 
@@ -1252,7 +1824,7 @@ mod tests {
                 },
                 fold_diag_tol: diag_tol,
             },
-            FoldOnlyCfg { min_arm },
+            FoldOnlyCfg { min_arm, ..Default::default() },
         )
     }
 
@@ -1602,7 +2174,7 @@ mod tests {
                 },
                 fold_diag_tol: 120,
             },
-            fold: FoldOnlyCfg { min_arm: 200 },
+            fold: FoldOnlyCfg { min_arm: 200, ..Default::default() },
             fold2: FoldSecondPassCfg {
                 min_support: 3,
                 min_identity: 0.6,
@@ -1767,5 +2339,306 @@ mod tests {
             "expected the nested artefact to also be cut, kept_len={kept_len} of {} (keep={:?})",
             seq.len(), keep,
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Alignment-verified rescue path
+    // ---------------------------------------------------------------------
+
+    /// Production-like balanced HiFi gates (k=17, w=21, 12 matches, 1000 bp
+    /// footprint, 500 bp end guard), with the rescue path on or off.
+    fn cfg_rescue(enabled: bool) -> MdaxCfg {
+        MdaxCfg {
+            shared: SharedCfg {
+                minimizer: MinimizerCfg { k: 17, w: 21, forward_only: true },
+                min_matches: 12,
+                end_guard: 500,
+                refine: RefineCfg {
+                    window: 200,
+                    arm: 1200,
+                    mode: RefineMode::HiFi,
+                    max_ed_rate: 0.25,
+                    max_jump_clip: 1000,
+                },
+                fold_diag_tol: 120,
+            },
+            fold: FoldOnlyCfg {
+                min_arm: 1000,
+                rescue: crate::cfg::RescueCfg {
+                    enabled,
+                    ..crate::cfg::RescueCfg::disabled()
+                },
+            },
+            fold2: FoldSecondPassCfg {
+                min_support: 3,
+                min_identity: 0.6,
+                min_support_ident: 0.0,
+                cut_low_ident: true,
+            },
+            sig: SigCfg { flank_bp: 600, take: 8, value_shift: 0 },
+        }
+    }
+
+    /// `body` followed by the reverse complement of its last `arm` bases,
+    /// optionally after `spacer` unrelated bases: a foldback whose junction
+    /// sits `arm` bp from the read end.
+    fn tail_foldback(body_len: usize, arm: usize, spacer: usize, seed: u64) -> (Vec<u8>, usize) {
+        let mut seq = random_dna(body_len, seed);
+        let mut tail = seq[body_len - arm..].to_vec();
+        revcomp_in_place(&mut tail);
+        seq.extend(random_dna(spacer, seed ^ 0x5EED));
+        seq.extend(tail);
+        (seq, body_len)
+    }
+
+    #[test]
+    fn rescue_finds_short_tail_foldback_the_gates_reject() {
+        let (seq, junction) = tail_foldback(4000, 300, 0, 0xFACE01);
+
+        let off = cfg_rescue(false);
+        let mut scratch = scratch::FoldScratch::new();
+        assert!(
+            detect_foldback(&seq, &off.shared, &off.fold, &mut scratch).is_none(),
+            "a 300 bp arm 300 bp from the read end is below every coarse gate"
+        );
+
+        let on = cfg_rescue(true);
+        let fb = detect_foldback(&seq, &on.shared, &on.fold, &mut scratch)
+            .expect("rescue path should find the tail foldback");
+        let v = fb.verified.expect("rescued candidates carry their alignment");
+        assert!(v.identity > 0.99, "clean copy should align perfectly, got {}", v.identity);
+        assert!(v.arm >= on.fold.rescue.min_arm);
+        assert!(
+            (fb.split_pos as i64 - junction as i64).abs() <= 40,
+            "split {} should sit at the junction {}",
+            fb.split_pos,
+            junction
+        );
+
+        // The support gate must be able to protect a genuine short repeat,
+        // which needs junction keys from the accepted candidate's bin.
+        let mut tmp = Vec::new();
+        let mut keys = Vec::new();
+        crate::fingerprint::junction_keys(&scratch.best_trip, 32, &mut tmp, &mut keys);
+        assert!(
+            keys.len() >= crate::fingerprint::JUNCTION_MIN_ELEMS,
+            "rescued candidate should yield junction keys, got {}",
+            keys.len()
+        );
+    }
+
+    #[test]
+    fn rescue_handles_spacer_between_arms() {
+        let (seq, junction) = tail_foldback(4000, 400, 120, 0xFACE02);
+        let on = cfg_rescue(true);
+        let mut scratch = scratch::FoldScratch::new();
+        let fb = detect_foldback(&seq, &on.shared, &on.fold, &mut scratch)
+            .expect("rescue path should find a tail foldback with a spacer");
+        let v = fb.verified.unwrap();
+        assert!(v.identity > 0.99);
+        assert!(
+            (v.gap as i64 - 120).abs() <= 80,
+            "gap {} should be close to the 120 bp spacer",
+            v.gap
+        );
+        assert!(fb.arm_end <= junction + 20 && fb.arm_start_right + 20 >= junction + 120 - 60);
+    }
+
+    #[test]
+    fn rescue_cut_drops_only_the_short_tail() {
+        let (seq, junction) = tail_foldback(4000, 300, 0, 0xFACE03);
+        let cfg = cfg_rescue(true);
+        let mut scratch = scratch::FoldScratch::new();
+        let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch).unwrap();
+        let rf = refine_detected(&seq, &fb, &cfg.shared, &mut scratch.refine)
+            .unwrap()
+            .expect("rescued candidates always refine");
+        let support = JunctionSupport::empty();
+        let mut sig_scratch = SigScratch::default();
+        let keep = recursive_foldback_cut_from_first_range(
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+        )
+        .unwrap();
+        assert_eq!(keep.start, 0);
+        assert!(
+            (keep.end as i64 - junction as i64).abs() <= 40,
+            "expected the read trimmed at the junction ({junction}), got {keep:?}"
+        );
+    }
+
+    #[test]
+    fn rescue_leaves_gated_detections_untouched() {
+        let (seq, _) = tail_foldback(6000, 2500, 0, 0xFACE04);
+        let mut scratch = scratch::FoldScratch::new();
+        let off = cfg_rescue(false);
+        let a = detect_foldback(&seq, &off.shared, &off.fold, &mut scratch).expect("gated hit");
+        let on = cfg_rescue(true);
+        let b = detect_foldback(&seq, &on.shared, &on.fold, &mut scratch).expect("gated hit");
+        assert!(b.verified.is_none(), "a candidate the gates accept must not be rescued");
+        assert_eq!((a.split_pos, a.matches, a.span), (b.split_pos, b.matches, b.span));
+    }
+
+    #[test]
+    fn rescue_rejects_reads_without_a_fold() {
+        let on = cfg_rescue(true);
+        let mut scratch = scratch::FoldScratch::new();
+
+        let plain = random_dna(8000, 0xFACE05);
+        assert!(detect_foldback(&plain, &on.shared, &on.fold, &mut scratch).is_none());
+
+        // A dinucleotide repeat is its own reverse complement about every
+        // position: plenty of anti-diagonal matches, but one or two
+        // minimizer values repeated, which is not evidence of a fold.
+        let mut micro = random_dna(3000, 0xFACE06);
+        micro.extend(repeat_bytes(b"AT", 300));
+        micro.extend(random_dna(3000, 0xFACE07));
+        assert!(
+            detect_foldback(&micro, &on.shared, &on.fold, &mut scratch).is_none(),
+            "a microsatellite must not be rescued as a foldback"
+        );
+
+        // Stale-state guard: a read too short to be matched at all must not
+        // inherit the previous read's bins.
+        let (fold, _) = tail_foldback(4000, 300, 0, 0xFACE08);
+        assert!(detect_foldback(&fold, &on.shared, &on.fold, &mut scratch).is_some());
+        assert!(detect_foldback(&plain[..30], &on.shared, &on.fold, &mut scratch).is_none());
+    }
+
+    #[test]
+    fn rescue_requires_the_arms_to_actually_align() {
+        // Same seeds would be proposed either way; what differs is whether
+        // the bases between them agree.
+        let on = cfg_rescue(true);
+        let mut scratch = scratch::FoldScratch::new();
+
+        let body = random_dna(4000, 0xFACE09);
+        let arm = &body[3600..];
+        let mut light = mutate_substitutions(arm, 25); // 4% divergence
+        revcomp_in_place(&mut light);
+        let mut seq = body.clone();
+        seq.extend(light);
+        assert!(
+            detect_foldback(&seq, &on.shared, &on.fold, &mut scratch).is_some(),
+            "a 96%-identical 400 bp arm should verify at the 90% threshold"
+        );
+
+        // Arm shorter than the minimum verified length: seeds exist, but
+        // the alignment window runs into unrelated sequence.
+        let mut seq = body.clone();
+        let mut stub = body[3920..].to_vec(); // 80 bp
+        revcomp_in_place(&mut stub);
+        seq.extend(stub);
+        assert!(
+            detect_foldback(&seq, &on.shared, &on.fold, &mut scratch).is_none(),
+            "an 80 bp arm is below rescue.min_arm (150) and must not be called"
+        );
+    }
+
+    /// Terminal dense scan only: the minimizer-seeded rescue is switched off
+    /// by an unreachable `min_pairs`, so these tests exercise one path.
+    fn cfg_terminal_only(mode: RefineMode) -> MdaxCfg {
+        let mut cfg = cfg_rescue(true);
+        cfg.shared.refine.mode = mode;
+        cfg.fold.rescue.min_pairs = 1_000_000;
+        cfg.fold.rescue.terminal = true;
+        if mode == RefineMode::ONT {
+            cfg.shared.minimizer = MinimizerCfg { k: 11, w: 11, forward_only: true };
+            cfg.fold.rescue.term_k = 9;
+            cfg.fold.rescue.term_min_seeds = 5;
+            cfg.fold.rescue.min_identity = 0.75;
+            cfg.fold.rescue.min_arm = 200;
+        }
+        cfg
+    }
+
+    #[test]
+    fn terminal_scan_finds_noisy_tail_foldback() {
+        // ~9% divergence between the arms, substitutions and indels both:
+        // the regime where sampled 11-mers rarely survive in both copies.
+        let body = random_dna(5000, 0x7E2A01);
+        let arm = &body[4650..];
+        let noisy = inject_deletions(&inject_insertions(&mutate_substitutions(arm, 23), 41, b'G'), 37);
+        let mut tail = noisy;
+        revcomp_in_place(&mut tail);
+        let mut seq = body.clone();
+        seq.extend(tail);
+
+        let cfg = cfg_terminal_only(RefineMode::ONT);
+        let mut scratch = scratch::FoldScratch::new();
+        let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch)
+            .expect("terminal scan should find a noisy 350 bp tail foldback");
+        let v = fb.verified.expect("terminal candidates are verified");
+        assert!(v.identity >= 0.75 && v.identity < 0.99, "identity {}", v.identity);
+        assert!(
+            (fb.split_pos as i64 - 5000).abs() <= 60,
+            "split {} should sit at the junction (5000)",
+            fb.split_pos
+        );
+
+        // and the same read from the other strand is a *head* foldback
+        let mut rev = seq.clone();
+        revcomp_in_place(&mut rev);
+        let fb = detect_foldback(&rev, &cfg.shared, &cfg.fold, &mut scratch)
+            .expect("terminal scan should find the same foldback at the read start");
+        let junction = rev.len() - 5000;
+        assert!(
+            (fb.split_pos as i64 - junction as i64).abs() <= 60,
+            "split {} should sit at the junction ({junction})",
+            fb.split_pos
+        );
+    }
+
+    #[test]
+    fn terminal_scan_requires_the_copy_to_reach_the_read_end() {
+        let cfg = cfg_terminal_only(RefineMode::HiFi);
+        let mut scratch = scratch::FoldScratch::new();
+
+        let (mut seq, _) = tail_foldback(4000, 300, 0, 0x7E2A02);
+        assert!(
+            detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch).is_some(),
+            "a clean 300 bp tail foldback reaches the read end and must be found"
+        );
+
+        // The same inverted copy followed by 400 bp of unrelated sequence is
+        // a small hairpin that happens to sit near the end, not a strand
+        // switch that ran off the fragment.
+        seq.extend(random_dna(400, 0x7E2A03));
+        assert!(
+            detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch).is_none(),
+            "an inverted copy that stops short of the read end must not be called by the terminal scan"
+        );
+
+        let plain = random_dna(6000, 0x7E2A04);
+        assert!(detect_foldback(&plain, &cfg.shared, &cfg.fold, &mut scratch).is_none());
+
+        let mut micro = random_dna(5000, 0x7E2A05);
+        micro.extend(repeat_bytes(b"AT", 250));
+        assert!(
+            detect_foldback(&micro, &cfg.shared, &cfg.fold, &mut scratch).is_none(),
+            "a read ending in a dinucleotide repeat is not a tail foldback"
+        );
+    }
+
+    #[test]
+    fn rescue_end_only_ignores_short_hairpins_inside_a_read() {
+        // A 300 bp inverted copy followed by 2 kb of unrelated sequence: a
+        // short hairpin in the middle of a read, which on real data is as
+        // often a genome-encoded repeat as an artefact.
+        let (mut seq, junction) = tail_foldback(4000, 300, 0, 0xE0D001);
+        seq.extend(random_dna(2000, 0xE0D002));
+
+        let mut scratch = scratch::FoldScratch::new();
+        let end_only = cfg_rescue(true);
+        assert!(end_only.fold.rescue.end_only, "end_only is the default");
+        assert!(
+            detect_foldback(&seq, &end_only.shared, &end_only.fold, &mut scratch).is_none(),
+            "a mid-read short hairpin must not be rescued when end_only is set"
+        );
+
+        let mut anywhere = cfg_rescue(true);
+        anywhere.fold.rescue.end_only = false;
+        let fb = detect_foldback(&seq, &anywhere.shared, &anywhere.fold, &mut scratch)
+            .expect("with end_only off the same hairpin is rescued");
+        assert!((fb.split_pos as i64 - junction as i64).abs() <= 40);
     }
 }

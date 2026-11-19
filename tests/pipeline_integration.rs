@@ -48,7 +48,7 @@ fn test_cfg(min_support: usize) -> MdaxCfg {
             },
             fold_diag_tol: 120,
         },
-        fold: FoldOnlyCfg { min_arm: 1200 },
+        fold: FoldOnlyCfg { min_arm: 1200, ..Default::default() },
         fold2: FoldSecondPassCfg {
             min_support,
             min_identity: 0.50,
@@ -532,7 +532,7 @@ fn real_data_cfg(min_support: usize) -> MdaxCfg {
             },
             fold_diag_tol: 120,
         },
-        fold: FoldOnlyCfg { min_arm: 1200 },
+        fold: FoldOnlyCfg { min_arm: 1200, ..Default::default() },
         fold2: FoldSecondPassCfg {
             min_support,
             min_identity: 0.50,
@@ -694,7 +694,7 @@ fn large_gap_cfg(max_jump_clip: usize) -> MdaxCfg {
             fold_diag_tol: 120,
         },
         // min_arm 1000 < 1500 (actual arm) so the foldback is detectable.
-        fold: FoldOnlyCfg { min_arm: 1000 },
+        fold: FoldOnlyCfg { min_arm: 1000, ..Default::default() },
         fold2: FoldSecondPassCfg {
             // min_support = 2 with only one read → junction is never "real".
             min_support: 2,
