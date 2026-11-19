@@ -79,7 +79,7 @@ fn main() -> Result<()> {
     let mut k = *args.get_one::<usize>("k").expect("defaulted k of 17");
     let mut w = *args.get_one::<usize>("w").expect("defaulted w of 21");
     // w must be odd, so error out here if it's not
-    if w % 2 == 0 {
+    if w.is_multiple_of(2) {
         anyhow::bail!("Window size `w` must be odd, got {}", w);
     }
     let mut forward_only = *args.get_one::<bool>("forward_only").unwrap();
@@ -297,7 +297,7 @@ fn main() -> Result<()> {
     let cfg_arc = Arc::new(cfg.clone());
 
     // PASS 1
-    let (support, total_reads) = pipeline::pass1_build_support(&fasta, cfg_arc.clone(), threads, chan_cap)?;
+    let (support, total_reads) = pipeline::pass1_build_support(fasta, cfg_arc.clone(), threads, chan_cap)?;
     // Per-read junction support: how many reads (including itself) fold
     // about the same axis as each detected foldback.
     elog!(
@@ -397,7 +397,7 @@ fn main() -> Result<()> {
     }
 
     let (foldback_reads, cut_reads, real_reads) = pipeline::pass2_correct_and_write(
-        &fasta,
+        fasta,
         cfg_arc_pass2,
         support_arc.clone(),
         max_depth,

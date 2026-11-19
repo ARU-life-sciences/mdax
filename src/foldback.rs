@@ -390,7 +390,7 @@ pub fn refine_breakpoint_hamming(
     let (identity_est, final_gap_est) = if use_hint {
         // Direct arm placement: compare the innermost `id_window` bp of each arm.
         // Clamp to available sequence so neither window overruns the slice.
-        let id_window = arm.min(span_hint).min(ID_WINDOW_CAP).max(1);
+        let id_window = arm.min(span_hint).clamp(1, ID_WINDOW_CAP);
         let avail_left  = arm_end.min(id_window);
         let avail_right = seq.len().saturating_sub(arm_start_right).min(id_window);
         let actual = avail_left.min(avail_right).max(1);
@@ -460,7 +460,7 @@ pub fn refine_breakpoint_hamming(
         // Final identity: Myers' bit-parallel ED on capped window (≤ID_WINDOW_CAP bp).
         // Window is always ≤512 bp, within the 8-word bitvector limit.
         let eff_arm = arm - best_delta;
-        let id_window = eff_arm.min(span_hint).min(ID_WINDOW_CAP).max(1);
+        let id_window = eff_arm.min(span_hint).clamp(1, ID_WINDOW_CAP);
         let id_left  = &seq[best_s - best_delta - id_window .. best_s - best_delta];
         let id_right = &seq[best_s + best_delta .. best_s + best_delta + id_window];
         scratch.right_rc.clear();
@@ -894,7 +894,7 @@ fn rescue_terminal(
         let win = &seq[start..start + t];
         if let Some(hit) = terminal_candidate(win, at_right_end, shared, rc, scratch) {
             let score = hit.tail as f32 * hit.identity;
-            if best.as_ref().map_or(true, |(bs, _, _)| score > *bs) {
+            if best.as_ref().is_none_or(|(bs, _, _)| score > *bs) {
                 best = Some((score, start, hit));
             }
         }
@@ -1036,7 +1036,7 @@ fn rescue_seeded(
                 // clean hairpin a k-mer straddling the axis also matches
                 // its own (overlapping) reverse complement; that is real
                 // evidence of the fold but cannot anchor an arm alignment.
-                if p1 + k <= p2 && inner.map_or(true, |(ip1, _)| p1 > ip1) {
+                if p1 + k <= p2 && inner.is_none_or(|(ip1, _)| p1 > ip1) {
                     inner = Some((p1, p2));
                 }
                 p1_min = p1_min.min(p1);
@@ -1094,7 +1094,7 @@ fn rescue_seeded(
         }
 
         let score = win_u as f32 * identity;
-        if best.as_ref().map_or(true, |(bs, _, _)| score > *bs) {
+        if best.as_ref().is_none_or(|(bs, _, _)| score > *bs) {
             let span = (p2_max + k - p1_min).max(0) as usize;
             best = Some((
                 score,
@@ -1522,7 +1522,7 @@ pub fn detect_foldbacks_topk(
 /// The split position is estimated as:
 ///     split ~= median(p1 + p2) / 2
 fn fold_breakpoint_from_pts(
-    pts: &mut Vec<(i32, i32)>,
+    pts: &mut [(i32, i32)],
     shared: &SharedCfg,
     fold: &FoldOnlyCfg,
     len: usize,
@@ -1648,16 +1648,15 @@ pub fn cut_boundaries(
     let lo = split.saturating_sub(half);
     let hi = (split + half).min(len);
     let policy = cut_spacer_policy();
-    if policy == CutSpacer::Resolve {
-        if let Some((m, side)) = crate::spacer::resolve(seq, trips, k) {
-            if (m.a + m.b).abs_diff(2 * split) <= 200 {
-                return match side {
-                    crate::spacer::SpacerSide::Left => (m.b, m.b),
-                    crate::spacer::SpacerSide::Right => (m.a, m.a),
-                    crate::spacer::SpacerSide::Unknown => (m.a, m.b),
-                };
-            }
-        }
+    if policy == CutSpacer::Resolve
+        && let Some((m, side)) = crate::spacer::resolve(seq, trips, k)
+        && (m.a + m.b).abs_diff(2 * split) <= 200
+    {
+        return match side {
+            crate::spacer::SpacerSide::Left => (m.b, m.b),
+            crate::spacer::SpacerSide::Right => (m.a, m.a),
+            crate::spacer::SpacerSide::Unknown => (m.a, m.b),
+        };
     }
     match policy {
         CutSpacer::Keep => (hi, lo),
@@ -1764,6 +1763,7 @@ fn chain_boundaries(split: usize, arm_end: usize, arm_start: usize, len: usize) 
 /// - All subsequent detections operate in view-local coordinates.
 /// - `scratch.best_trip` is assumed to correspond to the most recent
 ///   `detect_foldback` call.
+#[allow(clippy::too_many_arguments)]
 pub fn recursive_foldback_cut_from_first_range(
     seq: &[u8],               // original full sequence
     mut keep: Range<usize>,   // current keep window into `seq`
@@ -1917,6 +1917,7 @@ mod tests {
         cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg},
         scratch,
     };
+    #[allow(clippy::too_many_arguments)]
     fn test_fold_cfg(
         k: usize,
         w: usize,

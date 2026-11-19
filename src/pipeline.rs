@@ -2,6 +2,7 @@
 //! We implement a two step pipeline:
 //!  1) pass1: build support map from input reads (parallel)
 //!  2) pass2: correct reads using support map (parallel), write output FASTA + TSV
+//!
 //! Note: output is unordered, which is much faster
 
 use anyhow::Result;
@@ -145,6 +146,9 @@ struct OutRec {
     tsv_row: Option<String>,
 }
 
+/// One read's junction keys (see `fingerprint::junction_keys`).
+type ReadKeys = Vec<(u64, u64)>;
+
 /// Pass 1 (parallel): scan the input once and count, for every detected
 /// foldback, how many reads fold about the same axis (see
 /// `fingerprint::JunctionSupport`).
@@ -202,7 +206,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
         let rx = rx.clone();
 
         worker_handles.push(thread::spawn(
-            move || -> Result<(Vec<Vec<(u64, u64)>>, u64)> {
+            move || -> Result<(Vec<ReadKeys>, u64)> {
                 // One junction-key set per read with a detected foldback.
                 let mut groups: Vec<Vec<(u64, u64)>> = Vec::new();
                 let tol = axis_tol(&cfg);
@@ -291,6 +295,7 @@ pub fn pass1_build_support<P: AsRef<Path>>(
 }
 
 /// Pass 2 (parallel): detect foldbacks, decide whether they're "real", and (optionally) correct reads.
+#[allow(clippy::too_many_arguments)]
 pub fn pass2_correct_and_write<P: AsRef<Path>>(
     input: P,
     cfg: Arc<MdaxCfg>,

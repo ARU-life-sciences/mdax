@@ -266,11 +266,11 @@ pub fn build_evidence<P: AsRef<Path> + Clone>(
                     if foldback::detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut sc).is_none() {
                         continue;
                     }
-                    if let Some(m) = mirror(&seq, &sc.best_trip, k) {
-                        if let Some((a, b)) = boundary_kmers(&seq, m) {
-                            out.push(a);
-                            out.push(b);
-                        }
+                    if let Some(m) = mirror(&seq, &sc.best_trip, k)
+                        && let Some((a, b)) = boundary_kmers(&seq, m)
+                    {
+                        out.push(a);
+                        out.push(b);
                     }
                 }
             }

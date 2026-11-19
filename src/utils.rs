@@ -90,8 +90,8 @@ pub fn banded_edit_distance_scratch(
     // Initialize row 0: distance from empty prefix of `a` to prefix of `b`.
     // Outside the band: clamp to `inf` so it never wins.
     prev[0] = 0;
-    for j in 1..=m {
-        prev[j] = if j <= band { j } else { inf };
+    for (j, p) in prev.iter_mut().enumerate().skip(1) {
+        *p = if j <= band { j } else { inf };
     }
 
     // Fill curr once before the loop.  Inside the loop we maintain the invariant
@@ -175,7 +175,7 @@ pub fn edit_distance_myers(a: &[u8], b: &[u8], band: usize) -> usize {
     if n == 0 { return m.min(band + 1); }
     if m == 0 { return n.min(band + 1); }
 
-    let words = (n + 63) / 64;
+    let words = n.div_ceil(64);
 
     // Precompute PM: flat Vec indexed as pm[c * words + k] = word k of the
     // match bitvector for pattern char c.  Only the 256 ASCII byte values
@@ -374,6 +374,7 @@ mod tests {
     use super::*;
 
     // A tiny reference Levenshtein for small strings (no banding, no scratch).
+    #[allow(clippy::needless_range_loop)]
     fn levenshtein(a: &[u8], b: &[u8]) -> usize {
         let n = a.len();
         let m = b.len();

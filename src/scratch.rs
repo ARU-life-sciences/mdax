@@ -122,6 +122,12 @@ impl FoldScratch {
     }
 }
 
+impl Default for FoldScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Scratch space for breakpoint refinement.
 ///
 /// Holds:
