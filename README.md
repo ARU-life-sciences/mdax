@@ -35,7 +35,7 @@ Default outputs are the fasta file of corrected reads, and a table of all detect
 | PacBio HiFi / CCS | `mdax --mode balanced --refine-mode hifi -o out.fa -r out.tsv in.fa` |
 | ONT | `mdax --mode permissive --refine-mode ont -o out.fa -r out.tsv in.fa` |
 
-A detected foldback is cut unless enough other reads fold about the *same axis* (see [Algorithm overview](#algorithm-overview)); that applies to foldbacks with a low identity estimate too, which are cut by default (`--keep-low-ident` passes them through instead; the old `--cut-low-ident` flag is still accepted and does nothing). For ONT, `--refine-mode ont` automatically switches to smaller k-mers (k=11, w=11) for better sensitivity on error-prone reads, unless you set `-k`/`-w` explicitly — the effective values are echoed in the parameter summary printed at startup.
+A detected foldback is cut unless enough other reads fold about the *same axis* (see [Algorithm overview](#algorithm-overview)); that applies to foldbacks with a low identity estimate too, which are cut by default (`--keep-low-ident` passes them through instead; the old `--cut-low-ident` flag is still accepted and does nothing, as are the retired locus-signature flags `--sig-flank-bp`, `--sig-take` and `--sig-value-shift`; mdax prints a note when one is given). For ONT, `--refine-mode ont` automatically switches to smaller k-mers (k=11, w=11) for better sensitivity on error-prone reads, unless you set `-k`/`-w` explicitly — the effective values are echoed in the parameter summary printed at startup.
 
 **On `--min-support`:** leave it alone unless you have a reason. The number of unrelated artefacts that share a fold axis purely by chance grows with library depth, so after pass 1 mdax estimates that chance rate from the data and raises the threshold to match (never below the mode default) — check stderr for a `SUPPORT CALIBRATION` line to see what it picked (e.g. 3 → 8 on a ~140x library, 3 → 15 on a ~1500x one). An explicit `--min-support` disables this and applies one value whatever the depth.
 
@@ -111,10 +111,11 @@ Options:
           - refined_score: Score assigned after breakpoint refinement.
           - identity_est: Estimated nucleotide identity between the two foldback arms.
           - gap_est: Estimated template-switch gap size (bp) between the two arms; 0 for clean hairpin folds.
-          - support_n: Number of other reads supporting the same foldback junction.
-          - support_rank_frac: Relative prominence of this junction within the dataset, computed by ranking all junctions by support_n (descending) and normalising the rank to [0,1]. Values near 1 indicate highly recurrent junctions; values near 0 indicate rare/singleton events.
-          - support_span: Total supporting span (bp) aggregated across supporting reads.
-          - decision: Final classification based on thresholds (real, artefact, unknown, low_ident).
+          - support_n: Number of reads (including this one) folding about the same axis; compared against min_support.
+          - support_rank_frac: DEPRECATED, always 0. Kept so column positions do not change.
+          - support_span: Number of junction-key elements this foldback had (0 if it had too few to be keyed).
+          - decision: Final classification (real, artefact, low_ident).
+          - sig_band: First junction key of this foldback, as hex (NA if it was not keyed). For grouping rows only.
           
           Use '-' to write to stdout
           
@@ -371,8 +372,7 @@ Options:
           - canonical may increase the number of matchpoints (more hits), which can increase calls.
           - forward-only can be more conservative and may reduce false positives.
           
-          Note: we use canonical minimizers for *signatures* even if forward-only for detection;
-          this flag applies to the detector’s minimizer sampling.
+          Note: this flag applies to the detector’s minimizer sampling.
           
           [default: true]
           [possible values: true, false]
@@ -403,7 +403,7 @@ Options:
           High-level preset controlling detection and correction strictness.
           
           This sets a coherent bundle of thresholds (min_matches, min_span, min_identity, min_support,
-          max_depth, and signature parameters).
+          max_depth, end_guard).
           
           - strict: fewer calls and fewer cuts. Requires strong evidence and high identity.
           Best when you want to avoid over-trimming.
@@ -420,6 +420,29 @@ Options:
           - permissive: More calls/cuts; lower thresholds; exploratory
           
           [default: balanced]
+
+      --no-rescue
+          By default, when a read's foldback evidence is too thin for the coarse gates (--min-matches, --min-span, --end-guard), mdax still considers any anti-diagonal with a few matched minimizer pairs, and accepts it only if the two arms then align base-for-base (--rescue-min-arm bp at --rescue-min-identity or better). This is what finds foldbacks with short arms or a junction close to a read end. With this flag only the coarse gates are used.
+
+      --rescue-anywhere
+          By default the rescue path only accepts a candidate whose shorter arm runs to a read end. With this flag, verified candidates anywhere in the read are accepted. On reference-scored WGA HiFi data the mid-read candidates were as often genuine short inverted repeats as artefacts, so this is off by default.
+
+      --rescue-terminal <rescue_terminal>
+          Whether the rescue path also matches the first and last ~1.2 kb of each read against its own reverse complement using every k-mer (--rescue-term-k) rather than sampled minimizers, accepting a candidate only if the inverted copy runs all the way to the read end and aligns. Off by default: on reference-scored HiFi and ONT WGA data the minimizer-seeded rescue already proposed nearly every candidate this finds, and the few extra calls were false nearly as often as true.
+          
+          [possible values: on, off]
+
+      --rescue-term-k <rescue_term_k>
+          Rescue path: seed length for the read-end scan [default: 13 hifi, 9 ont]
+
+      --rescue-min-arm <rescue_min_arm>
+          Rescue path: minimum verified arm length (bp) [default: 150 hifi, 200 ont]
+
+      --rescue-min-identity <rescue_min_identity>
+          Rescue path: minimum identity of the verified arm alignment [default: 0.90 hifi, 0.65 ont]
+
+      --rescue-min-pairs <rescue_min_pairs>
+          Rescue path: minimum matched minimizer pairs proposing a candidate [default: 3]
 
       --keep-low-ident
           By default a detected foldback whose estimated arm identity falls below --min-identity is still cut, unless enough other reads fold about the same axis (the same support gate every other foldback goes through). With this flag such reads are passed through unchanged and labelled low_ident.
