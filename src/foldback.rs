@@ -1831,15 +1831,11 @@ pub fn recursive_foldback_cut_from_first_range(
                 rf
             }
             None => {
-                match refine_breakpoint(
-                    view,
-                    fb.split_pos,
-                    &cfg.shared,
-                    &mut scratch.refine,
-                    fb.span,
-                    fb.arm_end,
-                    fb.arm_start_right,
-                )? {
+                // `refine_detected`, not `refine_breakpoint`: a foldback
+                // found by the rescue path on the shortened view is short
+                // and sits at the view's end, which `refine_breakpoint`
+                // cannot refine (it needs `arm + window` bp on both sides).
+                match refine_detected(view, &fb, &cfg.shared, &mut scratch.refine)? {
                     Some(rf) => rf,
                     None => break,
                 }
@@ -2666,6 +2662,38 @@ mod tests {
         assert!(
             (keep.end as i64 - junction as i64).abs() <= 40,
             "expected the read trimmed at the junction ({junction}), got {keep:?}"
+        );
+    }
+
+    /// A short tail foldback that only becomes a read-end foldback once an
+    /// outer artefact has been cut away must be cut on the next recursion.
+    #[test]
+    fn rescued_foldback_nested_inside_a_cut_read_is_recut() {
+        // inner: 3700 bp body + RC of its last 300 bp (junction at 3700)
+        let (inner, inner_junction) = tail_foldback(3700, 300, 0, 0xFACE08);
+        // outer: inner + RC of inner[1500..] (junction at 4000, long arm)
+        let mut seq = inner.clone();
+        let mut tail = inner[1500..].to_vec();
+        revcomp_in_place(&mut tail);
+        seq.extend(tail);
+
+        let cfg = cfg_rescue(true);
+        let mut scratch = scratch::FoldScratch::new();
+        let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch).expect("outer fold");
+        assert!(fb.verified.is_none(), "the outer fold is a gated detection");
+        let rf = refine_detected(&seq, &fb, &cfg.shared, &mut scratch.refine)
+            .unwrap()
+            .expect("refine");
+        let support = JunctionSupport::empty();
+        let mut sig_scratch = SigScratch::default();
+        let keep = recursive_foldback_cut_from_first_range(
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+        )
+        .unwrap();
+        assert_eq!(keep.start, 0);
+        assert!(
+            (keep.end as i64 - inner_junction as i64).abs() <= 40,
+            "expected both folds cut, ending at the inner junction {inner_junction}, got {keep:?}"
         );
     }
 
