@@ -74,10 +74,11 @@ The TSV is intended for *debugging, QC, and post filtering*:\n\
 - refined_score: Score assigned after breakpoint refinement.\n\
 - identity_est: Estimated nucleotide identity between the two foldback arms.\n\
 - gap_est: Estimated template-switch gap size (bp) between the two arms; 0 for clean hairpin folds.\n\
-- support_n: Number of other reads supporting the same foldback junction.\n\
-- support_rank_frac: Relative prominence of this junction within the dataset, computed by ranking all junctions by support_n (descending) and normalising the rank to [0,1]. Values near 1 indicate highly recurrent junctions; values near 0 indicate rare/singleton events.\n\
-- support_span: Total supporting span (bp) aggregated across supporting reads.\n\
-- decision: Final classification based on thresholds (real, artefact, unknown, low_ident).\n\
+- support_n: Number of reads (including this one) folding about the same axis; compared against min_support.\n\
+- support_rank_frac: DEPRECATED, always 0. Kept so column positions do not change.\n\
+- support_span: Number of junction-key elements this foldback had (0 if it had too few to be keyed).\n\
+- decision: Final classification (real, artefact, low_ident).\n\
+- sig_band: First junction key of this foldback, as hex (NA if it was not keyed). For grouping rows only.\n\
 \n\
 Use '-' to write to stdout\n\
 "
@@ -407,8 +408,7 @@ How it affects foldback calling:\n\
 - canonical may increase the number of matchpoints (more hits), which can increase calls.\n\
 - forward-only can be more conservative and may reduce false positives.\n\
 \n\
-Note: we use canonical minimizers for *signatures* even if forward-only for detection;\n\
-this flag applies to the detector’s minimizer sampling.")
+Note: this flag applies to the detector’s minimizer sampling.")
                 .long("forward-only")
                 .default_value("true")
                 .value_parser(value_parser!(bool)),
@@ -445,7 +445,7 @@ Important:\n\
                 .long_help("High-level preset controlling detection and correction strictness.\n\
 \n\
 This sets a coherent bundle of thresholds (min_matches, min_span, min_identity, min_support,\n\
-max_depth, and signature parameters).\n\
+max_depth, end_guard).\n\
 \n\
 - strict: fewer calls and fewer cuts. Requires strong evidence and high identity.\n\
   Best when you want to avoid over-trimming.\n\
@@ -458,76 +458,6 @@ Override precedence:\n\
                 .long("mode")
                 .default_value("balanced")
                 .value_parser(value_parser!(CallMode)),
-        )
-        // Legacy locus-signature knobs. No longer used by the real/artefact gate.
-        .arg(
-            Arg::new("sig_flank_bp")
-                .long("sig-flank-bp")
-                // Inert since support became junction-axis based (see
-                // fingerprint::JunctionSupport); accepted so old command
-                // lines keep working.
-                .hide(true)
-                .help("Window (bp) around split for match-based fingerprinting")
-                .long_help("Signature flank size (bp) used to compute the junction fingerprint.\n\
-\n\
-Signatures are used to build the pass1 support map and to look up support in pass2.\n\
-They should be stable across small split jitter but specific enough not to collide.\n\
-\n\
-How it affects 'real vs artefact' decisions:\n\
-- Increasing sig-flank-bp gives more context included and fewer collisions, more stable support clusters,\n\
-  but slightly more compute and potentially more sensitivity to distant repeats.\n\
-- Decreasing sig-flank-bp gives signature becomes more local and is faster and less affected by distant repeats,\n\
-  but higher chance different junctions produce the same signature (collisions).\n\
-\n\
-If you see many signatures that are 'in support' but with wide split scatter, consider increasing\n\
-sig_flank_bp and/or sig_take to improve specificity.")
-                .value_parser(value_parser!(usize)),
-        )
-        .arg(
-            Arg::new("sig_take")
-                .long("sig-take")
-                // Inert since support became junction-axis based (see
-                // fingerprint::JunctionSupport); accepted so old command
-                // lines keep working.
-                .hide(true)
-                .long_help("Number of minimizer-derived values retained when constructing the junction signature.\n\
-\n\
-This controls signature specificity:\n\
-- Larger sig-take; more information in the signature, fewer collisions, better support discrimination.\n\
-- Smaller sig-take; less information, more collisions, more chance of misclassifying artefacts as real (or vice versa).\n\
-\n\
-Cost:\n\
-- Larger values are slightly slower and may fail more often if there are too few minimizers in the flank window.\n\
-  (In that case you may see fewer sig_ok events.)\n\
-\n\
-Guidance:\n\
-- If you want robust support-map behaviour, prefer increasing sig-take before relaxing split tolerance.\n\
-- If you process very short reads or tiny flanks, keep take modest so signatures can still be formed.")
-                .help("Number of minimizer hashes retained for foldback fingerprint")
-                .value_parser(value_parser!(usize)),
-        )
-        .arg(
-            Arg::new("sig_value_shift")
-                .long("sig-value-shift")
-                // Inert since support became junction-axis based (see
-                // fingerprint::JunctionSupport); accepted so old command
-                // lines keep working.
-                .hide(true)
-                .help("Right-shift applied to signature hash values before dedup (0 = exact)")
-                .long_help("Quantization applied to the minimizer values that make up a junction \
-signature, before sorting/dedup. 0 (the default for balanced/strict) keeps signatures exact: a \
-single sequencing error that changes one minimizer's value changes that value's contribution to \
-the signature outright. A non-zero shift coarsens values first, so two minimizers that differ only \
-in low bits (common after a single-base substitution shifts a hash by a small amount) can quantize \
-to the same bucket and still agree.\n\
-\n\
-Tradeoff is the same one --mode permissive already makes with sig_value_shift=8: coarser signatures \
-merge more of a single real locus's reads together (less fragmentation, better recall of real \
-inverted repeats under the min_support gate), but also raise the chance that two genuinely \
-different loci collide into one cluster (inflating apparent support for what should be two separate, \
-possibly-artefactual junctions). Prefer increasing sig-take before this if you haven't already; this \
-is the more aggressive knob.")
-                .value_parser(value_parser!(u8)),
         )
         .arg(
             Arg::new("no_rescue")
@@ -609,14 +539,6 @@ the estimate is systematically low on indel-rich (ONT / CLR) reads.")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            // Accepted for backwards compatibility: cutting low-identity
-            // foldbacks is now the default, so this is a no-op.
-            Arg::new("cut_low_ident")
-                .long("cut-low-ident")
-                .hide(true)
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
             Arg::new("qc_only")
                 .long("qc-only")
                 .help("Run pass1 only and report support statistics; skip cutting/output")
@@ -667,8 +589,39 @@ Default is a single core, multithreading will likely give gains up to 24-32 thre
         )
     );
 
+    deprecated_noop_args(c).get_matches()
+}
 
-    c.get_matches()
+/// Deprecated flags that are still accepted, so old command lines keep
+/// parsing, but have no effect: `(arg id, reason)`. They are hidden from
+/// `--help`; `main` prints a one-line note naming each one that was given.
+///
+/// - `--sig-flank-bp`, `--sig-take`, `--sig-value-shift`: parameters of the
+///   old locus band signatures. Support is now counted per fold axis
+///   (`fingerprint::JunctionSupport`), which has no such knobs.
+/// - `--cut-low-ident`: cutting low-identity foldbacks became the default;
+///   `--keep-low-ident` turns it off.
+pub const DEPRECATED_NOOP_FLAGS: &[(&str, &str)] = &[
+    ("sig_flank_bp", "support is now counted per fold axis, not per locus signature"),
+    ("sig_take", "support is now counted per fold axis, not per locus signature"),
+    ("sig_value_shift", "support is now counted per fold axis, not per locus signature"),
+    ("cut_low_ident", "cutting low-identity foldbacks is the default; see --keep-low-ident"),
+];
+
+/// Register the hidden, inert flags listed in [`DEPRECATED_NOOP_FLAGS`].
+/// Value types match what the flags used to take, so the same command lines
+/// are accepted (and the same malformed ones rejected) as before.
+fn deprecated_noop_args(c: Command) -> Command {
+    let deprecated = |id: &'static str, long: &'static str| {
+        Arg::new(id)
+            .long(long)
+            .hide(true)
+            .help("Deprecated, no effect")
+    };
+    c.arg(deprecated("sig_flank_bp", "sig-flank-bp").value_parser(value_parser!(usize)))
+        .arg(deprecated("sig_take", "sig-take").value_parser(value_parser!(usize)))
+        .arg(deprecated("sig_value_shift", "sig-value-shift").value_parser(value_parser!(u8)))
+        .arg(deprecated("cut_low_ident", "cut-low-ident").action(clap::ArgAction::SetTrue))
 }
 
 // Change RefineMode to a clap ValueEnum

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mdax::{
-    cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg},
+    cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg},
     pipeline::{self, TsvSink},
     utils::RefineMode,
 };
@@ -52,13 +52,7 @@ fn test_cfg(min_support: usize) -> MdaxCfg {
         fold2: FoldSecondPassCfg {
             min_support,
             min_identity: 0.50,
-            min_support_ident: 0.0,
             cut_low_ident: false,
-        },
-        sig: SigCfg {
-            flank_bp: 600,
-            take: 8,
-            value_shift: 0,
         },
     }
 }
@@ -536,13 +530,7 @@ fn real_data_cfg(min_support: usize) -> MdaxCfg {
         fold2: FoldSecondPassCfg {
             min_support,
             min_identity: 0.50,
-            min_support_ident: 0.0,
             cut_low_ident: false,
-        },
-        sig: SigCfg {
-            flank_bp: 600,
-            take: 8,
-            value_shift: 0,
         },
     }
 }
@@ -699,13 +687,7 @@ fn large_gap_cfg(max_jump_clip: usize) -> MdaxCfg {
             // min_support = 2 with only one read → junction is never "real".
             min_support: 2,
             min_identity: 0.50,
-            min_support_ident: 0.0,
             cut_low_ident: false,
-        },
-        sig: SigCfg {
-            flank_bp: 600,
-            take: 8,
-            value_shift: 0,
         },
     }
 }

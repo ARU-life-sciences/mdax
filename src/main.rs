@@ -6,8 +6,7 @@ use std::sync::Arc;
 use mdax::{
     cfg::{
         CallMode, FairnessParams, FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg,
-        RescueCfg,
-        SharedCfg, SigCfg,
+        RescueCfg, SharedCfg,
     },
     cli, elog, foldback, spacer,
     pipeline,
@@ -77,15 +76,6 @@ fn main() -> Result<()> {
     let mut min_support = *args
         .get_one::<usize>("min_support")
         .unwrap_or(&t.min_support);
-    // TODO: include these in fairness?
-    let sig_flank_bp = *args
-        .get_one::<usize>("sig_flank_bp")
-        .unwrap_or(&t.sig_flank_bp);
-    let sig_take = *args.get_one::<usize>("sig_take").unwrap_or(&t.sig_take);
-    let sig_value_shift = *args
-        .get_one::<u8>("sig_value_shift")
-        .unwrap_or(&t.sig_value_shift);
-
     let mut k = *args.get_one::<usize>("k").expect("defaulted k of 17");
     let mut w = *args.get_one::<usize>("w").expect("defaulted w of 21");
     // w must be odd, so error out here if it's not
@@ -181,12 +171,12 @@ fn main() -> Result<()> {
         ..RescueCfg::disabled()
     };
 
-    for legacy in ["sig_flank_bp", "sig_take", "sig_value_shift"] {
-        if args.value_source(legacy) == Some(clap::parser::ValueSource::CommandLine) {
+    for &(id, why) in cli::DEPRECATED_NOOP_FLAGS {
+        if args.value_source(id) == Some(clap::parser::ValueSource::CommandLine) {
             elog!(
                 "INIT",
-                "note: --{} no longer has any effect (support is now counted per fold axis, not per locus signature)",
-                legacy.replace('_', "-")
+                "note: --{} no longer has any effect ({why})",
+                id.replace('_', "-")
             );
         }
     }
@@ -266,13 +256,7 @@ fn main() -> Result<()> {
             // TODO: sensible defaults + add to cli
             min_support,
             min_identity,
-            min_support_ident: 0.0,
             cut_low_ident: !args.get_flag("keep_low_ident"),
-        },
-        sig: SigCfg {
-            flank_bp: sig_flank_bp,
-            take: sig_take,
-            value_shift: sig_value_shift,
         },
     };
 

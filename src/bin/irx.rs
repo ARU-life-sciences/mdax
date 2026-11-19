@@ -65,7 +65,7 @@ use std::{io::Write, path::PathBuf};
 use thread_local::ThreadLocal;
 
 use mdax::{
-    cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg},
+    cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg},
     foldback, io,
     scratch::FoldScratch,
     utils::RefineMode,
@@ -1435,13 +1435,7 @@ fn main() -> Result<()> {
         fold2: FoldSecondPassCfg {
             min_support: 0,
             min_identity: 0.0,
-            min_support_ident: 0.0,
             cut_low_ident: false,
-        },
-        sig: SigCfg {
-            flank_bp: 600,
-            take: 8,
-            value_shift: 0,
         },
     };
 

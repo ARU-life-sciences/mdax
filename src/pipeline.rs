@@ -15,7 +15,7 @@ use crate::{
     cfg::MdaxCfg,
     fingerprint::{JunctionSupport, axis_tol, junction_keys},
     foldback, io,
-    scratch::{FoldScratch, SigScratch},
+    scratch::FoldScratch,
     utils::RefineMode,
 };
 
@@ -422,7 +422,6 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
             let mut num_real: u64 = 0;
 
             let mut fold_scratch = FoldScratch::new();
-            let mut sig_scratch = SigScratch::default();
 
             let mut shared_fast = cfg.shared.clone();
             shared_fast.refine.mode = RefineMode::HiFi;
@@ -544,7 +543,6 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                             &support,
                                             max_depth,
                                             &mut fold_scratch,
-                                            &mut sig_scratch,
                                         )?;
 
                                         if keep2.start != 0 || keep2.end != len {

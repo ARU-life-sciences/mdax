@@ -19,14 +19,13 @@
 //!    - HiFi mode: Hamming-style symmetric arm comparison.
 //!    - ONT mode: banded edit distance between left arm and reverse-complemented right arm.
 //!
-//! 3. **Signature construction**
-//!    - Prefer a *local* minimizer-based signature derived from matched minimizers
-//!      participating in the foldback.
-//!    - Fall back to a flank-based signature if local matches are insufficient.
+//! 3. **Junction keys** (`fingerprint::junction_keys`)
+//!    - Key each foldback by its fold axis, from the matchpoints of the best
+//!      bin (`FoldScratch::best_trip`).
 //!
 //! 4. **Recursive cutting**
-//!    - Use support statistics to distinguish real genomic palindromes from
-//!      stochastic MDA artefacts.
+//!    - Use fold-axis support (`fingerprint::JunctionSupport`) to distinguish
+//!      real genomic palindromes from stochastic MDA artefacts.
 //!    - Iteratively trim artefactual foldbacks from the right end of the read.
 //!
 //! Design notes:
@@ -39,7 +38,7 @@
 use crate::cfg::{FoldOnlyCfg, MdaxCfg, SharedCfg};
 use crate::fingerprint::{JunctionSupport, axis_tol, junction_keys};
 use crate::minimizer::sampled_minimizers_into;
-use crate::scratch::{FoldScratch, RefineScratch, SigScratch};
+use crate::scratch::{FoldScratch, RefineScratch};
 use crate::utils::{
     RefineMode, Refined, comp, div_floor, edit_distance_myers,
     revcomp_into,
@@ -942,7 +941,6 @@ fn collect_diag_points(
     d_tol: i32,
 ) {
     scratch.best_pts.clear();
-    scratch.best_matches.clear();
     scratch.best_trip.clear();
     if scratch.stats.is_empty() {
         return;
@@ -960,7 +958,6 @@ fn collect_diag_points(
         for &p1 in p1s {
             if (p1 + p2 - target).abs() <= d_tol {
                 scratch.best_pts.push((p1, p2));
-                scratch.best_matches.push((p1 as usize, vrc));
                 scratch.best_trip.push((p1, p2, vrc));
             }
         }
@@ -1121,12 +1118,12 @@ fn rescue_seeded(
 
     let (_, bin, fb) = best?;
     // Leave scratch describing the accepted candidate, as the gated path
-    // does, so junction keys / signatures are computed from the right bin.
+    // does, so junction keys are computed from the right bin.
     collect_bin_points(seq.len(), shared, scratch, bin, tol);
     Some(fb)
 }
 
-/// Fill `best_pts` / `best_matches` / `best_trip` with the matchpoints of
+/// Fill `best_pts` / `best_trip` with the matchpoints of
 /// one anti-diagonal bin, from the matching state left by
 /// `detect_foldback_gated`.
 fn collect_bin_points(
@@ -1139,7 +1136,6 @@ fn collect_bin_points(
     let n = seq_len as i32;
     let k_i32 = shared.minimizer.k as i32;
     scratch.best_pts.clear();
-    scratch.best_matches.clear();
     scratch.best_trip.clear();
     for (&prc, &vrc) in scratch.pos_rc.iter().zip(scratch.val_rc.iter()) {
         if scratch.repetitive.contains_key(&vrc) {
@@ -1152,7 +1148,6 @@ fn collect_bin_points(
         for &p1 in p1s {
             if div_floor(p1 + p2, tol) == want_bin {
                 scratch.best_pts.push((p1, p2));
-                scratch.best_matches.push((p1 as usize, vrc));
                 scratch.best_trip.push((p1, p2, vrc));
             }
         }
@@ -1276,7 +1271,7 @@ fn detect_foldback_gated(
         // Without a tie-break, an exact score tie between two bins would
         // non-deterministically pick whichever happened to be visited first,
         // making detection results (and anything downstream: split position,
-        // signature, cut decision) irreproducible across runs on identical
+        // junction keys, cut decision) irreproducible across runs on identical
         // input. Prefer the smaller bin id on ties -- arbitrary but stable.
         let better = sc > best_score || (sc == best_score && Some(bin) < best_bin);
         if better {
@@ -1295,10 +1290,8 @@ fn detect_foldback_gated(
     // ---- 3) second phase: collect points only for best bin ----
     let cap = scratch.stats.get(&best_bin).map(|s| s.count).unwrap_or(0);
     scratch.best_pts.clear();
-    scratch.best_matches.clear();
     scratch.best_trip.clear();
     scratch.best_pts.reserve(cap);
-    scratch.best_matches.reserve(cap);
 
     for (&prc, &vrc) in pos_rc.iter().zip(val_rc.iter()) {
         if scratch.repetitive.contains_key(&vrc) {
@@ -1315,8 +1308,6 @@ fn detect_foldback_gated(
             let bin = div_floor(d, shared.fold_diag_tol.max(1));
             if bin == best_bin {
                 scratch.best_pts.push((p1, p2));
-                // Use forward minimizer position for locality filtering in signature
-                scratch.best_matches.push((p1 as usize, vrc));
                 scratch.best_trip.push((p1, p2, vrc));
             }
         }
@@ -1760,8 +1751,8 @@ fn chain_boundaries(split: usize, arm_end: usize, arm_start: usize, len: usize) 
 /// *full-sequence coordinates*), this function:
 /// - Converts breakpoints into view-local coordinates
 /// - Re-detects and refines foldbacks on progressively shortened prefixes
-/// - Uses foldback signatures and support statistics to decide whether a
-///   foldback is real or artefactual
+/// - Uses fold-axis junction support to decide whether a foldback is real
+///   or artefactual
 ///
 /// Real (supported) foldbacks terminate recursion.
 /// Artefactual foldbacks cause the sequence to be truncated at the split.
@@ -1782,7 +1773,6 @@ pub fn recursive_foldback_cut_from_first_range(
     support: &JunctionSupport,
     max_depth: usize,
     scratch: &mut FoldScratch,
-    _sig_scratch: &mut SigScratch,
 ) -> anyhow::Result<Range<usize>> {
     // We already have the first hit/refine (full coords). After first cut, detect/refine on the view.
     let mut fb_opt = Some(first_fb);
@@ -1922,10 +1912,9 @@ pub fn recursive_foldback_cut_from_first_range(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::foldback_signature_from_local_matches;
     use crate::utils::revcomp_in_place;
     use crate::{
-        cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg, SigCfg},
+        cfg::{FoldOnlyCfg, FoldSecondPassCfg, MdaxCfg, MinimizerCfg, RefineCfg, SharedCfg},
         scratch,
     };
     fn test_fold_cfg(
@@ -2150,50 +2139,6 @@ mod tests {
     }
 
     #[test]
-    fn local_signature_from_best_matches_is_some_and_consistent() {
-        // Use non-repetitive sequence so MAX_BUCKET/repetitive filter doesn’t delete everything.
-        let left = random_dna(4000, 0xC0FFEE);
-        let (s, _true_bp) = make_noisy_foldback_from_left(&left, b"", 0, 0, 0);
-
-        // Slightly denser minimizers can help, but the key fix is non-repetitive input.
-        let (shared, fold) = test_fold_cfg(
-            7,   // k
-            7,   // w  (denser than 9/11)
-            120, // diag_tol
-            200, // min_arm (coarse)
-            3,   // min_matches
-            20,  // refine_window
-            80,  // refine_arm
-            RefineMode::HiFi,
-            0.0,
-        );
-
-        let mut scratch = scratch::FoldScratch::new();
-
-        let coarse = detect_foldback(&s, &shared, &fold, &mut scratch)
-            .expect("detect_foldback should succeed on a clean random foldback");
-
-        let refined = refine_breakpoint(&s, coarse.split_pos, &shared, &mut scratch.refine, coarse.span, coarse.arm_end, coarse.arm_start_right)
-            .unwrap()
-            .expect("refine should succeed");
-
-        // Local signature: choose parameters that cannot fail due to take being too large.
-        let window_bp = 300usize;
-        let take = 6usize;
-        let value_shift = 0u8;
-
-        let sig_local = foldback_signature_from_local_matches(
-            &mut scratch.best_matches,
-            refined.split_pos,
-            window_bp,
-            take,
-            value_shift,
-        );
-
-        assert!(sig_local.is_some(), "local signature should be computable");
-    }
-
-    #[test]
     fn detect_foldback_repetitive_sequence_may_be_ignored() {
         let left = repeat_bytes(b"ACGTTGCAACGTTGCA", 300);
         let (s, _bp) = make_noisy_foldback_from_left(&left, b"", 0, 0, 0);
@@ -2292,7 +2237,7 @@ mod tests {
 
     // ── keep-longer-side cut policy ─────────────────────────────────────────
 
-    fn cfg_for_cut_policy(sig_flank_bp: usize, sig_take: usize) -> MdaxCfg {
+    fn cfg_for_cut_policy() -> MdaxCfg {
         MdaxCfg {
             shared: SharedCfg {
                 minimizer: MinimizerCfg { k: 17, w: 21, forward_only: true },
@@ -2311,10 +2256,8 @@ mod tests {
             fold2: FoldSecondPassCfg {
                 min_support: 3,
                 min_identity: 0.6,
-                min_support_ident: 0.0,
                 cut_low_ident: false,
             },
-            sig: SigCfg { flank_bp: sig_flank_bp, take: sig_take, value_shift: 0 },
         }
     }
 
@@ -2335,7 +2278,7 @@ mod tests {
         seq.extend_from_slice(&rc_arm);
         seq.extend_from_slice(&trail);
 
-        let cfg = cfg_for_cut_policy(300, 8);
+        let cfg = cfg_for_cut_policy();
         let mut scratch = scratch::FoldScratch::new();
 
         let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch)
@@ -2349,10 +2292,8 @@ mod tests {
 
         // Empty support map: nothing is "real", so this is treated as an artefact.
         let support = JunctionSupport::empty();
-        let mut sig_scratch = SigScratch::default();
-
         let keep = recursive_foldback_cut_from_first_range(
-            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch,
         )
         .unwrap();
 
@@ -2381,7 +2322,7 @@ mod tests {
         seq.extend_from_slice(&rc);
         seq.extend_from_slice(&random_dna(tail, 0x7A11));
 
-        let cfg = cfg_for_cut_policy(300, 8);
+        let cfg = cfg_for_cut_policy();
         let mut scratch = scratch::FoldScratch::new();
         let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch).expect("detect");
         let mut rs = RefineScratch::default();
@@ -2389,9 +2330,8 @@ mod tests {
             .unwrap()
             .expect("refine");
         let support = JunctionSupport::empty();
-        let mut sig = SigScratch::default();
         let keep = recursive_foldback_cut_from_first_range(
-            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig,
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch,
         )
         .unwrap();
         (seq, keep)
@@ -2452,7 +2392,7 @@ mod tests {
         seq.extend_from_slice(&rc_arm);
         seq.extend_from_slice(&trail);
 
-        let cfg = cfg_for_cut_policy(300, 8);
+        let cfg = cfg_for_cut_policy();
         let mut scratch = scratch::FoldScratch::new();
 
         let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch)
@@ -2465,10 +2405,8 @@ mod tests {
         .expect("should refine");
 
         let support = JunctionSupport::empty();
-        let mut sig_scratch = SigScratch::default();
-
         let keep = recursive_foldback_cut_from_first_range(
-            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch,
         )
         .unwrap();
 
@@ -2509,7 +2447,7 @@ mod tests {
         seq.extend_from_slice(&inner_arm);
         seq.extend_from_slice(&inner_rc);
 
-        let cfg = cfg_for_cut_policy(300, 8);
+        let cfg = cfg_for_cut_policy();
         let mut scratch = scratch::FoldScratch::new();
 
         let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch)
@@ -2522,10 +2460,8 @@ mod tests {
         .expect("should refine");
 
         let support = JunctionSupport::empty();
-        let mut sig_scratch = SigScratch::default();
-
         let keep = recursive_foldback_cut_from_first_range(
-            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch,
         )
         .unwrap();
 
@@ -2571,10 +2507,8 @@ mod tests {
             fold2: FoldSecondPassCfg {
                 min_support: 3,
                 min_identity: 0.6,
-                min_support_ident: 0.0,
                 cut_low_ident: true,
             },
-            sig: SigCfg { flank_bp: 600, take: 8, value_shift: 0 },
         }
     }
 
@@ -2653,9 +2587,8 @@ mod tests {
             .unwrap()
             .expect("rescued candidates always refine");
         let support = JunctionSupport::empty();
-        let mut sig_scratch = SigScratch::default();
         let keep = recursive_foldback_cut_from_first_range(
-            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch,
         )
         .unwrap();
         assert_eq!(keep.start, 0);
@@ -2685,9 +2618,8 @@ mod tests {
             .unwrap()
             .expect("refine");
         let support = JunctionSupport::empty();
-        let mut sig_scratch = SigScratch::default();
         let keep = recursive_foldback_cut_from_first_range(
-            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig_scratch,
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch,
         )
         .unwrap();
         assert_eq!(keep.start, 0);
