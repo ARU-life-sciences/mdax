@@ -1635,6 +1635,125 @@ fn fold_breakpoint_from_pts(
     })
 }
 
+/// Where a cut may end on each side of a detected foldback.
+///
+/// Returns `(left_end, right_start)` in the same coordinates as the inputs:
+/// keeping the left side means keeping `..left_end`, keeping the right side
+/// means keeping `right_start..`.
+///
+/// The policy is chosen once per run by `set_cut_spacer_policy`; see
+/// `CutSpacer`.
+pub fn cut_boundaries(
+    seq: &[u8],
+    trips: &[(i32, i32, u64)],
+    k: usize,
+    split: usize,
+    gap_est: usize,
+    chain_arm_end: usize,
+    chain_arm_start: usize,
+) -> (usize, usize) {
+    let len = seq.len();
+    let half = gap_est / 2;
+    let lo = split.saturating_sub(half);
+    let hi = (split + half).min(len);
+    let policy = cut_spacer_policy();
+    if policy == CutSpacer::Resolve {
+        if let Some((m, side)) = crate::spacer::resolve(seq, trips, k) {
+            if (m.a + m.b).abs_diff(2 * split) <= 200 {
+                return match side {
+                    crate::spacer::SpacerSide::Left => (m.b, m.b),
+                    crate::spacer::SpacerSide::Right => (m.a, m.a),
+                    crate::spacer::SpacerSide::Unknown => (m.a, m.b),
+                };
+            }
+        }
+    }
+    match policy {
+        CutSpacer::Keep => (hi, lo),
+        CutSpacer::Drop => (lo, hi),
+        CutSpacer::Chain | CutSpacer::Resolve => {
+            if let Some((a, b)) = chain_boundaries(split, chain_arm_end, chain_arm_start, len) {
+                (a, b)
+            } else {
+                (lo, hi)
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CutSpacer {
+    /// Legacy: keep the un-mirrored stretch between the arms on whichever
+    /// side is kept.
+    Keep,
+    /// Drop the un-mirrored stretch; boundaries from split +- gap_est/2.
+    Drop,
+    /// Drop it; boundaries from the innermost matched minimizers of the
+    /// coarse chain, falling back to `Drop` when those look inconsistent.
+    Chain,
+    /// Use exact mirror boundaries, and keep the spacer with whichever side
+    /// the rest of the library says it belongs to (see `crate::spacer`);
+    /// drop it when there is no evidence. Falls back to `Chain`.
+    Resolve,
+}
+
+static CUT_SPACER: std::sync::OnceLock<CutSpacer> = std::sync::OnceLock::new();
+
+/// Developer override for benchmarking: `MDAX_CUT_SPACER=keep|drop|chain|resolve`.
+fn cut_spacer_env() -> Option<CutSpacer> {
+    match std::env::var("MDAX_CUT_SPACER").as_deref() {
+        Ok("keep") => Some(CutSpacer::Keep),
+        Ok("drop") => Some(CutSpacer::Drop),
+        Ok("chain") => Some(CutSpacer::Chain),
+        Ok("resolve") => Some(CutSpacer::Resolve),
+        _ => None,
+    }
+}
+
+/// Choose the spacer policy for this run (first call wins). `Resolve` needs
+/// exact mirror boundaries, which HiFi reads give and noisy reads do not:
+/// on ONT its boundary k-mers were mis-assigned often enough to keep 8.7% of
+/// cut reads' bases as chimera (vs 0.5% for `Chain`), so noisy reads use
+/// `Chain`. `MDAX_CUT_SPACER` overrides.
+pub fn set_cut_spacer_policy(mode: RefineMode) -> CutSpacer {
+    *CUT_SPACER.get_or_init(|| {
+        cut_spacer_env().unwrap_or(match mode {
+            RefineMode::HiFi => CutSpacer::Resolve,
+            RefineMode::ONT => CutSpacer::Chain,
+        })
+    })
+}
+
+/// The policy in force: whatever `set_cut_spacer_policy` chose, else the
+/// env override, else `Chain` (no library evidence is available in that
+/// case, e.g. in unit tests calling the cutter directly).
+pub fn cut_spacer_policy() -> CutSpacer {
+    *CUT_SPACER.get_or_init(|| cut_spacer_env().unwrap_or(CutSpacer::Chain))
+}
+
+/// Arm boundaries from the coarse chain's innermost type-1 matchpoints, if
+/// they bracket the refined split plausibly.
+fn chain_boundaries(split: usize, arm_end: usize, arm_start: usize, len: usize) -> Option<(usize, usize)> {
+    const AXIS_TOL: usize = 100;
+    if arm_end == 0 || arm_start == 0 || arm_start > len || arm_end > len {
+        return None;
+    }
+    // arm_end includes the last matched k-mer, so it can sit a few bases past
+    // arm_start on a clean hairpin; that is still a valid boundary pair.
+    if arm_end > split + AXIS_TOL || arm_start + AXIS_TOL < split {
+        return None;
+    }
+    let axis2 = arm_end + arm_start;
+    if axis2.abs_diff(2 * split) > 2 * AXIS_TOL {
+        return None;
+    }
+    if arm_end > arm_start {
+        // overlapping innermost k-mers: an undisplaced hairpin, cut at the axis
+        return Some((split, split));
+    }
+    Some((arm_end, arm_start))
+}
+
 /// Recursively excise artefactual foldbacks from a sequence prefix.
 ///
 /// Starting from an initial foldback detection and refinement (given in
@@ -1750,13 +1869,28 @@ pub fn recursive_foldback_cut_from_first_range(
         // artefact -> cut. Keep whichever side of the split is longer, rather
         // than always keeping the left arm.
         //
-        // `rf.split_pos` is the anti-diagonal midpoint (≈ arm_end + gap/2),
-        // in `view`-local coordinates. Convert the two candidate boundaries
-        // to full-sequence coordinates so they can be compared directly
-        // against `keep`, which may already have been narrowed by an
-        // earlier (nested) cut.
-        let abs_arm_end   = detect.start + rf.split_pos.saturating_sub(rf.gap_est / 2);
-        let abs_arm_start = detect.start + (rf.split_pos + rf.gap_est / 2).min(view.len());
+        // Real template-switch folds are usually displaced: the two arms are
+        // offset on the genome, leaving an un-mirrored stretch between them
+        // that belongs to one strand or the other. A single read cannot tell
+        // which, and keeping it when it belongs to the dropped side leaves a
+        // strand-switched stub (measured median ~800 bp) on the kept read, so
+        // drop it: cut at the kept arm's own boundary. Boundaries come from
+        // the innermost matched minimizers of the coarse chain when those are
+        // consistent with the refined split (gap_est alone is off by >100 bp
+        // in about a quarter of reads). All in `view`-local coordinates,
+        // converted to full-sequence ones to compare against `keep`.
+        let (left_end, right_start) = cut_boundaries(
+            view,
+            &scratch.best_trip,
+            cfg.shared.minimizer.k,
+            rf.split_pos,
+            rf.gap_est,
+            fb.arm_end,
+            fb.arm_start_right,
+        );
+        let abs_arm_end = detect.start + left_end.min(right_start);
+        let abs_left_end = detect.start + left_end;
+        let abs_right_start = detect.start + right_start;
 
         // A foldback near the *start* of a long read means "keep the left
         // arm" throws away almost the entire read, even though everything
@@ -1769,15 +1903,18 @@ pub fn recursive_foldback_cut_from_first_range(
         // candidate lengths against the current `keep` bounds and keep the
         // longer side, then keep recursing into *that* side on the next
         // iteration (nested/compound artefacts can occur on either side).
-        let left_len = abs_arm_start.saturating_sub(keep.start);
-        let right_len = keep.end.saturating_sub(abs_arm_end);
+        let left_len = abs_left_end.saturating_sub(keep.start);
+        let right_len = keep.end.saturating_sub(abs_right_start);
 
         if right_len > left_len {
-            keep.start = abs_arm_end;
+            keep.start = abs_right_start.max(keep.start).min(keep.end);
             detect = keep.start..keep.end;
         } else {
-            keep.end = abs_arm_start;
-            detect = detect.start..abs_arm_end;
+            keep.end = abs_left_end.min(keep.end).max(keep.start);
+            // Re-detect only up to the inner edge of the mirrored region:
+            // anything beyond it can look reverse-complement similar to the
+            // arm and confuse the next pass.
+            detect = detect.start..abs_arm_end.min(keep.end).max(detect.start);
         }
 
         // next iteration will detect/refine on the shortened view
@@ -2235,6 +2372,72 @@ mod tests {
             keep.end, seq.len(),
             "expected the kept range to extend to the end of the read (right-keep), got {keep:?}"
         );
+    }
+
+    /// Cut a displaced fold built from one genome stretch, return the kept range.
+    /// Read = G[0..fwd_end] + RC(G[rev_low..rev_high]): the forward copy runs to
+    /// `fwd_end`, the polymerase then switches strand at genome `rev_high`.
+    fn cut_displaced(fwd_end: usize, rev_low: usize, rev_high: usize, tail: usize) -> (Vec<u8>, Range<usize>) {
+        let g = random_dna(rev_high.max(fwd_end) + 10, 0x5EED_D15B);
+        let mut rc = g[rev_low..rev_high].to_vec();
+        revcomp_in_place(&mut rc);
+        let mut seq = g[..fwd_end].to_vec();
+        seq.extend_from_slice(&rc);
+        seq.extend_from_slice(&random_dna(tail, 0x7A11));
+
+        let cfg = cfg_for_cut_policy(300, 8);
+        let mut scratch = scratch::FoldScratch::new();
+        let fb = detect_foldback(&seq, &cfg.shared, &cfg.fold, &mut scratch).expect("detect");
+        let mut rs = RefineScratch::default();
+        let rf = refine_breakpoint(&seq, fb.split_pos, &cfg.shared, &mut rs, fb.span, fb.arm_end, fb.arm_start_right)
+            .unwrap()
+            .expect("refine");
+        let support = JunctionSupport::empty();
+        let mut sig = SigScratch::default();
+        let keep = recursive_foldback_cut_from_first_range(
+            &seq, 0..seq.len(), fb, rf, &cfg, &support, 5, &mut scratch, &mut sig,
+        )
+        .unwrap();
+        (seq, keep)
+    }
+
+    /// Spacer on the dropped (reverse) side: the forward copy ends at 3000,
+    /// the reverse copy starts at genome 3600, so read 3000..3600 is
+    /// reverse-strand sequence with no mirror. Keeping it (the old policy)
+    /// left a 600 bp strand-switched stub on the kept read.
+    #[test]
+    fn displaced_fold_spacer_on_dropped_side_is_not_kept() {
+        let (_seq, keep) = cut_displaced(3000, 1000, 3600, 0);
+        assert_eq!(keep.start, 0, "left side is longer and should be kept: {keep:?}");
+        assert!(
+            keep.end <= 3000 + 40,
+            "kept read must end at the strand switch (3000), not carry the reverse-strand spacer: {keep:?}"
+        );
+        assert!(keep.end >= 3000 - 200, "should not over-trim the forward copy: {keep:?}");
+    }
+
+    /// Spacer on the kept (forward) side: the forward copy runs on to 3000
+    /// but the reverse copy starts at genome 2400. Read 2400..3000 is good
+    /// forward sequence, but a single read cannot tell the two cases apart,
+    /// so it is dropped too; what matters is that nothing reverse-strand is
+    /// kept and the loss is bounded by the spacer.
+    #[test]
+    fn displaced_fold_spacer_on_kept_side_costs_at_most_the_spacer() {
+        let (_seq, keep) = cut_displaced(3000, 1000, 2400, 0);
+        assert_eq!(keep.start, 0, "{keep:?}");
+        assert!(keep.end <= 3000 + 40, "no reverse-strand sequence may be kept: {keep:?}");
+        assert!(keep.end + 650 >= 3000, "loss must be bounded by the 600 bp spacer: {keep:?}");
+    }
+
+    /// Same two geometries mirrored: the long side is the right one.
+    #[test]
+    fn displaced_fold_keeping_right_side_drops_the_spacer() {
+        // forward copy short, reverse copy long, plus a long right tail
+        let (seq, keep) = cut_displaced(1500, 0, 2100, 6000);
+        assert_eq!(keep.end, seq.len(), "{keep:?}");
+        // strand switch is at read 1500; spacer is read 1500..2100
+        assert!(keep.start + 40 >= 2100, "kept right side must start after the spacer (2100): {keep:?}");
+        assert!(keep.start <= 2100 + 200, "should not over-trim the reverse copy: {keep:?}");
     }
 
     /// The symmetric case: a foldback near the *end* of a long read must keep

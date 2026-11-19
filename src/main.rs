@@ -9,7 +9,7 @@ use mdax::{
         RescueCfg,
         SharedCfg, SigCfg,
     },
-    cli, elog,
+    cli, elog, foldback, spacer,
     pipeline,
     utils::{RefineMode, compact_histogram},
 };
@@ -401,6 +401,16 @@ fn main() -> Result<()> {
     // does), so it's safe that `cfg_arc` above was built before calibration --
     // but pass2 must see the calibrated value, so build a fresh Arc here.
     let cfg_arc_pass2 = Arc::new(cfg.clone());
+
+    // Library-wide evidence for which side each displaced foldback's spacer
+    // belongs to (two extra passes over the input; see `mdax::spacer`).
+    let spacer_policy = foldback::set_cut_spacer_policy(refine_mode);
+    elog!("SPACER", "cut policy: {spacer_policy:?}");
+    if spacer_policy == foldback::CutSpacer::Resolve {
+        let ev = spacer::build_evidence(fasta.clone(), cfg_arc_pass2.clone(), threads, chan_cap)?;
+        elog!("SPACER", "boundary k-mers counted: {}", ev.len());
+        spacer::install(ev);
+    }
 
     let (foldback_reads, cut_reads, real_reads) = pipeline::pass2_correct_and_write(
         &fasta,

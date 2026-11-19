@@ -580,16 +580,23 @@ pub fn pass2_correct_and_write<P: AsRef<Path>>(
                                             .into_bytes(),
                                     );
                                     // Same convention as the main cutter: drop
-                                    // one arm, keep any spacer, and keep
-                                    // whichever side is longer rather than
-                                    // always the left.
-                                    let half_gap = rf_call.gap_est / 2;
-                                    let arm_end = rf_call.split_pos.saturating_sub(half_gap);
-                                    let arm_start = (rf_call.split_pos + half_gap).min(len);
-                                    keep = if len - arm_end > arm_start {
-                                        arm_end..len
+                                    // one arm and the un-mirrored stretch
+                                    // between the arms, and keep whichever
+                                    // side is longer rather than always the
+                                    // left.
+                                    let (left_end, right_start) = foldback::cut_boundaries(
+                                        &job.seq,
+                                        &fold_scratch.best_trip,
+                                        cfg.shared.minimizer.k,
+                                        rf_call.split_pos,
+                                        rf_call.gap_est,
+                                        fb.arm_end,
+                                        fb.arm_start_right,
+                                    );
+                                    keep = if len - right_start > left_end {
+                                        right_start..len
                                     } else {
-                                        0..arm_start
+                                        0..left_end
                                     };
                                     num_cut += 1;
                                     ("artefact", n, 0.0, n_elems, key0)

@@ -6,4 +6,5 @@ pub mod io;
 pub mod minimizer;
 pub mod pipeline;
 pub mod scratch;
+pub mod spacer;
 pub mod utils;
