@@ -1,0 +1,32 @@
+sample	library	arm	contigs	Mb	N50_Mb	BUSCO_C	BUSCO_D
+92	MDA	raw reads	1248	108.0	0.14	88.4	7.2
+92	MDA	old mdax (Oct)	894	110.7	0.25	93.9	5.4
+92	MDA	v5 fold-axis gate	681	107.7	0.39	96.4	2.9
+92	MDA	main (rescue + cut)	711	110.5	0.49	96.7	4.2
+96	MDA	raw reads	832	115.6	0.36	95.4	9.9
+96	MDA	old mdax (Oct)	642	113.6	0.54	97.4	6.5
+96	MDA	v5 fold-axis gate	325	104.5	0.98	98.5	1.8
+96	MDA	main (rescue + cut)	319	104.7	1.18	98.6	1.0
+98	MDA	raw reads	523	110.6	0.51	97.1	6.5
+98	MDA	old mdax (Oct)	433	109.6	0.73	97.9	5.2
+98	MDA	v5 fold-axis gate	205	103.0	1.14	98.5	0.7
+98	MDA	main (rescue + cut)	199	103.2	1.24	98.8	0.8
+97	MDA	raw reads	724	110.7	0.38	95.5	6.9
+97	MDA	old mdax (Oct)	568	110.9	0.51	97.3	7.0
+97	MDA	v5 fold-axis gate	301	103.9	0.88	98.5	1.5
+99	MDA	raw reads	694	110.8	0.29	93.7	6.1
+99	MDA	old mdax (Oct)	539	113.0	0.52	97.4	4.8
+99	MDA	v5 fold-axis gate	262	106.1	0.89	98.4	0.8
+100	MDA	raw reads	847	114.2	0.31	93.3	6.7
+100	MDA	old mdax (Oct)	657	114.2	0.50	95.9	5.2
+100	MDA	v5 fold-axis gate	504	109.1	0.69	97.6	2.4
+34	standard	raw reads	592	111.7	0.45	97.9	0.5
+34	standard	old mdax (Oct)	602	111.6	0.42	97.8	0.5
+34	standard	v5 fold-axis gate	638	111.1	0.36	97.5	0.5
+34	standard	calibration fix (v6)	610	111.5	0.41	97.7	0.5
+_ToL	standard	raw reads	545	112.1	0.50	98.0	0.7
+_ToL	standard	old mdax (Oct)	552	112.1	0.46	98.0	0.7
+_ToL	standard	v5 fold-axis gate	566	111.8	0.41	97.9	0.8
+_ToL	standard	calibration fix (v6)	551	112.0	0.47	98.0	0.8
+33	standard	old mdax (Oct)	1650	156.9	0.48	98.5	0.6
+33	standard	calibration fix (v6)	1653	156.8	0.46	98.5	0.6

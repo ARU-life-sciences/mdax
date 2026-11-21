@@ -1,0 +1,27 @@
+species	data	arm	contigs	Mb	N50_Mb	BUSCO_C	BUSCO_D
+C. elegans (celegans_wga)	ONT	raw reads	748	102.4	0.51	97.1	1.1
+C. elegans (celegans_wga)	ONT	Lee et al. remove_palindrome	622	99.6	0.55	97.3	0.4
+C. elegans (celegans_wga)	ONT	old mdax (Oct)	616	99.8	0.55	97.1	0.5
+C. elegans (celegans_wga)	ONT	v4 fold-axis gate	541	100.4	0.62	97.2	0.9
+C. elegans (celegans_wga)	ONT	main (rescue + cut)	563	99.3	0.65	97.3	0.6
+A. besseyi (aphelenchoides)	ONT	raw reads	215	45.1	1.31	59.4	2.0
+A. besseyi (aphelenchoides)	ONT	Lee et al. remove_palindrome	141	44.8	1.25	59.4	1.9
+A. besseyi (aphelenchoides)	ONT	old mdax (Oct)	143	45.0	2.01	59.4	1.9
+A. besseyi (aphelenchoides)	ONT	v4 fold-axis gate	142	44.9	2.00	59.4	1.9
+A. besseyi (aphelenchoides)	ONT	main (rescue + cut)	128	44.9	2.00	59.4	1.9
+L. squamata SRR27483171	PacBio CLR	raw reads	3960	134.6	0.31	71.9	10.1
+L. squamata SRR27483171	PacBio CLR	Lee et al. remove_palindrome	203	100.8	1.15	72.2	1.2
+L. squamata SRR27483171	PacBio CLR	old mdax (Oct)	251	102.3	1.14	72.1	1.8
+L. squamata SRR27483171	PacBio CLR	v4 fold-axis gate	190	101.5	1.29	72.2	1.4
+L. squamata SRR27483172	PacBio CLR	raw reads	5727	218.5	0.10	78.5	24.5
+L. squamata SRR27483172	PacBio CLR	Lee et al. remove_palindrome	3809	204.4	0.15	78.3	11.1
+L. squamata SRR27483172	PacBio CLR	old mdax (Oct)	2808	198.0	0.16	78.5	14.3
+L. squamata SRR27483172	PacBio CLR	v4 fold-axis gate	2788	198.6	0.17	78.3	13.7
+Sabatieria	ONT	raw reads	15913	458.3	0.07	58.5	25.5
+Sabatieria	ONT	Lee et al. remove_palindrome	16350	446.4	0.06	58.2	25.3
+Sabatieria	ONT	old mdax (Oct)	17319	431.9	0.05	57.7	22.6
+Sabatieria	ONT	v4 fold-axis gate	16107	447.2	0.06	58.4	24.9
+Microlaimidae	ONT	raw reads	45291	630.7	0.02	16.1	0.4
+Microlaimidae	ONT	Lee et al. remove_palindrome	42179	605.1	0.02	20.1	0.5
+Microlaimidae	ONT	old mdax (Oct)	40978	1084.4	0.03	18.9	0.5
+Microlaimidae	ONT	v4 fold-axis gate	40497	594.5	0.02	18.3	0.5

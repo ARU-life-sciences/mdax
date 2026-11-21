@@ -1,0 +1,11 @@
+sample	arm	contigs	Mb	N50_Mb	BUSCO_C	BUSCO_D
+92	main	711	110.5	0.49	96.7	4.2
+92	+ second-junction recursion (rejected)	741	110.7	0.47	96.6	4.7
+92	+ oracle: no-copy foldbacks cut	749	111.6	0.49	97.0	5.1
+92	+ oracle: every residual foldback cut	809	112.8	0.49	97.3	6.3
+92	+ oracle: every one cut, keep all pieces	824	113.3	0.49	97.3	6.4
+96	main	316	104.7	1.18	98.7	1.0
+96	+ second-junction recursion (rejected)	317	104.6	1.11	98.7	1.1
+96	+ oracle: no-copy foldbacks cut	314	104.6	1.18	98.8	1.2
+96	+ oracle: every residual foldback cut	309	104.4	1.12	98.8	1.1
+96	+ oracle: every one cut, keep all pieces	331	104.5	1.12	98.8	1.3
