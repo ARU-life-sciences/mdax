@@ -31,3 +31,11 @@
 
 # test_single_nematode: ignore raw ONT read data (symlinked to lustre); track scripts and BUSCO results
 /test_single_nematode/data/
+
+# benchmarks: large run data and outputs; track READMEs and scripts only
+/benchmarks/cadect_vs_mdax/
+/benchmarks/ground_truth_57/*
+!/benchmarks/ground_truth_57/README.md
+!/benchmarks/ground_truth_57/compare_truth.py
+# permissive-mode sweep: FASTQ subsets and logs (5.8 GB)
+/synth_bench/sweep_permissive/
