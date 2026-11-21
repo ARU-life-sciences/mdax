@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # GitHub's x86-64 Linux runners have AVX2 and AES-NI, which
+    # .cargo/config.toml requires (gxhash, simd-minimizers).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --all-targets
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      # Includes tests/truth_regression.rs: mdax on a stratified sample of
+      # reference-labelled reads from two public MDA ONT libraries, with
+      # floors on true foldbacks cut and ceilings on linear reads cut.
+      - name: Test
+        run: cargo test --release
