@@ -524,8 +524,8 @@ mod tests {
         let mut heavy = with_hist(85_000, 12_000);
         heavy.n_hist[3] = 1500;
         let mut c = 600.0f64;
-        for n in 4..20 {
-            heavy.n_hist[n] = c as u64;
+        for h in &mut heavy.n_hist[4..20] {
+            *h = c as u64;
             c *= 0.6;
         }
         let t = heavy.adaptive_min_support(3, 0.01);
@@ -535,21 +535,15 @@ mod tests {
         // repeats shared by ~coverage reads (shape of nrCaeEleg34, a non-WGA
         // C. elegans library). Calibration must leave the floor alone.
         let mut genuine = with_hist(555, 470);
-        for n in 3..10 {
-            genuine.n_hist[n] = 420;
-        }
-        for n in 10..30 {
-            genuine.n_hist[n] = 260;
-        }
+        genuine.n_hist[3..10].fill(420);
+        genuine.n_hist[10..30].fill(260);
         assert!(genuine.singleton_frac() < JunctionSupport::ARTEFACT_DOMINATED);
         assert_eq!(genuine.adaptive_min_support(3, 0.01), 3);
 
         // Flat counts just above the Poisson threshold are not a chance
         // tail: no extrapolation through them.
         let mut flat = with_hist(80_000, 9_000);
-        for n in 3..40 {
-            flat.n_hist[n] = 300;
-        }
+        flat.n_hist[3..40].fill(300);
         assert_eq!(flat.adaptive_min_support(3, 0.01), 3);
     }
 
