@@ -1,5 +1,7 @@
 # test_pal/
 
+> Results here predate v0.2.0 (old locus-signature support; `--cut-low-ident` is now the default and a no-op). Current numbers: [`reports/mdax_eval/`](../reports/mdax_eval/mdax_eval.pdf).
+
 Comparison of `mdax` against the Strobl et al. (2023) Perl-based foldback baseline, using a 20,000-read ONT subsample from a real WGA library.
 
 **Reference**: Strobl et al. (2023), *Nucleic Acids Research* — https://doi.org/10.1093/nar/gkad573

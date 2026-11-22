@@ -1,5 +1,7 @@
 # test_celegans/
 
+> Results here predate v0.2.0 (old locus-signature support; `--cut-low-ident` is now the default and a no-op). Current numbers: [`reports/mdax_eval/`](../reports/mdax_eval/mdax_eval.pdf).
+
 Benchmark `mdax` on two real single-worm *C. elegans* MDA libraries with contrasting assembly quality and artefact rates. No external ground truth — the primary comparison is artefact rate between the two samples.
 
 ## Samples

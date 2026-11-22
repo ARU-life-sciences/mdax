@@ -2,22 +2,20 @@
 
 Read in HiFi or ONT raw data generated from Multiple Displacement Amplification methods, and correct reads. This tool currently only corrects 'foldback' or 'invert' chimeras (`mdax`). We also provide a binary to search for long Inverted Repeats (IR's) in assemblies (`irx`).
 
-**Contents:** [Install](#install) · [Quick start & recommended settings](#quick-start--recommended-settings) · [Full CLI reference](#usage) · [Tests and benchmarks](#tests-and-benchmarks) · [Performance](#performance) · [Algorithm overview](#algorithm-overview) · [`irx`](#irx-detecting-natural-irs-from-assemblies)
+**Contents:** [Install](#install) · [Quick start & recommended settings](#quick-start--recommended-settings) · [Full CLI reference](#usage) · [Validation](#validation) · [Tests and benchmarks](#tests-and-benchmarks) · [Performance](#performance) · [Algorithm overview](#algorithm-overview) · [`irx`](#irx-detecting-natural-irs-from-assemblies)
 
 ## Install
 
-Currently you'll have to clone this repo, have Rust installed, and compile:
+A Linux x86-64 binary is attached to each [release](https://github.com/ARU-life-sciences/mdax/releases) (needs AVX2/AES-NI, glibc ≥ 2.35). Or build from source:
 
 ```bash
 # install Rust first (https://rust-lang.org/tools/install/)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-# clone and cd
-git clone github.com/ARU-life-sciences/mdax
+git clone https://github.com/ARU-life-sciences/mdax
 cd mdax
-# use SIMD instructions
-RUSTFLAGS='-C target-feature=+aes,+sse2,+avx2' cargo build --release
-# or if you want in PATH
-RUSTFLAGS='-C target-feature=+aes,+sse2,+avx2' cargo install --path=.
+cargo build --release      # SIMD flags are set in .cargo/config.toml
+# or, to put mdax and irx in PATH
+cargo install --path=.
 ```
 
 ## Quick start & recommended settings
@@ -477,17 +475,22 @@ Options:
           Print version
 ```
 
+## Validation
+
+Full evaluation (read-level truth on four MDA read sets, hifiasm/Flye + BUSCO on 27 libraries): [`reports/mdax_eval/mdax_eval.pdf`](reports/mdax_eval/mdax_eval.pdf), also attached to the v0.2.0 release. In short: worth using on MDA HiFi (40–62% fewer contigs, 2–4× N50 vs raw), smaller gains on MDA ONT/CLR, no use on unamplified libraries.
+
 ## Tests and benchmarks
 
 | Directory | Tool | Type | Data | README |
 |---|---|---|---|---|
-| `tests/` | `mdax` | Rust integration tests | 57 real HiFi reads + synthetic | [tests/README.md](tests/README.md) |
+| `tests/` | both | Rust integration tests, incl. reference-truth regression | 57 real HiFi reads, 2 × 500 public ONT reads, synthetic | [tests/README.md](tests/README.md) |
+| `synth_bench/` | `mdax` | Synthetic harness; farm-side truth scorers | — | [synth_bench/README.md](synth_bench/README.md) |
 | `test_pal/` | `mdax` | ONT comparison vs Strobl 2023 Perl baseline | 20k ONT reads (SRR24201687) | [test_pal/README.md](test_pal/README.md) |
 | `test_celegans/` | `mdax` | Real HiFi benchmark, two MDA samples | 200k reads × 2 *C. elegans* samples | [test_celegans/README.md](test_celegans/README.md) |
 | `irx_tests/` | `irx` | Synthetic ground-truth evaluation | ~120 planted IRs, seed 42 | [irx_tests/README.md](irx_tests/README.md) |
 | `data/` | both | Test data and generators | — | [data/README.md](data/README.md) |
 
-Test data for `test_pal/` and `test_celegans/` is not tracked in git (large files). See the per-directory READMEs for data accessions and how to reproduce runs.
+Test data for `test_pal/` and `test_celegans/` is not tracked in git (large files). The `test_pal/` and `test_celegans/` numbers below predate v0.2.0; current numbers are in the [evaluation report](#validation).
 
 ### Rust integration tests (`tests/`)
 
@@ -495,7 +498,7 @@ Test data for `test_pal/` and `test_celegans/` is not tracked in git (large file
 cargo test
 ```
 
-Tests the full two-pass pipeline on synthetic and 57 real HiFi reads with BLAST-derived ground truth. All tests are deterministic and run in ~1 second.
+Tests the full two-pass pipeline on synthetic and 57 real HiFi reads with BLAST-derived ground truth, and (`truth_regression.rs`) checks foldbacks cut / linear reads cut on 1,000 public MDA ONT reads labelled against a reference (`data/ci_truth/`). Deterministic, a few seconds; run in CI on every push. `synth_bench/truth_regress.sh` runs the full-library version on the farm.
 
 ### ONT baseline comparison (`test_pal/`)
 
@@ -506,7 +509,9 @@ Metrics are generous (artefact + low_ident both counted as true positive).
 | Configuration | Precision | Recall | F1 |
 |---|---|---|---|
 | `balanced --refine-mode hifi` (default) | 0.998 | 0.647 | 0.785 |
-| `permissive --refine-mode ont --cut-low-ident` | **0.995** | **0.803** | **0.888** |
+| `permissive --refine-mode ont --cut-low-ident`¹ | **0.995** | **0.803** | **0.888** |
+
+¹ `--cut-low-ident` is now the default and the flag is a no-op.
 
 ```bash
 cd test_pal && ./test_pal.sh       # single run
@@ -554,7 +559,7 @@ cd irx_tests && bash test_suite.bash
 
 ## Performance
 
-It's fast, processing ~100 Gb of FASTA data in ~2 minutes in `hifi` mode on a Mac with 8 threads. `ont` mode uses Myers' bit-parallel edit distance for refinement and is comparable in speed.
+A full MDA library (HiFi or ONT) takes 3–20 minutes on 16 threads and under 4 GB of memory. `ont` mode uses Myers' bit-parallel edit distance for refinement and is comparable in speed.
 
 ## Algorithm overview
 
@@ -569,9 +574,9 @@ It's a two step pipeline:
 
 - Pass 2: correct reads
     - Each detected foldback is refined to a breakpoint and classified: at or above the support threshold it is genomic (`real`) and left alone; below it, it is an artefact.
-    - Artefacts are cut at the junction, keeping the longer side and any spacer, and the kept side is re-examined recursively for nested artefacts.
+    - Artefacts are cut at the strand switch, keeping the longer side, and the kept side is re-examined recursively for nested artefacts. When the arms are separated by an un-mirrored spacer, the spacer is dropped on ONT; on HiFi mdax keeps whichever side of it library k-mer counts say is genomic.
 
-Measured against a reference (random read samples from *C. elegans* WGA HiFi libraries aligned to WBcel235; `synth_bench/refbased_recall_eval.py`), this cuts 78% of true foldback artefacts at ~140x and 73% at ~1500x, with under 1% of true artefacts kept as `real`. Almost all of what remains is not a detection failure: about a fifth of reads with a nearby strand switch contain no inverted copy at all (the read ended before the new strand had been copied back as far as the old one), so no self-comparison can see them. Among foldbacks that do contain at least 100 bp of inverted copy, over 99% are detected on HiFi. In the TSV, `support_n` is the number of reads (including the read itself) sharing the fold axis, `support_span` is the number of key elements the junction had, and `support_rank_frac` is no longer computed (always 0).
+Measured against a reference (random read samples from *C. elegans* WGA HiFi libraries aligned to WBcel235; `synth_bench/refbased_recall_eval.py`), this cuts 79% of true foldback artefacts at ~140x and 74% at ~1500x (77.5% on MDA ONT), cutting about 2% of normal reads, with under 1% of true artefacts kept as `real`. Almost all of what remains is not a detection failure: about a fifth of reads with a nearby strand switch contain no inverted copy at all (the read ended before the new strand had been copied back as far as the old one), so no self-comparison can see them. Among foldbacks that do contain at least 100 bp of inverted copy, 95–99% are cut. Cutting the rest at reference-detected junctions gave no assembly gain. In the TSV, `support_n` is the number of reads (including the read itself) sharing the fold axis, `support_span` is the number of key elements the junction had, and `support_rank_frac` is no longer computed (always 0).
 
 ## `irx`: detecting 'natural' IR's from assemblies
 

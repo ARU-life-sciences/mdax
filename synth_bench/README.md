@@ -7,6 +7,18 @@ artefact *calls* agree with a baseline; nothing in the repo previously
 checked whether *acting on those calls* helps or hurts assembly. This
 directory closes that gap.
 
+> The motivation below describes the pre-v0.2.0 locus-signature gate; the fold-axis gate has since replaced it, and `--cut-low-ident` is now a no-op.
+
+## Other scripts
+
+| Script | Purpose |
+|---|---|
+| `truth_regress.sh submit BIN NAME` / `check NAME` | Full-library truth regression on four sets (farm); exits 1 if below floors |
+| `refbased_recall_eval.py`, `celegans_refbased_eval.py` | Reference-based foldback truth and scoring |
+| `measure_residual.sh`, `residual_location.py` | Foldbacks left in cut reads |
+| `noir_*.py` | Foldbacks with no inverted copy: junction geometry, k-mer dip, oracle cuts |
+| `retest_*_arm.sh`, `retest_summarise.sh` | hifiasm / Flye + BUSCO re-assembly arms |
+
 ## Motivation
 
 Colleagues observed that mdax-purged HiFi datasets produced **worse**

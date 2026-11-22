@@ -22,6 +22,12 @@ Read name conventions:
 
 ---
 
+## Reference-truth fixture (`ci_truth/`)
+
+`{celegans_wga,aphelenchoides}.fa.gz` + `.labels.tsv`: 250 foldback + 250 linear reads each from public MDA ONT libraries (SRR24201716, SRR24201688), labelled from alignment to WBcel235 / GCA_024699835.1. Used by `tests/truth_regression.rs`. Built by `recall_check/ci_fixture/build.sh` (farm, not tracked).
+
+---
+
 ## Synthetic datasets
 
 | File | Generator | Description |
