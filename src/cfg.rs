@@ -359,7 +359,7 @@ impl CallMode {
             //
             // min_matches / min_span / end_guard were 20 / 2000 / 1000 until
             // 2026-11-18. Scored against a reference (a random 3% of a
-            // ~140x C. elegans WGA HiFi library aligned to WBcel235), those
+            // ~100x C. elegans WGA HiFi library aligned to WBcel235), those
             // values found 96% of true foldbacks with arms over 4 kb but
             // only 72% at 1-2 kb, 44% at 500-1000 bp and 23-38% of those
             // within 1 kb of a read end -- 28% missed overall. 12 / 1000 /

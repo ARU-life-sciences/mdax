@@ -22,8 +22,8 @@ use crate::cfg::MdaxCfg;
 // a few hundred bp of the split) identified a *locus*. That is not enough to tell a genome-encoded
 // inverted repeat from an amplification artefact once a library is deep:
 // artefact junctions land roughly uniformly along the genome, so at e.g. one
-// junction per ~190 bp (a typical 140x C. elegans WGA HiFi run) *every* locus
-// "recurs" by chance, and at one per ~29 bp (a 1500x run) essentially all of
+// junction per ~190 bp (a typical 100x C. elegans WGA HiFi run) *every* locus
+// "recurs" by chance, and at one per ~29 bp (a 720x run) essentially all of
 // them do. Measured against a reference on real data, the locus-level gate
 // left 15-50% of true artefacts uncut as "real" for that reason.
 //
@@ -266,7 +266,7 @@ impl JunctionSupport {
     /// Amplified libraries are not Poisson: coverage is wildly uneven and
     /// early amplification products are copied many times over, so the
     /// number of artefacts sharing an axis has a much heavier tail than the
-    /// mean rate predicts (on a ~1500x C. elegans library the Poisson
+    /// mean rate predicts (on a ~720x C. elegans library the Poisson
     /// threshold still left 6% of reference-confirmed artefacts above it,
     /// their support counts decaying smoothly by ~0.7x per step, while
     /// genome-encoded repeats sat far out at n >= 20).

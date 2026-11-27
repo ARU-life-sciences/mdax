@@ -424,7 +424,7 @@ artefact, and that mdax was cutting far fewer of them than the logs implied:
 | fold-axis support, old detection thresholds | 71.7% | 0.5% | 27.8% | 1.2% |
 | fold-axis support, new balanced defaults | 78.1% | 0.7% | 21.2% | 2.1% |
 
-On nrCaeEleg94 (~1500x) the 30 Oct build cut 15.6% and kept 51.5% as "real";
+On nrCaeEleg94 (~720x) the 30 Oct build cut 15.6% and kept 51.5% as "real";
 fold-axis support cuts 73.1% and keeps 1.0%.
 
 **Why the old gate failed.** The signature was the bottom-k minimizers within

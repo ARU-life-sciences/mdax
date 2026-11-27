@@ -57,6 +57,20 @@ with open(f"{OUT}/hifi_hifiasm.tsv", "w") as o:
             if r[0]:
                 o.write("\t".join([s.replace("nrCaeEleg", ""), lib, label] + r) + "\n")
 
+# ---- HiFi, deep (~720x) libraries: old full-depth arms vs a ~150x subsample ------------
+# deep_sub/: mdax v0.2.0 run on the full library, then the same random read subsample
+# (seqkit sample -s 11, ~15 Gb) assembled raw and corrected.
+def sub(s, a):
+    return row(stats(f"{B}/deep_sub/{s}/{a}/p_ctg.fa"), busco(f"{B}/deep_sub/{s}/{a}/busco_summary.txt"))
+
+with open(f"{OUT}/hifi_deep.tsv", "w") as o:
+    o.write("sample\tdepth\tarm\tcontigs\tMb\tN50_Mb\tBUSCO_C\tBUSCO_D\n")
+    for s in ("nrCaeEleg93", "nrCaeEleg94", "nrCaeEleg95"):
+        for depth, label, r in [("full (~720×)", "raw reads", old(s, "raw")), ("full (~720×)", "old mdax (Oct)", old(s, "balanced")),
+                                ("150× subsample", "raw reads", sub(s, "raw")), ("150× subsample", "main (v0.2.0)", sub(s, "mdax"))]:
+            if r[0]:
+                o.write("\t".join([s.replace("nrCaeEleg", ""), depth, label] + r) + "\n")
+
 # ---- HiFi oracle / rejected arms -----------------------------------------------------
 with open(f"{OUT}/hifi_experiments.tsv", "w") as o:
     o.write("sample\tarm\tcontigs\tMb\tN50_Mb\tBUSCO_C\tBUSCO_D\n")

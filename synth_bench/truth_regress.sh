@@ -4,8 +4,8 @@
 # Runs the binary on four full amplified libraries and scores a random read
 # sample of each against a reference-derived truth (truth_join.py, copy in
 # synth_bench/refbased_recall_eval.py):
-#   nrCaeEleg92      C. elegans MDA HiFi, ~140x        (balanced)
-#   nrCaeEleg94      C. elegans MDA HiFi, ~1500x       (balanced)
+#   nrCaeEleg92      C. elegans MDA HiFi, ~100x        (balanced)
+#   nrCaeEleg94      C. elegans MDA HiFi, ~720x        (balanced)
 #   celegans_wga     C. elegans MDA ONT, SRR24201716   (permissive, ONT refine)
 #   aphelenchoides   A. besseyi MDA ONT, SRR24201688   (permissive, ONT refine;
 #                    truth vs independent strain AORJ, GCA_024699835.1)

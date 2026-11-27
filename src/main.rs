@@ -320,8 +320,8 @@ fn main() -> Result<()> {
     // Density-aware threshold. The number of *unrelated* artefacts that
     // share a fold axis by chance grows with how densely junctions cover the
     // genome, so a fixed min_support is too lax for deep libraries (measured
-    // against a reference: at ~140x, 15% of true artefacts were kept as
-    // "real"; at ~1500x, half). Estimate the chance rate from the data and
+    // against a reference: at ~100x, 15% of true artefacts were kept as
+    // "real"; at ~720x, half). Estimate the chance rate from the data and
     // raise the bar until under 1% of chance co-locations clear it. This
     // only ever raises the threshold, and an explicit --min-support (or the
     // frozen fairness baseline) disables it.

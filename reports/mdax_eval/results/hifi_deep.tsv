@@ -1,0 +1,10 @@
+sample	depth	arm	contigs	Mb	N50_Mb	BUSCO_C	BUSCO_D
+93	150× subsample	raw reads	1342	130.8	0.28	93.5	3.8
+93	150× subsample	main (v0.2.0)	1090	132.2	0.67	97.6	4.8
+94	full (~720×)	raw reads	12028	386.2	0.05	95.0	57.8
+94	full (~720×)	old mdax (Oct)	11208	361.9	0.05	96.8	54.7
+94	150× subsample	raw reads	1787	131.0	0.14	87.6	9.5
+94	150× subsample	main (v0.2.0)	1061	133.0	0.43	96.5	5.7
+95	full (~720×)	old mdax (Oct)	8949	330.2	0.07	97.5	50.6
+95	150× subsample	raw reads	1542	141.2	0.20	94.2	7.1
+95	150× subsample	main (v0.2.0)	997	141.4	0.59	97.8	6.5

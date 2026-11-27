@@ -1,14 +1,16 @@
 #import "@local/report:0.1.0": *
 #show: report.with(
   title: "Is mdax worth using on MDA data?",
-  subtitle: "Evaluation of mdax on C. elegans, A. besseyi, Lepidodermella and twelve other nematodes, 18–21 November 2026",
+  subtitle: "Evaluation of mdax on C. elegans, A. besseyi, Lepidodermella and twelve other nematodes, 18–27 November 2026",
   abstract: [
     mdax removes foldback chimeras, the inverted copies that multiple displacement amplification (MDA) leaves in long reads.
     We scored the current version (main at `812d743`) against a reference-based truth on four read sets from two
-    species, and assembled corrected reads from 11 C. elegans HiFi libraries and 16 ONT or PacBio CLR samples from 14 species. On MDA HiFi it cuts
+    species, and assembled corrected reads from 12 C. elegans HiFi libraries and 16 ONT or PacBio CLR samples from 14 species. On MDA HiFi it cuts
     74–79% of true foldbacks while cutting about 2% of normal reads. The 95–99% of foldbacks whose inverted copy is
-    still in the read are nearly all cut; the rest have no copy to find. Assembly gains are large on MDA HiFi: against
-    raw reads, contigs fall by 40–62%, N50 rises 2–4-fold and BUSCO duplication drops from 6–10% to 1–4%. On MDA
+    still in the read are nearly all cut; the rest have no copy to find. Assembly gains are large on MDA HiFi: on six
+    libraries of ordinary depth, contigs fall by 40–62% against raw reads, N50 rises 2–4-fold and BUSCO duplication
+    drops from 6–10% to 1–4%; on three libraries of about 720× assembled from a 150× subsample, contigs fall by 19–41%, N50
+    rises 2.4–3.1-fold and BUSCO completeness rises by 4–9 points. On MDA
     ONT and PacBio CLR the gains are real but smaller, and mdax matches or beats the palindrome removal of Lee et al. on
     every sample with a decent assembly. On libraries that were not amplified it gives nothing and costs a little. The
     answer is yes for MDA data; no for anything else.
@@ -18,9 +20,11 @@
 
 = Verdict
 
-#solid *Use mdax on MDA HiFi.* On all six amplified C. elegans HiFi libraries assembled with the new code, the hifiasm
+#solid *Use mdax on MDA HiFi.* On the six amplified C. elegans HiFi libraries of ordinary depth, the hifiasm
 assembly from mdax-corrected reads has 40–62% fewer contigs than raw reads, two to four times the N50, higher BUSCO
 completeness, and BUSCO duplication falls from 6–10% to 0.8–4.2%. The old (October) mdax cut contigs by only 17–28%.
+On the three deepest libraries (about 720×), assembled from the same 150× subsample of raw or corrected reads,
+contigs fall by 19–41%, N50 rises 2.4–3.1-fold and BUSCO completeness by 4–9 points.
 
 #solid *Use it on MDA ONT and PacBio CLR from a single animal, with smaller expectations.* On C. elegans ONT, A. besseyi
 and the first Lepidodermella sample, mdax beats raw reads clearly and beats or matches Lee et al.'s
@@ -38,8 +42,8 @@ its threshold low) but there is nothing for it to fix.
 
 *Read-level truth.* For a random sample of about 40,000 reads from each library we aligned the raw reads to an
 independent reference with minimap2 and called a read a true foldback when it had two aligned segments on opposite
-strands of the same sequence, within 5 kb. That gave four truth sets: nrCaeEleg92 (MDA HiFi, ~140×) and nrCaeEleg94
-(MDA HiFi, ~1500×) against WBcel235; celegans_wga (Lee et al.'s MDA ONT, SRR24201716) against WBcel235; and A. besseyi
+strands of the same sequence, within 5 kb. That gave four truth sets: nrCaeEleg92 (MDA HiFi, about 100×) and nrCaeEleg94
+(MDA HiFi, about 720×) against WBcel235; celegans_wga (Lee et al.'s MDA ONT, SRR24201716) against WBcel235; and A. besseyi
 strain APTV (MDA ONT, SRR24201688) against an independent assembly of strain AORJ (GCA_024699835.1) made from
 unamplified reads. mdax runs on the full library, since its decision to keep a foldback as genuine depends on how many
 other reads share it, and the sample reads are then scored. Every number below for "linear reads cut" is the share of
@@ -93,9 +97,19 @@ On the three libraries that were not amplified (34, ToL, 33), mdax does nothing 
 BUSCO is unchanged. Version 5 briefly made these worse (34: 638 contigs against 592 raw) because its calibration pushed
 the threshold to 47–60; the fix in `643e0bf` restored them to the old build's numbers.
 
-The three deepest C. elegans libraries (93, 94, 95, ~1000–1500×) were not assembled with the new code: the hugemem
-re-runs never completed. Their old assemblies are poor in every arm (9,000–12,000 contigs, BUSCO duplication about
-50%), so the question for them is coverage, not correction.
+The three deepest libraries (93, 94 and 95) hold about 72 Gb, or 720×, each. Assembled from all their reads, 94 and
+95 give 9,000–12,000 contigs, 330–386 Mb and BUSCO duplication of 51–58% whether or not the old mdax was used
+(@tab-deep): that much depth is more than hifiasm handles well. We therefore ran mdax on each full
+library, so that its support threshold was calibrated at the real depth (it rose from 3 to 13–14), then drew one
+random subsample of about 15 Gb (150×) and assembled the same reads raw and corrected. mdax helps clearly here too:
+contigs fall by 19–41%, N50 rises from 0.14–0.28 Mb to 0.43–0.67 Mb, and missing BUSCOs fall from 4.8–11.2% to
+1.6–2.6%. Duplication falls on 94 and 95 but rises from 3.8% to 4.8% on 93, as on 92. Both arms come to 131–141 Mb,
+well above the 100 Mb reference and the 103–110 Mb of the other libraries, and mdax does not change that.
+
+#figure(tsv-table(read("results/hifi_deep.tsv")),
+  caption: [hifiasm primary contigs for the three deepest MDA libraries. "Full" rows assemble every read (old arms,
+  October build); "150× subsample" rows assemble one random subsample of about 15 Gb, raw or after mdax v0.2.0 was run on
+  the full library.]) <tab-deep>
 
 = Assembly: MDA ONT and PacBio CLR (Flye)
 
@@ -141,13 +155,14 @@ within one contig; differences of a few percent in contig count are within run-t
 platform was tested. The read-level truth comes from two species, both nematodes with compact genomes; the A. besseyi
 reference is a different strain, which may count a few real inversions as foldbacks. No polyploid or repeat-rich
 genome has been tested. The oracle used hifiasm only, so the conclusion that leftover foldbacks don't matter is not
-proven for Flye. Ten of the ONT nematodes and three C. elegans HiFi libraries have only been assembled with the old
-build.
+proven for Flye. Ten of the ONT nematodes have only been assembled with the old build, and the three deepest HiFi
+libraries with the new code only from a 150× subsample.
 
 = Practical guidance
 
 Run mdax on MDA reads before assembly: `mdax reads.fa -o corrected.fa -r report.tsv` (balanced mode is the default for
 HiFi; use `--mode permissive --refine-mode ont` for ONT). A full library takes 3–20 minutes on 16 threads and under 4 GB
 of memory. Check the `[QC SUMMARY]` line: on an amplified library the support threshold is calibrated upward (7–14 on the C. elegans HiFi libraries); on a library that was not amplified calibration is skipped and the threshold stays at 3,
-which is the sign that there was little to correct. Don't expect it to fix low coverage, heterozygosity or an assembly
+which is the sign that there was little to correct. On a very deep library (several hundred-fold), run mdax on all
+the reads and then subsample the corrected reads to about 150× for assembly. Don't expect it to fix low coverage, heterozygosity or an assembly
 that is fragmented for other reasons.
